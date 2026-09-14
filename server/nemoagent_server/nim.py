@@ -112,6 +112,9 @@ class NIMClient:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice or "auto"
         payload.update(self._fixed_params.get(model, {}))
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("NIM request: model=%s tool_choice=%s tools=%s keys=%s", model, payload.get("tool_choice"),
+                      [t["function"]["name"] for t in (tools or [])], sorted(payload))
 
         attempt = 0
         while True:

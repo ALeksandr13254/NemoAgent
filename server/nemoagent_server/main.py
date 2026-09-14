@@ -102,6 +102,20 @@ async def memory_recent(limit: int = 20, authorization: Optional[str] = Header(d
     return services.memory.recent(limit)
 
 
+@app.post("/memory/prune")
+async def memory_prune(authorization: Optional[str] = Header(default=None)):
+    """Drop trivial/duplicate dialog memories (test chatter like 'Проверка.')."""
+    _check_token(authorization)
+    return {"removed": services.memory.prune(), "left": services.memory.count()}
+
+
+@app.post("/memory/clear")
+async def memory_clear(authorization: Optional[str] = Header(default=None)):
+    """Forget everything (irreversible)."""
+    _check_token(authorization)
+    return {"removed": services.memory.clear(), "left": services.memory.count()}
+
+
 @app.post("/deepseek/reload")
 async def deepseek_reload(authorization: Optional[str] = Header(default=None)):
     """Re-read DeepSeek token/cookies after refreshing them in server/.env + cookies file."""

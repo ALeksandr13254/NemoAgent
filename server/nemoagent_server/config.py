@@ -62,6 +62,10 @@ class Settings:
     # Fallback when the model answers in plain prose although speech was requested: a fast model
     # rewrites the answer into TTS-ready text (streamed to the client as speech).
     SPEAK_REWRITE = _bool("SPEAK_REWRITE", True)
+    # How a `speak` answer is kept in the conversation history: "content" turns it into a normal
+    # assistant message (coherent multi-turn dialogue), "tool" keeps the raw tool call + result.
+    # "tool" keeps the model calling speak reliably; with "content" it drifts into writing the call as text.
+    SPEAK_HISTORY = _env("SPEAK_HISTORY", "tool")
     # Default = the main model: on the free pool the "small" models (lightning 30B, ultra 550B) queue for
     # a minute, while Super answers in ~1 s and rewrites cleanly.
     SPEAK_REWRITE_MODEL = _env("SPEAK_REWRITE_MODEL") or LLM_MODEL
@@ -73,7 +77,7 @@ class Settings:
     MEMORY_DB = Path(_env("MEMORY_DB", str(SERVER_DIR / "data" / "memory.sqlite3")))
     MEMORY_AUTO_RECALL = _bool("MEMORY_AUTO_RECALL", True)
     MEMORY_TOP_K = _int("MEMORY_TOP_K", 4)
-    MEMORY_MIN_SCORE = _float("MEMORY_MIN_SCORE", 0.42)
+    MEMORY_MIN_SCORE = _float("MEMORY_MIN_SCORE", 0.5)
     CONTEXT_BUDGET_TOKENS = _int("CONTEXT_BUDGET_TOKENS", 60000)
     CONTEXT_KEEP_TURNS = _int("CONTEXT_KEEP_TURNS", 6)
 

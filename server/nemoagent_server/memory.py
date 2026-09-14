@@ -110,7 +110,15 @@ class MemoryStore:
         assistant_text = (assistant_text or "").strip()
         if not user_text and not assistant_text:
             return None
+        # Small talk and test chatter ("Проверка." / "Спасибо") are not worth remembering: they only
+        # pollute recall with near-identical junk that the model then parrots.
+        if len(user_text) < 12 and len(assistant_text) < 60:
+            return None
         doc = f"User: {user_text[:4000]}\nAssistant: {assistant_text[:6000]}"
+        with self._lock:
+            dup = self._db.execute("SELECT id FROM memories WHERE collection='text' AND text=? LIMIT 1", (doc,)).fetchone()
+        if dup:
+            return int(dup[0])
         try:
             vec = (await self.nim.embed(COLLECTION_MODEL["text"], [doc], "passage"))[0]
         except Exception as e:  # noqa: BLE001
@@ -200,6 +208,39 @@ class MemoryStore:
         merged = [r for rs in results for r in rs]
         merged.sort(key=lambda r: -r["score"])
         return merged[:top_k]
+
+    def delete(self, ids: list[int]) -> int:
+        if not ids:
+            return 0
+        with self._lock:
+            ph = ",".join("?" * len(ids))
+            self._db.execute(f"DELETE FROM vectors WHERE memory_id IN ({ph})", ids)
+            cur = self._db.execute(f"DELETE FROM memories WHERE id IN ({ph})", ids)
+            self._db.commit()
+        self._load()
+        return cur.rowcount
+
+    def prune(self, min_user_chars: int = 12, min_answer_chars: int = 60) -> int:
+        """Remove trivial dialog memories (short question and short answer) and exact duplicates."""
+        rows = self._db.execute("SELECT id, text FROM memories WHERE collection='text' AND kind='dialog' ORDER BY id").fetchall()
+        seen: set[str] = set()
+        victims: list[int] = []
+        for mid, text in rows:
+            user_part, _, answer = text.partition("\nAssistant: ")
+            user_part = user_part.removeprefix("User: ")
+            if (len(user_part.strip()) < min_user_chars and len(answer.strip()) < min_answer_chars) or text in seen:
+                victims.append(mid)
+            seen.add(text)
+        return self.delete(victims)
+
+    def clear(self) -> int:
+        with self._lock:
+            n = self._db.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+            self._db.execute("DELETE FROM vectors")
+            self._db.execute("DELETE FROM memories")
+            self._db.commit()
+        self._load()
+        return int(n)
 
     def recent(self, limit: int = 20) -> list[dict]:
         rows = self._db.execute("SELECT id, collection, session_id, kind, text, ts FROM memories ORDER BY id DESC LIMIT ?", (limit,)).fetchall()

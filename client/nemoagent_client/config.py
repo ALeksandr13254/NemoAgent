@@ -54,13 +54,13 @@ class Settings:
     STT_DEVICE = _env("STT_DEVICE", "auto")            # auto | cuda | cpu
     STT_COMPUTE = _env("STT_COMPUTE", "auto")          # auto | float16 | int8_float16 | int8
     STT_LANGUAGE = _env("STT_LANGUAGE", "ru")          # ru | en | auto (auto can drift to other languages on background audio)
-    STT_BEAM = _int("STT_BEAM", 1)
+    STT_BEAM = _int("STT_BEAM", 3)                     # beam 3 costs nothing on GPU and drops fewer words
 
     # --- microphone / VAD ---
     MIC_DEVICE = _env("MIC_DEVICE")                    # name or index; empty = default
     AUTO_LISTEN = _bool("AUTO_LISTEN", True)           # hands-free: VAD decides when you speak
     VAD_THRESHOLD = _float("VAD_THRESHOLD", 0.55)
-    VAD_SILENCE_MS = _int("VAD_SILENCE_MS", 650)       # silence that ends an utterance
+    VAD_SILENCE_MS = _int("VAD_SILENCE_MS", 750)       # silence that ends an utterance (a mid-sentence pause is ~0.5 s)
     VAD_MIN_SPEECH_MS = _int("VAD_MIN_SPEECH_MS", 250)
     VAD_MAX_UTTERANCE_S = _int("VAD_MAX_UTTERANCE_S", 45)
     VAD_PRE_ROLL_MS = _int("VAD_PRE_ROLL_MS", 300)

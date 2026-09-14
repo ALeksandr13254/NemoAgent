@@ -49,7 +49,9 @@ Style:
 - Before dangerous or irreversible actions (deleting data, changing system settings, sending anything, payments) ask for explicit confirmation first.
 - Never claim you did something you did not do. If a tool fails, say so and suggest the next step.
 - When the user asks to check, run, execute or verify something, actually call the tool in this turn — even if a memory or an earlier answer already contains a plausible result.
-- When you use tools, keep the final answer focused on the outcome, not the mechanics."""
+- When you use tools, keep the final answer focused on the outcome, not the mechanics.
+- Every answer must respond to the LATEST user message. Never repeat your previous answer verbatim. If the message is unclear, looks like a fragment (speech recognition may cut or garble words) or does not make sense in context, say what you understood and ask a short clarifying question instead of guessing.
+- Do not end every answer with "чем могу помочь" or similar filler; just answer."""
 
 VOICE_STYLE_TEXT = ("The user typed the message and the answer is shown as text only: answer concisely; light markdown "
                     "(short lists, `code`) is fine when it helps.")
@@ -67,10 +69,13 @@ VOICE_STYLE_SPEAK = """Your answer is read aloud by a text-to-speech engine. ALW
   6. Speak like a person: short natural sentences (up to about twenty words each), no lists, no headings, no tables. Put pauses with commas and full stops.
   7. Be concise: what matters, then stop.
 Use the optional `display` argument for the screen version whenever the answer contains code, commands, paths, links, exact numbers or a table — there markdown is fine. If `display` is omitted, `speech` is shown on screen.
-Example. User: "Напиши команду PowerShell для топ пяти процессов по памяти." You call:
-  speak(speech="Команда на экране. Она берёт все процессы, сортирует по занятой памяти по убыванию и оставляет первые пять.", display="```powershell\nGet-Process | Sort-Object WorkingSet -Descending | Select-Object -First 5 Name, Id, WorkingSet\n```")
-Example. Tool result says free space is 24.9 GB of 1765.3 GB on drive C. You call:
-  speak(speech="На диске Це свободно двадцать четыре целых девять десятых гигабайта из тысячи семисот шестидесяти пяти.", display="Диск C: свободно 24,9 ГБ из 1765,3 ГБ")
+Example. User: "Напиши команду PowerShell для топ пяти процессов по памяти." — you call the speak tool with
+  speech: Команда на экране. Она берёт все процессы, сортирует по занятой памяти по убыванию и оставляет первые пять.
+  display: ```powershell\nGet-Process | Sort-Object WorkingSet -Descending | Select-Object -First 5 Name, Id, WorkingSet\n```
+Example. A tool result says free space is 24.9 GB of 1765.3 GB on drive C — you call the speak tool with
+  speech: На диске Це свободно двадцать четыре целых девять десятых гигабайта из тысячи семисот шестидесяти пяти.
+  display: Диск C: свободно 24,9 ГБ из 1765,3 ГБ
+(The speak tool is a real function call, never text like speak(...) in your reply.)
 Before a long tool action you may call speak together with the other tools to say what you are doing ("Сейчас проверю."); the turn then continues after the tools return."""
 
 SPEECH_REWRITE_PROMPT = """You convert an assistant's written answer into text for a Russian/English text-to-speech engine with a tiny vocabulary. Output ONLY the spoken text, nothing else. Rules:
@@ -84,12 +89,14 @@ class JsonStringStreamer:
     """Incrementally extracts the value of one string key from JSON arriving in fragments.
 
     Used to start speaking a `speak` call while the model is still streaming its arguments.
+    `opener` may override the pattern that starts the string (e.g. a pseudo-call `speak(speech="`).
     """
 
     _ESC = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "/": "/", "\\": "\\", '"': '"'}
 
-    def __init__(self, key: str):
+    def __init__(self, key: str, opener: Optional[str] = None):
         self.key = key
+        self.opener = opener or (r'"' + re.escape(key) + r'"\s*:\s*"')
         self.raw = ""
         self.pos = 0
         self.state = "seek"
@@ -101,7 +108,7 @@ class JsonStringStreamer:
     def feed(self, chunk: str) -> str:
         self.raw += chunk
         if self.state == "seek":
-            m = re.search(r'"' + re.escape(self.key) + r'"\s*:\s*"', self.raw)
+            m = re.search(self.opener, self.raw)
             if not m:
                 return ""
             self.pos = m.end()
@@ -152,6 +159,78 @@ class JsonStringStreamer:
             i += 1
         self.pos = i
         return "".join(out)
+
+
+_PSEUDO_RE = re.compile(r"speak\s*\(\s*speech\s*=\s*\"")
+_PSEUDO_DISPLAY_RE = re.compile(r"display\s*=\s*\"((?:[^\"\\]|\\.)*)\"", re.S)
+
+
+class PseudoSpeakDetector:
+    """The model sometimes writes the call as text — `speak(speech="...", display="...")` — instead
+    of calling the tool. This streams such text as speech (and hides it from the chat) so the answer
+    is still spoken immediately, without the slow rewrite fallback.
+
+    feed() yields ("delta", text) for ordinary content and ("speech", text) for spoken pieces.
+    """
+
+    def __init__(self) -> None:
+        self.buf = ""
+        self.mode = "text"           # text | call
+        self.streamer: Optional[JsonStringStreamer] = None
+        self.tail = ""               # everything after `speak(` (for display= parsing)
+        self.speech = ""
+        self.detected = False
+
+    def feed(self, chunk: str):
+        if self.mode == "call":
+            self.tail += chunk
+            piece = self.streamer.feed(chunk)
+            if piece:
+                self.speech += piece
+                yield ("speech", piece)
+            return
+        self.buf += chunk
+        m = _PSEUDO_RE.search(self.buf)
+        if m:
+            before = self.buf[:m.start()]
+            if before.strip():
+                yield ("delta", before)
+            self.mode = "call"
+            self.detected = True
+            self.streamer = JsonStringStreamer("speech", opener=_PSEUDO_RE.pattern)
+            rest = self.buf[m.start():]
+            self.buf = ""
+            self.tail = rest
+            piece = self.streamer.feed(rest)
+            if piece:
+                self.speech += piece
+                yield ("speech", piece)
+            return
+        # hold back a tail that could be the beginning of "speak(speech="
+        hold = 0
+        for k in range(min(len(self.buf), 14), 0, -1):
+            if "speak(speech=".startswith(self.buf[-k:].lower().replace(" ", "")[:13]):
+                hold = k
+                break
+        emit = self.buf[:len(self.buf) - hold] if hold else self.buf
+        self.buf = self.buf[len(emit):]
+        if emit:
+            yield ("delta", emit)
+
+    def finish(self):
+        if self.mode == "text" and self.buf:
+            b, self.buf = self.buf, ""
+            yield ("delta", b)
+
+    def display(self) -> Optional[str]:
+        m = _PSEUDO_DISPLAY_RE.search(self.tail)
+        if not m:
+            return None
+        raw = m.group(1)
+        try:
+            return json.loads('"' + raw + '"') or None
+        except Exception:
+            return raw.replace("\\n", "\n").replace('\\"', '"') or None
 
 
 class AgentSession:
@@ -302,15 +381,17 @@ class AgentSession:
             # Presented as an automatic search_memory tool round (not as a transcript in the system
             # prompt): the model then treats memories as observations and keeps its tool habits —
             # a transcript-looking block made it drift into plain-prose answers.
-            block = self.services.memory.format_for_prompt(recalled)
             call_id = f"mem_{uuid.uuid4().hex[:8]}"
+            # same shape as a real search_memory result, so the model sees one format only
+            results = [{"when": dt.datetime.fromtimestamp(r["ts"]).strftime("%Y-%m-%d %H:%M"), "kind": r["kind"],
+                        "score": round(r["score"], 3), "text": r["text"][:2500]} for r in recalled]
             self.messages.append({"role": "assistant", "content": None, "tool_calls": [{
                 "id": call_id, "type": "function",
-                "function": {"name": "search_memory", "arguments": json.dumps({"query": text[:200], "auto": True}, ensure_ascii=False)}}]})
+                "function": {"name": "search_memory", "arguments": json.dumps({"query": text[:200]}, ensure_ascii=False)}}]})
             self.messages.append({"role": "tool", "tool_call_id": call_id, "name": "search_memory", "content": json.dumps({
-                "note": ("Automatic recall from PAST conversations — context, not current facts. If the user asks to "
-                         "check, run, look, measure or verify something, do it with tools now."),
-                "results": block}, ensure_ascii=False)})
+                "note": ("PAST conversations (earlier sessions) — background context only, not the current request; "
+                         "answer the latest message on its own merits."),
+                "count": len(results), "results": results}, ensure_ascii=False)})
             await self.send({"type": "memory", "items": [{"kind": r["kind"], "score": round(r["score"], 2),
                                                           "text": r["text"][:300], "ts": r["ts"]} for r in recalled]})
         self.turns += 1
@@ -331,13 +412,22 @@ class AgentSession:
                 round_t0 = time.time()
                 speech_streams: dict[int, JsonStringStreamer] = {}
                 spoke_this_round = False
+                pseudo = PseudoSpeakDetector() if tts else None
 
                 async def on_event(kind: str, data: dict) -> None:
                     nonlocal first_token_ms, spoke_this_round
                     if kind == "delta":
                         if first_token_ms is None:
                             first_token_ms = int((time.time() - t_start) * 1000)
-                        await self.send({"type": "delta", "content": data["content"]})
+                        if pseudo is None:
+                            await self.send({"type": "delta", "content": data["content"]})
+                            return
+                        for what, text in pseudo.feed(data["content"]):
+                            if what == "speech":
+                                spoke_this_round = True
+                                await self.send({"type": "speech_delta", "content": text})
+                            else:
+                                await self.send({"type": "delta", "content": text})
                     elif kind == "reasoning":
                         await self.send({"type": "reasoning", "content": data["content"]})
                     elif kind == "tool_delta":
@@ -357,6 +447,9 @@ class AgentSession:
                 # after a round where it already spoke (narration + tools), forcing a tool again makes it
                 # repeat the same calls forever — so that round runs on "auto".
                 choice = "required" if (tts and settings.SPEAK_REQUIRED and not spoke_last_round) else "auto"
+                if log.isEnabledFor(logging.DEBUG):
+                    log.debug("session %s round %d messages:\n%s", self.id, round_no,
+                              json.dumps(messages[1:], ensure_ascii=False, indent=1)[-6000:])
                 acc: Completion = await self.services.nim.chat_stream(messages, schemas, tool_choice=choice, on_event=on_event)
                 log.info("session %s round %d: %d chars, %d tool calls, %.1fs", self.id, round_no,
                          len(acc.content), len(acc.tool_calls), time.time() - round_t0)
@@ -364,7 +457,20 @@ class AgentSession:
                 if acc.finish_reason == "length":
                     await self.send({"type": "notice", "message": "Ответ обрезан по лимиту max_tokens."})
 
+                if pseudo is not None:
+                    for what, text in pseudo.finish():
+                        await self.send({"type": what if what == "delta" else "speech_delta", "content": text})
+
                 if not acc.tool_calls:
+                    if pseudo is not None and pseudo.detected and pseudo.speech.strip():
+                        # the model wrote speak(...) as text: already streamed as speech above
+                        display = pseudo.display()
+                        said = display or pseudo.speech.strip()
+                        await self.send({"type": "speech_done", "display": display, "final": True})
+                        assistant_text = said
+                        self.messages.append({"role": "assistant", "content": said})
+                        finish = "speak"
+                        break
                     assistant_text = acc.content
                     self.messages.append({"role": "assistant", "content": acc.content})
                     if tts and acc.content.strip() and settings.SPEAK_REWRITE:
@@ -389,21 +495,38 @@ class AgentSession:
                     finish = "loop"
                     break
                 last_call_signature = signature
-                self.messages.append({"role": "assistant", "content": acc.content or None, "tool_calls": calls})
-                if acc.content:
-                    assistant_text += acc.content + "\n"
+                narration = acc.content.strip() if acc.content else ""
+                self.messages.append({"role": "assistant", "content": narration or None, "tool_calls": calls})
+                if narration:
+                    assistant_text += narration + "\n"
 
                 # --- `speak` calls: the spoken text was already streamed; finish them here
                 speak_calls = [c for c in calls if c["function"]["name"] == "speak"]
                 other_calls = [c for c in calls if c["function"]["name"] != "speak"]
+                spoken_texts: list[str] = []
                 for c in speak_calls:
                     speech, display = self._parse_speak(c["function"]["arguments"])
                     if not spoke_this_round and speech:   # arguments arrived in one piece (non-streamed backend)
                         await self.send({"type": "speech_delta", "content": speech})
                     await self.send({"type": "speech_done", "display": display, "final": not other_calls})
                     assistant_text += (display or speech) + "\n"
-                    self.messages.append({"role": "tool", "tool_call_id": c["id"], "name": "speak",
-                                          "content": json.dumps({"ok": True, "spoken": True})})
+                    spoken_texts.append(display or speech)
+                if speak_calls and settings.SPEAK_HISTORY == "content":
+                    # Keep what was said as a normal assistant message: the model then reads its own
+                    # replies as dialogue (and does not parrot the last tool call on unclear input).
+                    said = "\n".join(t for t in spoken_texts if t).strip()
+                    last = self.messages[-1]
+                    text_now = "\n".join(t for t in (narration, said) if t).strip()
+                    if other_calls:
+                        last["tool_calls"] = other_calls
+                        last["content"] = text_now or None
+                    else:
+                        self.messages[-1] = {"role": "assistant", "content": text_now}
+                elif speak_calls:
+                    for c, said in zip(speak_calls, spoken_texts):
+                        # the result repeats what was said, so the model sees its own reply as dialogue
+                        self.messages.append({"role": "tool", "tool_call_id": c["id"], "name": "speak",
+                                              "content": json.dumps({"ok": True, "said": said[:2000]}, ensure_ascii=False)})
 
                 if speak_calls and not other_calls:
                     finish = "speak"
