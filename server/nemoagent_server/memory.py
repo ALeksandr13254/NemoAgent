@@ -106,8 +106,9 @@ class MemoryStore:
     # ------------------------------------------------------------- writing
     async def remember_dialog(self, session_id: str, user_text: str, assistant_text: str, meta: Optional[dict] = None) -> Optional[int]:
         """Index one user/assistant exchange in the text collection."""
+        from .speechfmt import strip_filler
         user_text = (user_text or "").strip()
-        assistant_text = (assistant_text or "").strip()
+        assistant_text = strip_filler((assistant_text or "").strip())
         if not user_text and not assistant_text:
             return None
         # Small talk and test chatter ("Проверка." / "Спасибо") are not worth remembering: they only
@@ -221,13 +222,22 @@ class MemoryStore:
         return cur.rowcount
 
     def prune(self, min_user_chars: int = 12, min_answer_chars: int = 60) -> int:
-        """Remove trivial dialog memories (short question and short answer) and exact duplicates."""
+        """Remove trivial dialog memories (short question and short answer) and exact duplicates;
+        also cut the "Чем могу помочь?"-style endings out of stored answers."""
+        from .speechfmt import strip_filler
         rows = self._db.execute("SELECT id, text FROM memories WHERE collection='text' AND kind='dialog' ORDER BY id").fetchall()
         seen: set[str] = set()
         victims: list[int] = []
         for mid, text in rows:
             user_part, _, answer = text.partition("\nAssistant: ")
             user_part = user_part.removeprefix("User: ")
+            cleaned = strip_filler(answer.strip())
+            if cleaned != answer.strip():
+                text = f"User: {user_part}\nAssistant: {cleaned}"
+                with self._lock:
+                    self._db.execute("UPDATE memories SET text=? WHERE id=?", (text, mid))
+                    self._db.commit()
+                answer = cleaned
             if (len(user_part.strip()) < min_user_chars and len(answer.strip()) < min_answer_chars) or text in seen:
                 victims.append(mid)
             seen.add(text)

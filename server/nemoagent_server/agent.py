@@ -16,6 +16,7 @@ from .attachments import AttachmentStore
 from .config import settings
 from .memory import MemoryStore
 from .nim import Completion, NIMClient
+from .speechfmt import ProseSpeechRouter, strip_filler
 from .tools import CLIENT_TOOL_NAMES, ToolContext, all_schemas, compact_result, run_server_tool
 from .vision import VisionService
 
@@ -59,15 +60,28 @@ VOICE_STYLE_TEXT = ("The user typed the message and the answer is shown as text 
 # Rules derived from the TeraTTSv2 model card + its character table (unicode_indexer.json):
 # vocabulary = letters, space, . , ! ? : ; - ( ) « » " ' ; digits expanded only in the nominative;
 # % ° № — … / \ _ * # @ & = + < > [ ] { } are dropped; abbreviations are read letter by letter.
-VOICE_STYLE_SPEAK = """Your answer is read aloud by a text-to-speech engine. ALWAYS finish your turn by calling the `speak` tool (do not write the final answer as plain text). In `speech` follow these rules strictly:
-  1. Words only. Allowed characters: letters, spaces and the punctuation . , ! ? : ; - ( ) « » " '. No digits, no symbols (% ° № $ € / \\ _ * # @ & = + < > [ ] ~ |), no emoji, no markdown.
-  1a. NEVER put code, shell commands, file paths, URLs, e-mails or identifiers into `speech` — the engine cannot pronounce them. Describe them in words ("команда из трёх частей: получить процессы, отсортировать по памяти, взять первые пять") and put the exact text into `display`.
+SPEECH_RULES = """  1. Words only. Allowed characters: letters, spaces and the punctuation . , ! ? : ; - ( ) « » " '. No digits, no symbols (% ° № $ € / \\ _ * # @ & = + < > [ ] ~ |), no emoji, no markdown.
+  1a. NEVER put code, shell commands, file paths, URLs, e-mails or identifiers into the spoken text — the engine cannot pronounce them. Describe them in words ("команда из трёх частей: получить процессы, отсортировать по памяти, взять первые пять").
   2. Write every number in words, in the grammatically correct form: "двадцать четыре целых девять десятых гигабайта", "пятнадцать ноль две", "минус три градуса", "восемьдесят процентов", "в две тысячи двадцать шестом году".
   3. Expand abbreviations and units into full words ("гигабайт", "операционная система", "компьютер", "километров в час"); if an abbreviation is pronounced letter by letter, write the letter names ("эс-ша-а", "ю-эс-би").
   4. In Russian speech write foreign names, brands and products in Cyrillic transliteration ("Виндоус", "Гитхаб", "Пайтон", "Ютуб", "Визуал Студио Код"). Do not mix Latin and Cyrillic inside one sentence. If the whole answer is in English, write it in English.
   5. Use the letter ё where it belongs (всё, ещё, идёт). Stress is placed automatically; only for an ambiguous homograph put + right before the stressed vowel (з+амок on a door, зам+ок on a hill).
   6. Speak like a person: short natural sentences (up to about twenty words each), no lists, no headings, no tables. Put pauses with commas and full stops.
-  7. Be concise: what matters, then stop.
+  7. Say what matters and stop. No closing offers or questions: never "Чем могу помочь?", "Если нужно что-то ещё, скажите", "Обращайтесь", "How can I help", "Let me know" — the user will ask if they want more. Do not thank or praise the user for their message."""
+
+VOICE_STYLE_PROSE = """The user is talking by voice and your reply is read aloud by a text-to-speech engine with a tiny vocabulary. Write the reply itself as spoken text, following these rules strictly:
+""" + SPEECH_RULES + """
+If the answer needs code, a shell command, a file path, a link, exact figures or a table, first say it in words, then add a line containing only === and put the exact text below it (it is shown on screen, not spoken; markdown is fine there). Example:
+  На диске Це свободно двадцать четыре целых девять десятых гигабайта. Команда на экране.
+  ===
+  Диск C: свободно 24,9 ГБ из 1765,3 ГБ
+  ```powershell
+  Get-PSDrive C
+  ```
+Before a long tool action you may write one short sentence about what you are doing ("Сейчас проверю."), then call the tools."""
+
+VOICE_STYLE_SPEAK = """Your answer is read aloud by a text-to-speech engine. ALWAYS finish your turn by calling the `speak` tool (do not write the final answer as plain text). In `speech` follow these rules strictly:
+""" + SPEECH_RULES + """
 Use the optional `display` argument for the screen version whenever the answer contains code, commands, paths, links, exact numbers or a table — there markdown is fine. If `display` is omitted, `speech` is shown on screen.
 Example. User: "Напиши команду PowerShell для топ пяти процессов по памяти." — you call the speak tool with
   speech: Команда на экране. Она берёт все процессы, сортирует по занятой памяти по убыванию и оставляет первые пять.
@@ -282,9 +296,12 @@ class AgentSession:
         return f"Current date and time on the user's machine: {now.strftime('%A, %d %B %Y, %H:%M')} ({name})."
 
     def _system_message(self, tts: bool) -> dict:
+        if tts:
+            style = VOICE_STYLE_SPEAK if settings.SPEECH_MODE == "tool" else VOICE_STYLE_PROSE
+        else:
+            style = VOICE_STYLE_TEXT
         return {"role": "system", "content": SYSTEM_PROMPT.format(
-            env=self._env_description() + "\n" + self._now_line(),
-            voice_style=VOICE_STYLE_SPEAK if tts else VOICE_STYLE_TEXT)}
+            env=self._env_description() + "\n" + self._now_line(), voice_style=style)}
 
     def note_screenshot(self, attachment_id: str) -> None:
         self.session_attachment_ids.append(attachment_id)
@@ -398,7 +415,9 @@ class AgentSession:
         self._trim_context()
 
         tools_enabled = bool(self.client_info.get("tools_enabled", True))
-        schemas = all_schemas(tools_enabled, self.services.vision.enabled, speak_enabled=tts)
+        tool_mode = tts and settings.SPEECH_MODE == "tool"
+        prose_mode = tts and not tool_mode
+        schemas = all_schemas(tools_enabled, self.services.vision.enabled, speak_enabled=tool_mode)
         ctx = ToolContext(self, self.client_call)
         assistant_text = ""       # what goes to memory
         first_token_ms: Optional[int] = None
@@ -411,34 +430,44 @@ class AgentSession:
                 messages = [self._system_message(tts)] + self.messages
                 round_t0 = time.time()
                 speech_streams: dict[int, JsonStringStreamer] = {}
+                speech_routers: dict[int, ProseSpeechRouter] = {}
                 spoke_this_round = False
-                pseudo = PseudoSpeakDetector() if tts else None
+                pseudo = PseudoSpeakDetector() if tool_mode else None
+                prose = ProseSpeechRouter() if prose_mode else None
+
+                async def emit_routed(events) -> None:
+                    nonlocal spoke_this_round
+                    for what, text in events:
+                        if what == "speech":
+                            spoke_this_round = True
+                            await self.send({"type": "speech_delta", "content": text})
+                        else:
+                            await self.send({"type": "delta", "content": text})
 
                 async def on_event(kind: str, data: dict) -> None:
                     nonlocal first_token_ms, spoke_this_round
                     if kind == "delta":
                         if first_token_ms is None:
                             first_token_ms = int((time.time() - t_start) * 1000)
-                        if pseudo is None:
+                        if prose is not None:
+                            await emit_routed(prose.feed(data["content"]))
+                        elif pseudo is not None:
+                            await emit_routed(pseudo.feed(data["content"]))
+                        else:
                             await self.send({"type": "delta", "content": data["content"]})
-                            return
-                        for what, text in pseudo.feed(data["content"]):
-                            if what == "speech":
-                                spoke_this_round = True
-                                await self.send({"type": "speech_delta", "content": text})
-                            else:
-                                await self.send({"type": "delta", "content": text})
                     elif kind == "reasoning":
                         await self.send({"type": "reasoning", "content": data["content"]})
                     elif kind == "tool_delta":
-                        if data.get("name") == "speak" and tts:
+                        if data.get("name") == "speak" and tool_mode:
                             st = speech_streams.setdefault(data["index"], JsonStringStreamer("speech"))
+                            router = speech_routers.setdefault(data["index"], ProseSpeechRouter())
                             piece = st.feed(data.get("arguments") or "")
                             if piece:
                                 if first_token_ms is None:
                                     first_token_ms = int((time.time() - t_start) * 1000)
-                                spoke_this_round = True
-                                await self.send({"type": "speech_delta", "content": piece})
+                                await emit_routed(router.feed(piece))
+                            if st.done:
+                                await emit_routed(router.finish())
                     else:
                         await self.send({"type": "wait", **data})
 
@@ -458,10 +487,20 @@ class AgentSession:
                     await self.send({"type": "notice", "message": "Ответ обрезан по лимиту max_tokens."})
 
                 if pseudo is not None:
-                    for what, text in pseudo.finish():
-                        await self.send({"type": what if what == "delta" else "speech_delta", "content": text})
+                    await emit_routed(pseudo.finish())
+                if prose is not None:
+                    await emit_routed(prose.finish())
 
                 if not acc.tool_calls:
+                    if prose is not None:
+                        speech, display = prose.result
+                        if speech or display:
+                            await self.send({"type": "speech_done", "display": display, "final": True})
+                            said = speech + (("\n" + display) if display else "")
+                            assistant_text = said
+                            self.messages.append({"role": "assistant", "content": said})
+                            finish = "speak"
+                            break
                     if pseudo is not None and pseudo.detected and pseudo.speech.strip():
                         # the model wrote speak(...) as text: already streamed as speech above
                         display = pseudo.display()
@@ -496,6 +535,10 @@ class AgentSession:
                     break
                 last_call_signature = signature
                 narration = acc.content.strip() if acc.content else ""
+                if prose is not None:
+                    narration = strip_filler(narration) if narration else ""
+                    if spoke_this_round:   # "Сейчас проверю." was spoken; let the player finish this bit
+                        await self.send({"type": "speech_done", "display": None, "final": False})
                 self.messages.append({"role": "assistant", "content": narration or None, "tool_calls": calls})
                 if narration:
                     assistant_text += narration + "\n"
@@ -504,8 +547,9 @@ class AgentSession:
                 speak_calls = [c for c in calls if c["function"]["name"] == "speak"]
                 other_calls = [c for c in calls if c["function"]["name"] != "speak"]
                 spoken_texts: list[str] = []
-                for c in speak_calls:
+                for i, c in enumerate(speak_calls):
                     speech, display = self._parse_speak(c["function"]["arguments"])
+                    speech = strip_filler(speech)
                     if not spoke_this_round and speech:   # arguments arrived in one piece (non-streamed backend)
                         await self.send({"type": "speech_delta", "content": speech})
                     await self.send({"type": "speech_done", "display": display, "final": not other_calls})
@@ -561,25 +605,28 @@ class AgentSession:
     async def _rewrite_for_speech(self, content: str) -> None:
         """Fallback: turn a written answer into TTS-ready speech with a fast model, streamed."""
         t0 = time.time()
-        spoken = ""
+        router = ProseSpeechRouter()
 
         async def on_event(kind: str, data: dict) -> None:
-            nonlocal spoken
             if kind == "delta":
-                spoken += data["content"]
-                await self.send({"type": "speech_delta", "content": data["content"]})
+                for what, text in router.feed(data["content"]):
+                    if what == "speech":
+                        await self.send({"type": "speech_delta", "content": text})
 
         try:
             await self.services.nim.chat_stream(
                 [{"role": "system", "content": SPEECH_REWRITE_PROMPT},
                  {"role": "user", "content": content[:6000]}],
                 None, model=settings.SPEAK_REWRITE_MODEL, thinking=False, temperature=0.2, max_tokens=900, on_event=on_event)
+            for what, text in router.finish():
+                if what == "speech":
+                    await self.send({"type": "speech_delta", "content": text})
         except Exception as e:  # noqa: BLE001
             log.warning("speech rewrite failed: %s", e)
-            if not spoken:
-                await self.send({"type": "speech_delta", "content": content})   # client sanitizes as best it can
+            if not router.speech:
+                await self.send({"type": "speech_delta", "content": strip_filler(content)})   # client sanitizes as best it can
         await self.send({"type": "speech_done", "display": content, "final": True})
-        log.info("session %s: speech rewrite %d -> %d chars in %.1fs", self.id, len(content), len(spoken), time.time() - t0)
+        log.info("session %s: speech rewrite %d -> %d chars in %.1fs", self.id, len(content), len(router.speech), time.time() - t0)
 
     @staticmethod
     def _parse_speak(raw: str) -> tuple[str, Optional[str]]:

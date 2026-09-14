@@ -57,7 +57,8 @@
       case 'round': if (m.round > 1) { current = null; } break;
       case 'delta': {
         if (!current) { current = add(div('msg assistant streaming')); current._text = ''; }
-        current._text += m.content; current.innerHTML = fmt(current._text); scroll();
+        current._text += m.content;
+        current.innerHTML = (current._speech ? '<span class="spk" title="озвучено">🔊</span>' : '') + fmt(current._text); scroll();
         break;
       }
       case 'speech_delta': {
