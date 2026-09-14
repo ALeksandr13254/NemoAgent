@@ -10,6 +10,8 @@ Protocol (JSON text frames):
     {"type":"interrupt"}          # stop the current answer (barge-in)
     {"type":"new_session"}
     {"type":"client_info", "client": {...}}     # update capabilities/toggles
+    {"type":"get_prompts"} / {"type":"set_prompts","values":{system,voice_prose,voice_text}} / {"type":"reset_prompts","keys":[...]}
+        -> {"type":"prompts","current":{...},"defaults":{...},"overridden":[...]}   (editable system prompt parts)
     {"type":"ping"}
   server -> client
     {"type":"ready", "session_id": "...", "vision": bool, "memory": {...}}
@@ -44,6 +46,7 @@ from .attachments import AttachmentStore
 from .config import settings
 from .memory import MemoryStore
 from .nim import NIMClient
+from .prompts import PromptStore
 from .vision import VisionService
 
 logging.basicConfig(level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
@@ -62,7 +65,8 @@ async def lifespan(app: FastAPI):
     memory = MemoryStore(nim)
     attachments = AttachmentStore()
     vision = VisionService(attachments, memory)
-    services = Services(nim=nim, memory=memory, attachments=attachments, vision=vision)
+    prompts = PromptStore()
+    services = Services(nim=nim, memory=memory, attachments=attachments, vision=vision, prompts=prompts)
     log.info("NemoAgent server ready on %s:%s | model %s | vision %s | memory %s",
              settings.HOST, settings.PORT, settings.LLM_MODEL, "on" if vision.enabled else f"off ({vision.error})", memory.count())
     try:
@@ -218,6 +222,12 @@ async def ws_endpoint(ws: WebSocket):
             elif t == "client_info":
                 link.client_info.update(msg.get("client") or {})
                 link.session.client_info = link.client_info
+            elif t == "get_prompts":
+                await link.send({"type": "prompts", **services.prompts.snapshot()})
+            elif t == "set_prompts":
+                await link.send({"type": "prompts", "saved": True, **services.prompts.set(msg.get("values") or {})})
+            elif t == "reset_prompts":
+                await link.send({"type": "prompts", "saved": True, **services.prompts.reset(msg.get("keys"))})
             elif t == "ping":
                 await link.send({"type": "pong", "t": msg.get("t")})
     except WebSocketDisconnect:

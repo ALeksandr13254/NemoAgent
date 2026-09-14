@@ -412,6 +412,8 @@ class ClientCore:
                 self.speaker.say(str(msg.get("text") or ""))
         elif t == "get_state":
             await ws.send_text(json.dumps(self.status_payload(), ensure_ascii=False))
+        elif t in ("get_prompts", "set_prompts", "reset_prompts"):
+            await self.send_server(msg)      # the server answers with a "prompts" message, relayed to the UI
         elif t == "ping":
             await ws.send_text(json.dumps({"type": "pong", "t": msg.get("t")}))
 

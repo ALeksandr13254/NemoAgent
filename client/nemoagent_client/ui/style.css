@@ -11,6 +11,14 @@ nav.tabs .tab.active { color: var(--text); border-bottom-color: var(--accent); }
 .tabpane { overflow-y: auto; }
 .panehead { display: flex; align-items: center; gap: 8px; padding: 8px 4px; }
 pre.raw { background: #0b0d12; border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; white-space: pre-wrap; word-break: break-word; font-size: 12px; margin: 0 4px 12px; }
+.editor { border: 1px solid var(--border); border-radius: 10px; background: var(--panel); margin: 8px 4px; padding: 4px 10px 10px; }
+.editor .panehead { padding: 6px 0; flex-wrap: wrap; }
+.editor code { background: #0b0d12; padding: 0 4px; border-radius: 4px; }
+label.ed { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 4px; }
+label.ed textarea { display: block; width: 100%; margin-top: 4px; background: #0b0d12; color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font: 12px/1.45 ui-monospace, Consolas, monospace; resize: vertical; }
+label.ed textarea:focus { outline: none; border-color: var(--accent); }
+label.ed textarea.dirty { border-color: var(--warn); }
+.row.left { justify-content: flex-start; align-items: center; gap: 8px; display: flex; margin-top: 8px; }
 #log-list { display: flex; flex-direction: column; gap: 8px; padding: 4px 4px 16px; }
 .logent { border: 1px solid var(--border); border-radius: 10px; background: var(--panel); font-size: 12px; }
 .logent summary { cursor: pointer; padding: 8px 12px; color: var(--muted); }

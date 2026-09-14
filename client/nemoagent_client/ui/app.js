@@ -82,9 +82,30 @@
   }
   $('log-clear').onclick = () => { logList.innerHTML = ''; logCount = 0; $('log-count').textContent = ''; };
 
+  /* ---------------------------------------------------------------- prompt editor */
+  const PROMPT_KEYS = ['system', 'voice_prose', 'voice_text'];
+  let promptState = null;
+  function renderPrompts(p) {
+    promptState = p;
+    for (const k of PROMPT_KEYS) {
+      const ta = $('ed-' + k); ta.value = p.current[k]; ta.classList.remove('dirty');
+      $('ov-' + k).textContent = (p.overridden || []).includes(k) ? '· изменён' : '· по умолчанию';
+    }
+    $('prompt-status').textContent = p.saved ? 'сохранено ' + new Date().toLocaleTimeString() : '';
+  }
+  for (const k of PROMPT_KEYS) $('ed-' + k).addEventListener('input', (e) => { e.target.classList.toggle('dirty', promptState && e.target.value !== promptState.current[k]); });
+  $('prompt-save').onclick = () => { const values = {}; for (const k of PROMPT_KEYS) values[k] = $('ed-' + k).value; send({ type: 'set_prompts', values }); $('prompt-status').textContent = 'сохраняю…'; };
+  $('prompt-reset').onclick = () => { if (confirm('Вернуть все три части к встроенным значениям?')) send({ type: 'reset_prompts' }); };
+  $('prompt-reload').onclick = () => send({ type: 'get_prompts' });
+
   function handle(m) {
     switch (m.type) {
-      case 'status': state = m; renderStatus(); break;
+      case 'status': {
+        const wasConnected = state && state.server; state = m; renderStatus();
+        if (m.server && (!wasConnected || !promptState)) send({ type: 'get_prompts' });
+        break;
+      }
+      case 'prompts': renderPrompts(m); break;
       case 'trace': handleTrace(m); break;
       case 'user_message': {
         const d = div('msg user');

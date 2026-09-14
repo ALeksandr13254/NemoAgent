@@ -30,8 +30,27 @@
   <main id="chat" class="tabpane"></main>
 
   <section id="prompt" class="tabpane hidden">
+    <div class="editor">
+      <div class="panehead">
+        <b>Редактирование</b>
+        <span class="muted small">Хранится на сервере, действует со следующего сообщения. В шаблоне работают подстановки <code>{env}</code> (окружение и текущее время) и <code>{voice_style}</code> (один из двух блоков ниже, по режиму).</span>
+      </div>
+      <label class="ed">Шаблон системного промпта <span id="ov-system" class="muted small"></span>
+        <textarea id="ed-system" rows="18" spellcheck="false"></textarea></label>
+      <label class="ed">Стиль голосового режима (правила речи) <span id="ov-voice_prose" class="muted small"></span>
+        <textarea id="ed-voice_prose" rows="14" spellcheck="false"></textarea></label>
+      <label class="ed">Стиль текстового режима <span id="ov-voice_text" class="muted small"></span>
+        <textarea id="ed-voice_text" rows="3" spellcheck="false"></textarea></label>
+      <div class="row left">
+        <button id="prompt-save" class="primary">Сохранить</button>
+        <button id="prompt-reset">Сбросить к умолчанию</button>
+        <button id="prompt-reload" class="link">перечитать с сервера</button>
+        <span id="prompt-status" class="muted small"></span>
+      </div>
+    </div>
     <div class="panehead">
-      <span class="muted small" id="prompt-meta">Появится после первого сообщения: ровно тот системный промпт, который ушёл в модель.</span>
+      <b>Последний отправленный промпт</b>
+      <span class="muted small" id="prompt-meta">Появится после первого сообщения: ровно тот текст, который ушёл в модель.</span>
     </div>
     <pre id="prompt-text" class="raw"></pre>
   </section>
