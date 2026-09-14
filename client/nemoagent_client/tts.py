@@ -219,7 +219,7 @@ def _hardwrap(s: str, limit: int) -> list[str]:
     while len(s) > limit:
         window = s[:limit]
         cut = max((window.rfind(b) for b in _PUNCT_BREAKS), default=-1)
-        if cut < int(limit * 0.35):
+        if cut < int(limit * 0.25):
             cut = window.rfind(" ")
         if cut <= 10:
             cut = limit - 1
@@ -265,7 +265,8 @@ class SentenceSplitter:
 
     def _pack(self, sent: str) -> list[str]:
         limit = self.first_max if self.emitted == 0 else self.max_chars
-        pieces = _hardwrap(sent, limit) if len(sent) > limit else [sent]
+        # a sentence slightly over the limit is synthesised whole (~0.6 s) rather than cut mid-phrase
+        pieces = _hardwrap(sent, limit) if len(sent) > limit * 1.35 else [sent]
         self.emitted += len(pieces)
         return pieces
 
