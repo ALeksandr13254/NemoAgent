@@ -1,0 +1,5 @@
+{
+  "cf_clearance": "paste from DevTools -> Application -> Cookies -> https://chat.deepseek.com",
+  "aws-waf-token": "…",
+  "ds_session_id": "…"
+}

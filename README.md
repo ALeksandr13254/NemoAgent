@@ -1,0 +1,131 @@
+# NemoAgent
+
+Голосовой и текстовый агент из двух частей: **сервер** (мозг: Nemotron 3 Super через NVIDIA NIM, зрение и
+веб-поиск через реверс-API DeepSeek, долговременная память на эмбеддингах NIM) и **клиент** на машине
+пользователя (микрофон → faster-whisper, TeraTTSv2 → колонки, локальный веб-интерфейс, исполнение
+команд и управление компьютером).
+
+```
+ пользователь ──голос/текст/файлы/скриншоты──▶ клиент (client/)                сервер (server/)
+   микрофон ─▶ Silero VAD ─▶ faster-whisper ──текст──▶ WebSocket ──▶ AgentSession
+   колонки ◀─ TeraTTSv2 ◀─ предложения ◀──дельты──◀ ws ◀── nvidia/nemotron-3-super-120b-a12b (tools)
+   PowerShell/bash/python/GUI ◀── client_tool ◀──────────┤              │
+   скриншот ──▶ png ──────────────────────▶ look_at_screen ──▶ DeepSeek (vision)
+   файлы ──▶ POST /upload ────────────────▶ analyze_attachments ──▶ DeepSeek (docs + images, до 50×100 МБ)
+                                            web_search ──▶ DeepSeek (search)
+                                            память: SQLite + nemotron-3-embed-1b / llama-nemotron-embed-vl-1b-v2
+```
+
+## Что умеет
+
+- **Голосовой диалог без рук**: VAD сам находит начало и конец фразы, распознаёт (GPU, ~0.3 с), ответ
+  модели начинает звучать по первому же предложению, пока модель дописывает остальное. Можно перебить
+  голосом (barge-in) — озвучка и генерация останавливаются.
+- **Текст, файлы, картинки, скриншоты** из локального веб-интерфейса (drag&drop, Ctrl+V, кнопка скриншота).
+  Nemotron сам не видит вложений — он вызывает `analyze_attachments`, и DeepSeek (единственная
+  «объединённая» модель `default`, у которой теперь есть зрение) читает файлы и картинки.
+- **Управление компьютером** через function calling: `run_command` (PowerShell/cmd на Windows, bash/zsh/sh
+  на Linux и macOS), `run_python`, файлы, `gui_action` (мышь/клавиатура), `open_target`, буфер обмена,
+  окна, `system_info`, `look_at_screen` (скриншот → DeepSeek → описание с координатами). Опасные команды
+  требуют подтверждения в интерфейсе (`TOOL_CONFIRM=dangerous|always|never`).
+- **Веб-поиск** — `web_search` через DeepSeek с включённым поиском.
+- **Долговременная память (RAG по прошлым диалогам)**: каждый обмен репликами индексируется на сервере
+  моделью `nvidia/nemotron-3-embed-1b`; анализы файлов/экрана (текст + картинки как data-URI) — моделью
+  `nvidia/llama-nemotron-embed-vl-1b-v2` в отдельной коллекции. Перед каждым ответом релевантные
+  воспоминания подмешиваются в контекст, есть инструмент `search_memory`. Живой контекст держится в
+  бюджете `CONTEXT_BUDGET_TOKENS` (по умолчанию 60k): старые ходы уходят из контекста, но остаются в памяти.
+
+## Замеры (RTX 4070 Ti SUPER, Windows 11)
+
+| этап | время |
+|---|---|
+| STT large-v3-turbo (CUDA fp16), фраза ~3 с | ~0.3 с |
+| первый токен Nemotron 3 Super (без reasoning) | 0.7–1.4 с |
+| первый звук TeraTTSv2 после появления первого предложения | 0.2–0.3 с (CUDA), 0.5–0.8 с (CPU) |
+| анализ картинки в DeepSeek | ~5 с |
+
+## Установка
+
+Нужен Python 3.11 (сервер — любой ≥3.10). Клиенту для GPU нужна NVIDIA-карта с драйвером CUDA 12+
+(все CUDA-библиотеки ставятся pip'ом, отдельный CUDA Toolkit не нужен). Без GPU всё работает на CPU.
+
+### Сервер
+
+```bash
+cd server
+copy .env.example .env      # и заполнить
+run_server.bat              # Windows (создаст .venv и поставит зависимости)
+./run_server.sh             # Linux/macOS
+```
+
+В `server/.env`:
+
+- `AGENT_TOKEN` — общий секрет клиента и сервера (любая длинная строка);
+- `NVIDIA_API_KEY` — ключ NIM с build.nvidia.com;
+- `DEEPSEEK_AUTH_TOKEN` — `localStorage.userToken` на chat.deepseek.com, а в `server/deepseek_cookies.json` —
+  куки `cf_clearance`, `aws-waf-token`, `ds_session_id` (см. `deepseek_cookies.example.json`). Куки живут
+  несколько часов; после обновления файла достаточно `POST /deepseek/reload` (или перезапуска). Если DeepSeek
+  недоступен, сервер работает без зрения/поиска;
+- `DEEPSEEK_PROXY` — прокси только для chat.deepseek.com, если он нужен в вашей сети.
+
+Сервер слушает `0.0.0.0:8700`: `GET /health`, `POST /upload`, `WS /ws` (протокол описан в
+`server/nemoagent_server/main.py`).
+
+### Клиент
+
+```bash
+cd client
+copy .env.example .env      # SERVER_URL и тот же AGENT_TOKEN
+run_client.bat              # Windows (создаст .venv, поставит зависимости)
+./run_client.sh             # Linux/macOS
+python download_models.py   # TeraTTSv2 (~1.2 ГБ) в client/models и whisper (~1.6 ГБ) в кэш HF
+```
+
+Клиент поднимает интерфейс на <http://127.0.0.1:8765> и открывает его в браузере. Статусные метки
+показывают, загрузились ли STT/TTS и подключён ли сервер; внизу — уровень микрофона и задержки
+(STT, первый токен, первый звук).
+
+Управление в интерфейсе: текст (Enter — отправить), 📎 файлы, 🖥 скриншот в вложение, 🎙 push-to-talk
+(держать кнопку или пробел вне поля ввода), 👂 автопрослушивание (VAD), ■ остановить, ⚙ настройки
+(режим озвучки, голоса `ru_*`/`eng_*`, темп, barge-in, язык распознавания, разрешение управлять
+компьютером и режим подтверждений).
+
+## Как это устроено
+
+**server/nemoagent_server**
+
+- `nim.py` — стриминговый клиент NIM с инструментами: повтор при перегрузке пула (500/503/529, «[ERROR: …]»
+  в теле ответа), откат неподдерживаемых параметров, «immutable»-параметры; эмбеддинги.
+- `agent.py` — сессия: системный промпт (включая ОС/оболочку/экран клиента), цикл tool calling
+  (до `MAX_TOOL_ROUNDS`), автоподмешивание памяти, обрезка контекста, прерывание.
+- `tools.py` — схемы всех инструментов; серверные реализации (`analyze_attachments`, `look_at_screen`,
+  `web_search`, `search_memory`, `get_current_time`, `calculate`, `get_weather`); клиентские только
+  описаны — их исполняет клиент.
+- `vision.py` — DeepSeek: загрузка файлов (ждёт `SUCCESS`), цепочка сообщений в одной DeepSeek-сессии на
+  диалог, поиск; результаты сразу пишутся в VL-память.
+- `deepseek/` — актуализированный реверс chat.deepseek.com (клиент 2.5.0): единственная модель
+  `default` с `file_feature.vision`, `fetch_page` GET, `/client/settings?scope=model` с лимитами файлов,
+  тот же PoW (WASM через wasmtime).
+- `memory.py` — SQLite + numpy-косинус, две коллекции (`text`, `vl`), поиск обоих эмбеддингов параллельно.
+
+**client/nemoagent_client**
+
+- `audio_in.py` — микрофон 16 кГц, Silero VAD (ONNX, без torch), пред-буфер, push-to-talk, barge-in с
+  повышенным порогом, пока агент говорит; `stt.py` — faster-whisper с фильтром галлюцинаций.
+- `tts.py` — TeraTTSv2 напрямую через ONNX Runtime (CUDA → CPU), разметка `<ru>/<en>` по словам, выбор
+  голоса по языку предложения, чистка markdown/эмодзи, `SentenceSplitter` для потока дельт.
+- `speech.py` + `player.py` — очередь предложений, синтез в отдельном потоке, единый безразрывный
+  `OutputStream`, мгновенная отмена по поколению.
+- `executor.py` — инструменты управления компьютером, детектор опасных команд, скриншоты (`mss`) с
+  пересчётом координат для `gui_action`.
+- `core.py` — оркестратор: WebSocket к серверу с автопереподключением, локальный UI-хаб, эхо-фильтр
+  (не принимать за речь пользователя собственную озвучку), подтверждения.
+
+## Ограничения и заметки
+
+- DeepSeek — это аккаунт браузера, а не API: куки протухают, есть лимиты; сервер выполняет не более двух
+  запросов к нему одновременно.
+- Reasoning у Nemotron выключен по умолчанию (`LLM_THINKING=false`) ради задержки; включается в `.env`.
+- `gui_action` работает по координатам из `look_at_screen`; если `SCREENSHOT_MAX_SIDE` уменьшает
+  скриншот, клиент сам пересчитывает координаты обратно в пиксели экрана.
+- Список окон/фокус (`list_windows`) есть только на Windows; остальное кроссплатформенно.

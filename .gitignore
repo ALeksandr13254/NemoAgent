@@ -1,0 +1,30 @@
+# secrets & local config
+.env
+server/.env
+client/.env
+server/deepseek_cookies.json
+*.pem
+
+# runtime data
+server/data/
+client/models/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.log
+
+# python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+.claude/

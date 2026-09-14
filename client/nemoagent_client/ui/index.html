@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NemoAgent</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="brand">NemoAgent <span id="model" class="muted"></span></div>
+    <div class="pills">
+      <span class="pill" id="pill-server" title="Соединение с сервером">сервер</span>
+      <span class="pill" id="pill-stt" title="Распознавание речи">STT</span>
+      <span class="pill" id="pill-tts" title="Синтез речи">TTS</span>
+      <span class="pill" id="pill-vision" title="Зрение / файлы / веб-поиск (DeepSeek)">vision</span>
+      <span class="pill" id="pill-memory" title="Записей в долговременной памяти">память</span>
+    </div>
+    <div class="metrics" id="metrics"></div>
+    <button id="btn-settings" class="icon" title="Настройки">⚙</button>
+  </header>
+
+  <main id="chat"></main>
+
+  <div id="attachments" class="attachments"></div>
+
+  <footer>
+    <div class="composer">
+      <textarea id="input" rows="1" placeholder="Напишите сообщение… (Enter — отправить, Shift+Enter — перенос, Ctrl+V — вставить картинку)"></textarea>
+      <div class="buttons">
+        <button id="btn-attach" class="icon" title="Прикрепить файлы">📎</button>
+        <input type="file" id="file-input" multiple hidden>
+        <button id="btn-shot" class="icon" title="Сделать скриншот и прикрепить">🖥</button>
+        <button id="btn-ptt" class="icon" title="Удерживайте, чтобы говорить (push-to-talk)">🎙</button>
+        <button id="btn-listen" class="icon" title="Автоматическое прослушивание (VAD)">👂</button>
+        <button id="btn-stop" class="icon" title="Остановить ответ / озвучку">■</button>
+        <button id="btn-send" class="primary" title="Отправить">➤</button>
+      </div>
+    </div>
+    <div class="statusline">
+      <div class="meter"><div id="mic-level"></div></div>
+      <span id="stt-state" class="muted"></span>
+      <span class="spacer"></span>
+      <button id="btn-new" class="link">новый диалог</button>
+    </div>
+  </footer>
+
+  <aside id="settings" class="hidden">
+    <h3>Настройки</h3>
+    <label>Озвучивать ответы
+      <select id="s-tts_mode">
+        <option value="always">всегда</option>
+        <option value="voice">только на голосовые</option>
+        <option value="off">выключено</option>
+      </select>
+    </label>
+    <label>Русский голос <select id="s-voice_ru"></select></label>
+    <label>English voice <select id="s-voice_en"></select></label>
+    <label>Темп речи (меньше — быстрее) <input id="s-tts_speed" type="range" min="0.7" max="1.4" step="0.05"><span id="s-tts_speed-v"></span></label>
+    <label><input id="s-auto_listen" type="checkbox"> Слушать автоматически (VAD)</label>
+    <label><input id="s-barge_in" type="checkbox"> Перебивать голосом (barge-in)</label>
+    <label>Язык распознавания
+      <select id="s-stt_language">
+        <option value="auto">авто</option><option value="ru">русский</option><option value="en">english</option>
+      </select>
+    </label>
+    <hr>
+    <label><input id="s-tools_enabled" type="checkbox"> Разрешить управление компьютером</label>
+    <label>Подтверждение действий
+      <select id="s-confirm">
+        <option value="dangerous">только опасные</option>
+        <option value="always">все действия</option>
+        <option value="never">никогда</option>
+      </select>
+    </label>
+    <hr>
+    <button id="btn-say" class="link">проверить голос</button>
+    <div id="settings-status" class="muted small"></div>
+  </aside>
+
+  <div id="confirm" class="modal hidden">
+    <div class="box">
+      <h3>Подтвердить действие?</h3>
+      <div class="muted" id="confirm-name"></div>
+      <pre id="confirm-summary"></pre>
+      <div class="row">
+        <button id="confirm-no">Отклонить</button>
+        <button id="confirm-yes" class="primary">Выполнить</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

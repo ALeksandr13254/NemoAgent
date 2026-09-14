@@ -1,0 +1,105 @@
+"""Speaker: LLM text stream -> sentences -> TeraTTS -> gapless player, with instant cancel."""
+from __future__ import annotations
+
+import logging
+import queue
+import threading
+import time
+from collections import deque
+from typing import Callable, Optional
+
+from .player import StreamPlayer
+from .tts import SentenceSplitter, TeraTTS, clean_for_tts, has_speech
+
+log = logging.getLogger("speech")
+
+
+class Speaker:
+    def __init__(self, tts: TeraTTS, player: StreamPlayer, on_state: Optional[Callable[[dict], None]] = None):
+        self.tts = tts
+        self.player = player
+        self.on_state = on_state or (lambda d: None)
+        self.splitter = SentenceSplitter()
+        self._q: "queue.Queue[tuple[int, str] | None]" = queue.Queue()
+        self._gen = 0
+        self._busy = threading.Event()
+        self._utt_started = 0.0
+        self._first_audio_at = 0.0
+        self.recent: deque[str] = deque(maxlen=12)   # last spoken sentences (for echo rejection)
+        self._thread = threading.Thread(target=self._worker, daemon=True, name="tts-worker")
+        self._thread.start()
+
+    # ----------------------------------------------------------------- state
+    @property
+    def is_speaking(self) -> bool:
+        return self._busy.is_set() or self.player.is_playing or not self._q.empty()
+
+    # ----------------------------------------------------------------- input
+    def begin(self) -> int:
+        """Start a new utterance (new LLM answer). Cancels anything still playing."""
+        self.cancel()
+        self._utt_started = time.time()
+        self._first_audio_at = 0.0
+        self.splitter.reset()
+        return self._gen
+
+    def feed(self, delta: str) -> None:
+        for sent in self.splitter.feed(delta):
+            self._enqueue(sent)
+
+    def end(self) -> None:
+        for sent in self.splitter.finish():
+            self._enqueue(sent)
+
+    def say(self, text: str) -> None:
+        self.begin()
+        self.feed(text)
+        self.end()
+
+    def _enqueue(self, sentence: str) -> None:
+        cleaned = clean_for_tts(sentence)
+        if not has_speech(cleaned):
+            return
+        self._q.put((self._gen, cleaned))
+
+    def cancel(self) -> None:
+        self._gen += 1
+        try:
+            while True:
+                self._q.get_nowait()
+        except queue.Empty:
+            pass
+        self.player.flush()
+        self.splitter.reset()
+
+    # ----------------------------------------------------------------- worker
+    def _worker(self) -> None:
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            gen, sentence = item
+            if gen != self._gen:
+                continue
+            self._busy.set()
+            try:
+                t0 = time.perf_counter()
+                first = True
+                for chunk in self.tts.synth_stream(sentence):
+                    if gen != self._gen:
+                        break
+                    if first:
+                        first = False
+                        if not self._first_audio_at:
+                            self._first_audio_at = time.time()
+                            self.on_state({"type": "tts_first_audio", "ms": int((self._first_audio_at - self._utt_started) * 1000),
+                                           "synth_ms": int((time.perf_counter() - t0) * 1000)})
+                    self.player.feed(chunk, self.player.generation)
+                self.recent.append(sentence)
+            except Exception as e:  # noqa: BLE001
+                log.warning("TTS failed for %r: %s", sentence[:60], e)
+            finally:
+                self._busy.clear()
+
+    def close(self) -> None:
+        self._q.put(None)
