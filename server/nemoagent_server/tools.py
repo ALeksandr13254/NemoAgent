@@ -424,13 +424,15 @@ SERVER_TOOLS: dict[str, tuple[dict, ServerTool]] = {
 }
 
 
-def all_schemas(client_tools_enabled: bool, vision_enabled: bool) -> list[dict]:
+def all_schemas(client_tools_enabled: bool, vision_enabled: bool, memory_enabled: bool = True) -> list[dict]:
     """Tools are for actions only; talking is plain streamed text (see agent.py)."""
     schemas = []
     for name, (schema, _) in SERVER_TOOLS.items():
         if not vision_enabled and name in ("analyze_attachments", "look_at_screen", "web_search"):
             continue
         if name == "look_at_screen" and not client_tools_enabled:
+            continue
+        if name == "search_memory" and not memory_enabled:
             continue
         schemas.append(schema)
     if client_tools_enabled:

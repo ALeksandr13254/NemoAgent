@@ -48,6 +48,7 @@ class ClientCore:
             "stt_language": settings.STT_LANGUAGE,
             "speaker_device": settings.SPEAKER_DEVICE or "",
             "mic_device": settings.MIC_DEVICE or "",
+            "memory_recall": False,     # 🗂 button: recall long-term memory for the messages while it is on
         }
         self.current_source = "text"
         self.turn_t0 = 0.0
@@ -275,9 +276,10 @@ class ClientCore:
         if self.speaker:
             self.speaker.cancel()
         tts = self._speak_enabled()
-        await self.broadcast({"type": "user_message", "text": text, "attachments": attachments, "source": source})
+        memory = bool(self.state.get("memory_recall"))
+        await self.broadcast({"type": "user_message", "text": text, "attachments": attachments, "source": source, "memory": memory})
         ok = await self.send_server({"type": "user_message", "text": text, "attachments": attachments,
-                                     "source": source, "tts": tts})
+                                     "source": source, "tts": tts, "memory": memory})
         if not ok:
             self.turn_active = False
             await self.broadcast({"type": "done", "finish_reason": "error"})
@@ -414,7 +416,8 @@ class ClientCore:
             await ws.send_text(json.dumps({"type": "pong", "t": msg.get("t")}))
 
     async def _apply_settings(self, s: dict) -> None:
-        for key in ("tts_mode", "auto_listen", "barge_in", "tools_enabled", "confirm", "voice_ru", "voice_en", "tts_speed", "stt_language"):
+        for key in ("tts_mode", "auto_listen", "barge_in", "tools_enabled", "confirm", "voice_ru", "voice_en", "tts_speed",
+                    "stt_language", "memory_recall"):
             if key in s:
                 self.state[key] = s[key]
         for key in ("speaker_device", "mic_device"):   # unchanged: don't reopen the stream

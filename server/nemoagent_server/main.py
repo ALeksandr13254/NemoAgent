@@ -3,8 +3,9 @@
 Protocol (JSON text frames):
   client -> server
     {"type":"hello", "token": "...", "client": {os, hostname, user, shell, screen, timezone, tools_enabled}}
-    {"type":"user_message", "text": "...", "attachments": ["id", ...], "source": "voice"|"text", "tts": bool}
-        tts=true offers the model the `speak` tool: the spoken text streams back as speech_delta events
+    {"type":"user_message", "text": "...", "attachments": ["id", ...], "source": "voice"|"text", "tts": bool, "memory": bool}
+        tts=true: the answer is written in TTS form and streamed as speech_delta events
+        memory=true: long-term memory is recalled for this message and the search_memory tool is offered
     {"type":"tool_result", "call_id": "...", "result": {...}}
     {"type":"interrupt"}          # stop the current answer (barge-in)
     {"type":"new_session"}
@@ -17,8 +18,10 @@ Protocol (JSON text frames):
     {"type":"tool_call", "id","name","arguments"}            # informational (server tools)
     {"type":"client_tool", "call_id","name","arguments"}     # execute on the client, reply with tool_result
     {"type":"tool_result", "id","name","ms","result"}
-    {"type":"speech_delta", "content": "..."}  # TTS-ready text from the speak tool (stream it to the TTS)
-    {"type":"speech_done", "display": str|null, "final": bool}   # display = screen version, if the model gave one
+    {"type":"speech_delta", "content": "..."}  # TTS-ready text (stream it to the TTS)
+    {"type":"speech_done", "display": str|null, "final": bool}   # display = screen-only part after ===, if any
+    {"type":"trace", "kind":"request", "messages":[...full prompt...], "tools":[...], "params":{...}}
+    {"type":"trace", "kind":"response", "content", "reasoning", "tool_calls", "usage", "ms"}
     {"type":"memory", "items":[...]}            {"type":"wait", ...}   {"type":"notice", "message"}
     {"type":"done", "finish_reason", "ms", "first_token_ms"}    {"type":"error", "message"}
 Uploads: POST /upload (multipart 'file', header Authorization: Bearer <AGENT_TOKEN>) -> attachment json.
@@ -199,7 +202,7 @@ async def ws_endpoint(ws: WebSocket):
                     link.cancel_pending()
                 turn_task = asyncio.create_task(link.session.handle_user_message(
                     msg.get("text") or "", msg.get("attachments") or [], msg.get("source") or "text",
-                    tts=bool(msg.get("tts"))))
+                    tts=bool(msg.get("tts")), memory=bool(msg.get("memory"))))
             elif t == "tool_result":
                 link.resolve(msg.get("call_id", ""), msg.get("result") or {})
             elif t == "interrupt":

@@ -21,7 +21,29 @@
     <button id="btn-settings" class="icon" title="Настройки">⚙</button>
   </header>
 
-  <main id="chat"></main>
+  <nav class="tabs">
+    <button class="tab active" data-tab="chat">Чат</button>
+    <button class="tab" data-tab="prompt">Системный промпт</button>
+    <button class="tab" data-tab="log">Полный лог <span id="log-count" class="muted"></span></button>
+  </nav>
+
+  <main id="chat" class="tabpane"></main>
+
+  <section id="prompt" class="tabpane hidden">
+    <div class="panehead">
+      <span class="muted small" id="prompt-meta">Появится после первого сообщения: ровно тот системный промпт, который ушёл в модель.</span>
+    </div>
+    <pre id="prompt-text" class="raw"></pre>
+  </section>
+
+  <section id="log" class="tabpane hidden">
+    <div class="panehead">
+      <span class="muted small">Всё, что реально уходит в модель и приходит от неё: системный промпт, история, вызовы инструментов и их результаты, ответы, usage.</span>
+      <span class="spacer"></span>
+      <button id="log-clear" class="link">очистить</button>
+    </div>
+    <div id="log-list"></div>
+  </section>
 
   <div id="attachments" class="attachments"></div>
 
@@ -32,6 +54,7 @@
         <button id="btn-attach" class="icon" title="Прикрепить файлы">📎</button>
         <input type="file" id="file-input" multiple hidden>
         <button id="btn-shot" class="icon" title="Сделать скриншот и прикрепить">🖥</button>
+        <button id="btn-memory" class="icon" title="Память (RAG по прошлым диалогам): пока включено, к сообщениям подмешиваются воспоминания и модели доступен поиск по памяти">🗂</button>
         <button id="btn-ptt" class="icon" title="Удерживайте, чтобы говорить (push-to-talk)">🎙</button>
         <button id="btn-listen" class="icon" title="Автоматическое прослушивание (VAD)">👂</button>
         <button id="btn-stop" class="icon" title="Остановить ответ / озвучку">■</button>

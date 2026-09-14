@@ -201,10 +201,11 @@ class AgentSession:
         self.created_at = time.time()
 
     # ------------------------------------------------------------- main turn
-    async def handle_user_message(self, text: str, attachment_ids: list[str], source: str = "text", tts: bool = False) -> None:
+    async def handle_user_message(self, text: str, attachment_ids: list[str], source: str = "text",
+                                  tts: bool = False, memory: bool = False) -> None:
         if self.busy():
             await self.interrupt()
-        self._task = asyncio.create_task(self._run_turn(text, attachment_ids, source, tts))
+        self._task = asyncio.create_task(self._run_turn(text, attachment_ids, source, tts, memory))
         try:
             await self._task
         except asyncio.CancelledError:
@@ -232,7 +233,7 @@ class AgentSession:
         await self.send({"type": "memory", "items": [{"kind": r["kind"], "score": round(r["score"], 2),
                                                       "text": r["text"][:300], "ts": r["ts"]} for r in recalled]})
 
-    async def _run_turn(self, text: str, attachment_ids: list[str], source: str, tts: bool) -> None:
+    async def _run_turn(self, text: str, attachment_ids: list[str], source: str, tts: bool, memory: bool = False) -> None:
         t_start = time.time()
         text = (text or "").strip()
         atts = [self.services.attachments.get(a) for a in attachment_ids or []]
@@ -248,13 +249,14 @@ class AgentSession:
             listing = "; ".join(self.services.attachments.describe(a) for a in atts)
             user_content += f"\n\n[attachments: {listing}]"
         self.messages.append({"role": "user", "content": user_content})
-        if settings.MEMORY_AUTO_RECALL and text:
+        use_memory = memory or settings.MEMORY_AUTO_RECALL
+        if use_memory and text:
             await self._recall(text)
         self.turns += 1
         self._trim_context()
 
         tools_enabled = bool(self.client_info.get("tools_enabled", True))
-        schemas = all_schemas(tools_enabled, self.services.vision.enabled)
+        schemas = all_schemas(tools_enabled, self.services.vision.enabled, memory_enabled=use_memory)
         ctx = ToolContext(self, self.client_call)
         assistant_text = ""       # what goes to memory
         first_token_ms: Optional[int] = None
@@ -290,9 +292,20 @@ class AgentSession:
                 if log.isEnabledFor(logging.DEBUG):
                     log.debug("session %s round %d messages:\n%s", self.id, round_no,
                               json.dumps(messages[1:], ensure_ascii=False, indent=1)[-6000:])
+                # full trace for the client's log tab: exactly what goes to the model
+                await self.send({"type": "trace", "kind": "request", "turn": self.turns, "round": round_no,
+                                 "model": settings.LLM_MODEL, "messages": messages,
+                                 "tools": [s["function"]["name"] for s in schemas],
+                                 "params": {"temperature": settings.LLM_TEMPERATURE, "max_tokens": settings.LLM_MAX_TOKENS,
+                                            "thinking": settings.LLM_THINKING, "tool_choice": "auto" if schemas else None,
+                                            "tts": tts, "memory": use_memory, "source": source}})
                 acc: Completion = await self.services.nim.chat_stream(messages, schemas, on_event=on_event)
                 log.info("session %s round %d: %d chars, %d tool calls, %.1fs", self.id, round_no,
                          len(acc.content), len(acc.tool_calls), time.time() - round_t0)
+                await self.send({"type": "trace", "kind": "response", "turn": self.turns, "round": round_no,
+                                 "content": acc.content, "reasoning": acc.reasoning, "tool_calls": acc.tool_calls,
+                                 "finish_reason": acc.finish_reason, "usage": acc.usage,
+                                 "ms": int((time.time() - round_t0) * 1000)})
                 if acc.finish_reason == "length":
                     await self.send({"type": "notice", "message": "Ответ обрезан по лимиту max_tokens."})
 

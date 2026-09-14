@@ -62,7 +62,9 @@ class Settings:
 
     # --- memory (RAG over past dialogs) ---
     MEMORY_DB = Path(_env("MEMORY_DB", str(SERVER_DIR / "data" / "memory.sqlite3")))
-    MEMORY_AUTO_RECALL = _bool("MEMORY_AUTO_RECALL", True)
+    # Memory (RAG over past dialogs) is used only when the client asks for it (the 🗂 button); set
+    # true to recall automatically on every message instead.
+    MEMORY_AUTO_RECALL = _bool("MEMORY_AUTO_RECALL", False)
     MEMORY_TOP_K = _int("MEMORY_TOP_K", 4)
     MEMORY_MIN_SCORE = _float("MEMORY_MIN_SCORE", 0.5)
     CONTEXT_BUDGET_TOKENS = _int("CONTEXT_BUDGET_TOKENS", 60000)

@@ -42,13 +42,54 @@
     ws.onmessage = (e) => { try { handle(JSON.parse(e.data)); } catch (err) { console.error(err, e.data); } };
   }
 
+  /* ---------------------------------------------------------------- tabs, prompt & full log */
+  document.querySelectorAll('nav.tabs .tab').forEach((b) => b.onclick = () => {
+    document.querySelectorAll('nav.tabs .tab').forEach((x) => x.classList.toggle('active', x === b));
+    for (const id of ['chat', 'prompt', 'log']) $(id).classList.toggle('hidden', id !== b.dataset.tab);
+    document.querySelector('footer').classList.toggle('hidden', b.dataset.tab !== 'chat');
+    $('attachments').classList.toggle('hidden', b.dataset.tab !== 'chat');
+  });
+  let logCount = 0;
+  const logList = $('log-list');
+  function logEntry(cls, title, bodyHtml, open) {
+    const d = document.createElement('details'); d.className = 'logent ' + cls; if (open) d.open = true;
+    d.innerHTML = `<summary>${title}</summary>${bodyHtml}`; logList.appendChild(d);
+    logCount++; $('log-count').textContent = `(${logCount})`;
+    if (logList.children.length > 400) logList.removeChild(logList.firstChild);
+    return d;
+  }
+  function renderMessages(msgs) {
+    return msgs.map((m) => {
+      let body = '';
+      if (typeof m.content === 'string' && m.content) body += esc(m.content);
+      else if (m.content && typeof m.content !== 'string') body += esc(JSON.stringify(m.content, null, 1));
+      if (m.tool_calls) body += (body ? '\n' : '') + '⚙ tool_calls: ' + esc(JSON.stringify(m.tool_calls.map((t) => ({ id: t.id, name: t.function?.name, arguments: t.function?.arguments })), null, 1));
+      const extra = m.tool_call_id ? ` <span class="muted">(tool_call_id ${esc(m.tool_call_id)}${m.name ? ', ' + esc(m.name) : ''})</span>` : '';
+      return `<div class="m ${esc(m.role)}"><span class="msg-role">${esc(m.role)}</span>${extra}<pre>${body}</pre></div>`;
+    }).join('');
+  }
+  function handleTrace(m) {
+    const t = new Date().toLocaleTimeString();
+    if (m.kind === 'request') {
+      const sys = (m.messages || []).find((x) => x.role === 'system');
+      if (sys) { $('prompt-text').textContent = sys.content; $('prompt-meta').textContent = `${t} · ход ${m.turn}, раунд ${m.round} · ${m.model} · инструменты: ${(m.tools || []).join(', ') || 'нет'} · ${JSON.stringify(m.params)}`; }
+      logEntry('req', `→ <b>запрос</b> ${t} · ход ${m.turn} · раунд ${m.round} · ${esc(m.model)} · сообщений: ${m.messages.length} · инструменты: ${esc((m.tools || []).join(', ') || 'нет')} · ${esc(JSON.stringify(m.params))}`, renderMessages(m.messages), false);
+    } else if (m.kind === 'response') {
+      const tc = (m.tool_calls || []).map((c) => `${c.function?.name}(${c.function?.arguments})`).join('\n');
+      const body = `<pre>${m.reasoning ? '🧠 reasoning:\n' + esc(m.reasoning) + '\n\n' : ''}${esc(m.content || '')}${tc ? '\n⚙ tool_calls:\n' + esc(tc) : ''}\n\nfinish_reason: ${esc(String(m.finish_reason))} · usage: ${esc(JSON.stringify(m.usage))} · ${m.ms} мс</pre>`;
+      logEntry('res', `← <b>ответ</b> ${t} · ход ${m.turn} · раунд ${m.round} · ${(m.content || '').length} симв. · ${(m.tool_calls || []).length} вызов. · ${m.ms} мс`, body, false);
+    }
+  }
+  $('log-clear').onclick = () => { logList.innerHTML = ''; logCount = 0; $('log-count').textContent = ''; };
+
   function handle(m) {
     switch (m.type) {
       case 'status': state = m; renderStatus(); break;
+      case 'trace': handleTrace(m); break;
       case 'user_message': {
         const d = div('msg user');
         const src = m.source === 'voice' ? '🎙 голос' : '⌨ текст';
-        let html = `<div class="src">${src}</div>${fmt(m.text || '')}`;
+        let html = `<div class="src">${src}${m.memory ? ' · 🗂 память' : ''}</div>${fmt(m.text || '')}`;
         if (m.attachments && m.attachments.length) html += `<div class="src">📎 ${m.attachments.length} влож.</div>`;
         d.innerHTML = html; add(d);
         current = null; reasoningCard = null; metrics = { stt: metrics.stt }; updateMetrics();
@@ -79,10 +120,15 @@
         if (!reasoningCard) { reasoningCard = card('reasoning', '🧠 рассуждения', '', false); }
         const pre = reasoningCard.querySelector('pre'); pre.textContent += m.content; break;
       }
-      case 'tool_call': card('tool', `🔧 <b>${esc(m.name)}</b>`, JSON.stringify(m.arguments ?? m.raw, null, 1), false); current = null; break;
+      case 'tool_call':
+        card('tool', `🔧 <b>${esc(m.name)}</b>`, JSON.stringify(m.arguments ?? m.raw, null, 1), false); current = null;
+        logEntry('tool', `⚙ <b>вызов ${esc(m.name)}</b> ${new Date().toLocaleTimeString()}`, `<pre>${esc(JSON.stringify(m.arguments ?? m.raw, null, 1))}</pre>`, false);
+        break;
       case 'tool_result': {
         const r = m.result || {}; const ok = !r.error;
-        card('tool', `${ok ? '✅' : '⚠️'} <b>${esc(m.name)}</b> · ${m.ms} мс`, JSON.stringify(r, null, 1).slice(0, 4000), !ok); break;
+        card('tool', `${ok ? '✅' : '⚠️'} <b>${esc(m.name)}</b> · ${m.ms} мс`, JSON.stringify(r, null, 1).slice(0, 4000), !ok);
+        logEntry('tool', `${ok ? '✅' : '⚠️'} <b>результат ${esc(m.name)}</b> · ${m.ms} мс`, `<pre>${esc(JSON.stringify(r, null, 1))}</pre>`, false);
+        break;
       }
       case 'client_tool_start': $('stt-state').textContent = `выполняю: ${m.summary.slice(0, 80)}`; break;
       case 'client_tool_done': $('stt-state').textContent = m.ok ? '' : `⚠ ${m.name} завершился с ошибкой`; break;
@@ -126,6 +172,7 @@
     setPill('pill-memory', 'ok', `память ${mem}`);
     $('model').textContent = si.model ? '· ' + si.model.split('/').pop() : '';
     $('btn-listen').classList.toggle('active', !!state.listening);
+    $('btn-memory').classList.toggle('active', !!(state.settings && state.settings.memory_recall));
     $('pill-stt').title = state.mic ? 'микрофон: ' + state.mic : '';
     const s = state.settings || {};
     for (const k of ['tts_mode', 'confirm', 'stt_language']) $('s-' + k).value = s[k];
@@ -209,6 +256,7 @@
   $('btn-stop').onclick = () => send({ type: 'interrupt' });
   $('btn-new').onclick = () => send({ type: 'new_session' });
   $('btn-listen').onclick = () => pushSettings({ auto_listen: !(state?.settings?.auto_listen) });
+  $('btn-memory').onclick = () => pushSettings({ memory_recall: !(state?.settings?.memory_recall) });
 
   /* push-to-talk: hold the button (mouse/touch) or hold Space when the input is not focused */
   const ptt = $('btn-ptt'); let held = false;
