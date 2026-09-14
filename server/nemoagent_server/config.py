@@ -56,25 +56,6 @@ class Settings:
     LLM_TOP_P = _env("LLM_TOP_P")                   # unset = model default
     UPSTREAM_TIMEOUT = _int("UPSTREAM_TIMEOUT", 600)  # seconds of NIM silence we tolerate
     MAX_TOOL_ROUNDS = _int("MAX_TOOL_ROUNDS", 12)
-    # How the model produces speech when the client wants voice:
-    #   prose — the answer itself is written in TTS format (rules in the system prompt) and streamed
-    #           sentence by sentence; screen-only text goes after a `===` line. Fastest, no tool quirks.
-    #   tool  — the model calls speak(speech, display). NIM delivers tool arguments in one piece, so
-    #           the voice starts only after the whole answer is generated.
-    SPEECH_MODE = _env("SPEECH_MODE", "prose")
-    # tool_choice=required would guarantee the `speak` tool, but in streaming mode NIM then buffers the
-    # whole call (no incremental speech) and sometimes leaks the JSON into the text — keep it off.
-    SPEAK_REQUIRED = _bool("SPEAK_REQUIRED", False)
-    # Fallback when the model answers in plain prose although speech was requested: a fast model
-    # rewrites the answer into TTS-ready text (streamed to the client as speech).
-    SPEAK_REWRITE = _bool("SPEAK_REWRITE", True)
-    # How a `speak` answer is kept in the conversation history: "content" turns it into a normal
-    # assistant message (coherent multi-turn dialogue), "tool" keeps the raw tool call + result.
-    # "tool" keeps the model calling speak reliably; with "content" it drifts into writing the call as text.
-    SPEAK_HISTORY = _env("SPEAK_HISTORY", "tool")
-    # Default = the main model: on the free pool the "small" models (lightning 30B, ultra 550B) queue for
-    # a minute, while Super answers in ~1 s and rewrites cleanly.
-    SPEAK_REWRITE_MODEL = _env("SPEAK_REWRITE_MODEL") or LLM_MODEL
 
     EMBED_TEXT_MODEL = _env("EMBED_TEXT_MODEL", "nvidia/nemotron-3-embed-1b")
     EMBED_VL_MODEL = _env("EMBED_VL_MODEL", "nvidia/llama-nemotron-embed-vl-1b-v2")

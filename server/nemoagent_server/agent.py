@@ -1,4 +1,12 @@
-"""Agent session: conversation state, streaming tool loop, memory recall and context trimming."""
+"""Agent session: conversation state, streaming tool loop, memory recall and context trimming.
+
+Speech without function calling. When the client wants voice, the model is prompted to write the
+answer itself in a TTS-ready form (rules in VOICE_STYLE_PROSE) and the text is streamed to the
+client as speech while it is being generated (ProseSpeechRouter): the first sentence is spoken
+about a second after the request, the rest follows without gaps. A line with `===` separates an
+optional screen-only part (code, paths, links). Tools are used only for actions — commands, files,
+screen, attachments, web search — never for talking.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -6,7 +14,6 @@ import datetime as dt
 import json
 import logging
 import platform
-import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -83,172 +90,6 @@ If the answer needs code, a shell command, a file path, a link, exact figures or
   ```
 Before a long tool action you may write one short sentence about what you are doing ("Сейчас проверю."), then call the tools."""
 
-VOICE_STYLE_SPEAK = """Your answer is read aloud by a text-to-speech engine. ALWAYS finish your turn by calling the `speak` tool (do not write the final answer as plain text). In `speech` follow these rules strictly:
-""" + SPEECH_RULES + """
-Use the optional `display` argument for the screen version whenever the answer contains code, commands, paths, links, exact numbers or a table — there markdown is fine. If `display` is omitted, `speech` is shown on screen.
-Example. User: "Напиши команду PowerShell для топ пяти процессов по памяти." — you call the speak tool with
-  speech: Команда на экране. Она берёт все процессы, сортирует по занятой памяти по убыванию и оставляет первые пять.
-  display: ```powershell\nGet-Process | Sort-Object WorkingSet -Descending | Select-Object -First 5 Name, Id, WorkingSet\n```
-Example. A tool result says free space is 24.9 GB of 1765.3 GB on drive C — you call the speak tool with
-  speech: На диске Це свободно двадцать четыре целых девять десятых гигабайта из тысячи семисот шестидесяти пяти.
-  display: Диск C: свободно 24,9 ГБ из 1765,3 ГБ
-(The speak tool is a real function call, never text like speak(...) in your reply.)
-Before a long tool action you may call speak together with the other tools to say what you are doing ("Сейчас проверю."); the turn then continues after the tools return."""
-
-SPEECH_REWRITE_PROMPT = """You convert an assistant's written answer into text for a Russian/English text-to-speech engine with a tiny vocabulary. Output ONLY the spoken text, nothing else. Rules:
-- Keep the meaning and the language of the answer; drop markdown, lists, headings, code, commands, file paths, URLs, e-mails and identifiers (mention that they are shown on screen if they matter).
-- Allowed characters: letters, spaces and . , ! ? : ; - ( ) « » " '. No digits and no symbols: write every number in words in the correct grammatical form ("двадцать четыре целых девять десятых гигабайта", "пятнадцать ноль две", "минус три градуса", "восемьдесят процентов"); expand abbreviations and units ("гигабайт", "операционная система"); spell letter-by-letter abbreviations as letter names ("эс-ша-а").
-- In Russian text write foreign names and brands in Cyrillic ("Виндоус", "Гитхаб", "Пайтон"). Use ё where it belongs.
-- Short natural sentences, concise. No emoji."""
-
-
-class JsonStringStreamer:
-    """Incrementally extracts the value of one string key from JSON arriving in fragments.
-
-    Used to start speaking a `speak` call while the model is still streaming its arguments.
-    `opener` may override the pattern that starts the string (e.g. a pseudo-call `speak(speech="`).
-    """
-
-    _ESC = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "/": "/", "\\": "\\", '"': '"'}
-
-    def __init__(self, key: str, opener: Optional[str] = None):
-        self.key = key
-        self.opener = opener or (r'"' + re.escape(key) + r'"\s*:\s*"')
-        self.raw = ""
-        self.pos = 0
-        self.state = "seek"
-
-    @property
-    def done(self) -> bool:
-        return self.state == "done"
-
-    def feed(self, chunk: str) -> str:
-        self.raw += chunk
-        if self.state == "seek":
-            m = re.search(self.opener, self.raw)
-            if not m:
-                return ""
-            self.pos = m.end()
-            self.state = "in"
-        if self.state != "in":
-            return ""
-        out: list[str] = []
-        i = self.pos
-        n = len(self.raw)
-        while i < n:
-            c = self.raw[i]
-            if c == "\\":
-                if i + 1 >= n:
-                    break
-                e = self.raw[i + 1]
-                if e == "u":
-                    if i + 6 > n:
-                        break
-                    try:
-                        code = int(self.raw[i + 2:i + 6], 16)
-                    except ValueError:
-                        i += 2
-                        continue
-                    if 0xD800 <= code <= 0xDBFF:  # surrogate pair
-                        if i + 12 > n:
-                            break
-                        if self.raw[i + 6:i + 8] == "\\u":
-                            try:
-                                low = int(self.raw[i + 8:i + 12], 16)
-                                code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
-                                i += 12
-                            except ValueError:
-                                i += 6
-                        else:
-                            i += 6
-                    else:
-                        i += 6
-                    out.append(chr(code))
-                    continue
-                out.append(self._ESC.get(e, e))
-                i += 2
-                continue
-            if c == '"':
-                self.state = "done"
-                i += 1
-                break
-            out.append(c)
-            i += 1
-        self.pos = i
-        return "".join(out)
-
-
-_PSEUDO_RE = re.compile(r"speak\s*\(\s*speech\s*=\s*\"")
-_PSEUDO_DISPLAY_RE = re.compile(r"display\s*=\s*\"((?:[^\"\\]|\\.)*)\"", re.S)
-
-
-class PseudoSpeakDetector:
-    """The model sometimes writes the call as text — `speak(speech="...", display="...")` — instead
-    of calling the tool. This streams such text as speech (and hides it from the chat) so the answer
-    is still spoken immediately, without the slow rewrite fallback.
-
-    feed() yields ("delta", text) for ordinary content and ("speech", text) for spoken pieces.
-    """
-
-    def __init__(self) -> None:
-        self.buf = ""
-        self.mode = "text"           # text | call
-        self.streamer: Optional[JsonStringStreamer] = None
-        self.tail = ""               # everything after `speak(` (for display= parsing)
-        self.speech = ""
-        self.detected = False
-
-    def feed(self, chunk: str):
-        if self.mode == "call":
-            self.tail += chunk
-            piece = self.streamer.feed(chunk)
-            if piece:
-                self.speech += piece
-                yield ("speech", piece)
-            return
-        self.buf += chunk
-        m = _PSEUDO_RE.search(self.buf)
-        if m:
-            before = self.buf[:m.start()]
-            if before.strip():
-                yield ("delta", before)
-            self.mode = "call"
-            self.detected = True
-            self.streamer = JsonStringStreamer("speech", opener=_PSEUDO_RE.pattern)
-            rest = self.buf[m.start():]
-            self.buf = ""
-            self.tail = rest
-            piece = self.streamer.feed(rest)
-            if piece:
-                self.speech += piece
-                yield ("speech", piece)
-            return
-        # hold back a tail that could be the beginning of "speak(speech="
-        hold = 0
-        for k in range(min(len(self.buf), 14), 0, -1):
-            if "speak(speech=".startswith(self.buf[-k:].lower().replace(" ", "")[:13]):
-                hold = k
-                break
-        emit = self.buf[:len(self.buf) - hold] if hold else self.buf
-        self.buf = self.buf[len(emit):]
-        if emit:
-            yield ("delta", emit)
-
-    def finish(self):
-        if self.mode == "text" and self.buf:
-            b, self.buf = self.buf, ""
-            yield ("delta", b)
-
-    def display(self) -> Optional[str]:
-        m = _PSEUDO_DISPLAY_RE.search(self.tail)
-        if not m:
-            return None
-        raw = m.group(1)
-        try:
-            return json.loads('"' + raw + '"') or None
-        except Exception:
-            return raw.replace("\\n", "\n").replace('\\"', '"') or None
-
 
 class AgentSession:
     def __init__(self, services: Services, send: SendFn, client_call: ClientCallFn, client_info: Optional[dict] = None):
@@ -299,12 +140,9 @@ class AgentSession:
         return f"Current date and time on the user's machine: {now.strftime('%A, %d %B %Y, %H:%M')} ({name})."
 
     def _system_message(self, tts: bool) -> dict:
-        if tts:
-            style = VOICE_STYLE_SPEAK if settings.SPEECH_MODE == "tool" else VOICE_STYLE_PROSE
-        else:
-            style = VOICE_STYLE_TEXT
         return {"role": "system", "content": SYSTEM_PROMPT.format(
-            env=self._env_description() + "\n" + self._now_line(), voice_style=style)}
+            env=self._env_description() + "\n" + self._now_line(),
+            voice_style=VOICE_STYLE_PROSE if tts else VOICE_STYLE_TEXT)}
 
     def note_screenshot(self, attachment_id: str) -> None:
         self.session_attachment_ids.append(attachment_id)
@@ -372,6 +210,28 @@ class AgentSession:
         except asyncio.CancelledError:
             pass
 
+    async def _recall(self, text: str) -> None:
+        """Automatic memory recall, presented as a search_memory tool round (an observation, not a transcript)."""
+        try:
+            recalled = await asyncio.wait_for(self.services.memory.search(text, exclude_session=self.id), timeout=6.0)
+        except Exception as e:  # noqa: BLE001
+            log.warning("memory recall failed: %s", e)
+            return
+        if not recalled:
+            return
+        call_id = f"mem_{uuid.uuid4().hex[:8]}"
+        results = [{"when": dt.datetime.fromtimestamp(r["ts"]).strftime("%Y-%m-%d %H:%M"), "kind": r["kind"],
+                    "score": round(r["score"], 3), "text": r["text"][:2500]} for r in recalled]
+        self.messages.append({"role": "assistant", "content": None, "tool_calls": [{
+            "id": call_id, "type": "function",
+            "function": {"name": "search_memory", "arguments": json.dumps({"query": text[:200]}, ensure_ascii=False)}}]})
+        self.messages.append({"role": "tool", "tool_call_id": call_id, "name": "search_memory", "content": json.dumps({
+            "note": ("PAST conversations (earlier sessions) — background context only, not the current request; "
+                     "answer the latest message on its own merits."),
+            "count": len(results), "results": results}, ensure_ascii=False)})
+        await self.send({"type": "memory", "items": [{"kind": r["kind"], "score": round(r["score"], 2),
+                                                      "text": r["text"][:300], "ts": r["ts"]} for r in recalled]})
+
     async def _run_turn(self, text: str, attachment_ids: list[str], source: str, tts: bool) -> None:
         t_start = time.time()
         text = (text or "").strip()
@@ -387,142 +247,76 @@ class AgentSession:
         if atts:
             listing = "; ".join(self.services.attachments.describe(a) for a in atts)
             user_content += f"\n\n[attachments: {listing}]"
-
-        # --- memory recall (runs before the LLM call; both embeddings in parallel)
-        recalled: list[dict] = []
-        if settings.MEMORY_AUTO_RECALL and text:
-            try:
-                recalled = await asyncio.wait_for(
-                    self.services.memory.search(text, exclude_session=self.id), timeout=6.0)
-            except Exception as e:  # noqa: BLE001
-                log.warning("memory recall failed: %s", e)
         self.messages.append({"role": "user", "content": user_content})
-        if recalled:
-            # Presented as an automatic search_memory tool round (not as a transcript in the system
-            # prompt): the model then treats memories as observations and keeps its tool habits —
-            # a transcript-looking block made it drift into plain-prose answers.
-            call_id = f"mem_{uuid.uuid4().hex[:8]}"
-            # same shape as a real search_memory result, so the model sees one format only
-            results = [{"when": dt.datetime.fromtimestamp(r["ts"]).strftime("%Y-%m-%d %H:%M"), "kind": r["kind"],
-                        "score": round(r["score"], 3), "text": r["text"][:2500]} for r in recalled]
-            self.messages.append({"role": "assistant", "content": None, "tool_calls": [{
-                "id": call_id, "type": "function",
-                "function": {"name": "search_memory", "arguments": json.dumps({"query": text[:200]}, ensure_ascii=False)}}]})
-            self.messages.append({"role": "tool", "tool_call_id": call_id, "name": "search_memory", "content": json.dumps({
-                "note": ("PAST conversations (earlier sessions) — background context only, not the current request; "
-                         "answer the latest message on its own merits."),
-                "count": len(results), "results": results}, ensure_ascii=False)})
-            await self.send({"type": "memory", "items": [{"kind": r["kind"], "score": round(r["score"], 2),
-                                                          "text": r["text"][:300], "ts": r["ts"]} for r in recalled]})
+        if settings.MEMORY_AUTO_RECALL and text:
+            await self._recall(text)
         self.turns += 1
         self._trim_context()
 
         tools_enabled = bool(self.client_info.get("tools_enabled", True))
-        tool_mode = tts and settings.SPEECH_MODE == "tool"
-        prose_mode = tts and not tool_mode
-        schemas = all_schemas(tools_enabled, self.services.vision.enabled, speak_enabled=tool_mode)
+        schemas = all_schemas(tools_enabled, self.services.vision.enabled)
         ctx = ToolContext(self, self.client_call)
         assistant_text = ""       # what goes to memory
         first_token_ms: Optional[int] = None
         finish = "stop"
-        spoke_last_round = False
         last_call_signature: Optional[str] = None
         try:
             for round_no in range(1, settings.MAX_TOOL_ROUNDS + 1):
                 await self.send({"type": "round", "round": round_no})
                 messages = [self._system_message(tts)] + self.messages
                 round_t0 = time.time()
-                speech_streams: dict[int, JsonStringStreamer] = {}
-                speech_routers: dict[int, ProseSpeechRouter] = {}
+                prose = ProseSpeechRouter() if tts else None
                 spoke_this_round = False
-                pseudo = PseudoSpeakDetector() if tool_mode else None
-                prose = ProseSpeechRouter() if prose_mode else None
-
-                async def emit_routed(events) -> None:
-                    nonlocal spoke_this_round
-                    for what, text in events:
-                        if what == "speech":
-                            spoke_this_round = True
-                            await self.send({"type": "speech_delta", "content": text})
-                        else:
-                            await self.send({"type": "delta", "content": text})
 
                 async def on_event(kind: str, data: dict) -> None:
                     nonlocal first_token_ms, spoke_this_round
                     if kind == "delta":
                         if first_token_ms is None:
                             first_token_ms = int((time.time() - t_start) * 1000)
-                        if prose is not None:
-                            await emit_routed(prose.feed(data["content"]))
-                        elif pseudo is not None:
-                            await emit_routed(pseudo.feed(data["content"]))
-                        else:
+                        if prose is None:
                             await self.send({"type": "delta", "content": data["content"]})
+                            return
+                        for what, piece in prose.feed(data["content"]):
+                            if what == "speech":
+                                spoke_this_round = True
+                                await self.send({"type": "speech_delta", "content": piece})
+                            else:
+                                await self.send({"type": "delta", "content": piece})
                     elif kind == "reasoning":
                         await self.send({"type": "reasoning", "content": data["content"]})
-                    elif kind == "tool_delta":
-                        if data.get("name") == "speak" and tool_mode:
-                            st = speech_streams.setdefault(data["index"], JsonStringStreamer("speech"))
-                            router = speech_routers.setdefault(data["index"], ProseSpeechRouter())
-                            piece = st.feed(data.get("arguments") or "")
-                            if piece:
-                                if first_token_ms is None:
-                                    first_token_ms = int((time.time() - t_start) * 1000)
-                                await emit_routed(router.feed(piece))
-                            if st.done:
-                                await emit_routed(router.finish())
-                    else:
+                    elif kind == "wait":
                         await self.send({"type": "wait", **data})
 
-                # With `speak` on the table the model must go through a tool every round: otherwise it
-                # happily answers in plain text after tool results and the TTS gets raw prose. But right
-                # after a round where it already spoke (narration + tools), forcing a tool again makes it
-                # repeat the same calls forever — so that round runs on "auto".
-                choice = "required" if (tts and settings.SPEAK_REQUIRED and not spoke_last_round) else "auto"
                 if log.isEnabledFor(logging.DEBUG):
                     log.debug("session %s round %d messages:\n%s", self.id, round_no,
                               json.dumps(messages[1:], ensure_ascii=False, indent=1)[-6000:])
-                acc: Completion = await self.services.nim.chat_stream(messages, schemas, tool_choice=choice, on_event=on_event)
+                acc: Completion = await self.services.nim.chat_stream(messages, schemas, on_event=on_event)
                 log.info("session %s round %d: %d chars, %d tool calls, %.1fs", self.id, round_no,
                          len(acc.content), len(acc.tool_calls), time.time() - round_t0)
-
                 if acc.finish_reason == "length":
                     await self.send({"type": "notice", "message": "Ответ обрезан по лимиту max_tokens."})
 
-                if pseudo is not None:
-                    await emit_routed(pseudo.finish())
                 if prose is not None:
-                    await emit_routed(prose.finish())
+                    for what, piece in prose.finish():
+                        spoke_this_round = spoke_this_round or what == "speech"
+                        await self.send({"type": "speech_delta" if what == "speech" else "delta", "content": piece})
 
+                # ---------------- final answer (no tool calls)
                 if not acc.tool_calls:
                     if prose is not None:
                         speech, display = prose.result
-                        if acc.content.strip() != speech.strip():
-                            log.info("session %s: filler stripped: %r -> %r", self.id, acc.content.strip()[-120:], speech[-120:])
-                        if speech or display:
-                            await self.send({"type": "speech_done", "display": display, "final": True})
-                            said = speech + (("\n" + display) if display else "")
-                            assistant_text = said
-                            self.messages.append({"role": "assistant", "content": said})
-                            finish = "speak"
-                            break
-                    if pseudo is not None and pseudo.detected and pseudo.speech.strip():
-                        # the model wrote speak(...) as text: already streamed as speech above
-                        display = pseudo.display()
-                        said = display or pseudo.speech.strip()
+                        spoken_raw = acc.content.split("\n===")[0].strip()
+                        if spoken_raw != speech.strip():
+                            log.info("session %s: filler stripped: %r -> %r", self.id, spoken_raw[-120:], speech[-120:])
                         await self.send({"type": "speech_done", "display": display, "final": True})
-                        assistant_text = said
-                        self.messages.append({"role": "assistant", "content": said})
+                        assistant_text = speech + (("\n" + display) if display else "")
                         finish = "speak"
-                        break
-                    assistant_text = acc.content
-                    self.messages.append({"role": "assistant", "content": acc.content})
-                    if tts and acc.content.strip() and settings.SPEAK_REWRITE:
-                        # plain prose although speech was requested: rewrite it for the TTS engine
-                        await self._rewrite_for_speech(acc.content)
-                        finish = "rewrite"
+                    else:
+                        assistant_text = acc.content.strip()
+                    self.messages.append({"role": "assistant", "content": assistant_text})
                     break
 
+                # ---------------- tool calls
                 calls = []
                 for i, tc in enumerate(acc.tool_calls):
                     calls.append({
@@ -532,13 +326,13 @@ class AgentSession:
                     })
                 signature = json.dumps([(c["function"]["name"], c["function"]["arguments"]) for c in calls], ensure_ascii=False)
                 if signature == last_call_signature:
-                    # exact repeat of the previous round's calls: the model is stuck — stop here
                     log.warning("session %s: repeated tool calls, breaking the loop", self.id)
                     await self.send({"type": "notice", "message": "Модель повторяет одни и те же вызовы, останавливаю."})
                     self.messages.append({"role": "assistant", "content": assistant_text.strip() or "(stopped: repeated tool calls)"})
                     finish = "loop"
                     break
                 last_call_signature = signature
+
                 narration = acc.content.strip() if acc.content else ""
                 if prose is not None:
                     narration = strip_filler(narration) if narration else ""
@@ -548,42 +342,8 @@ class AgentSession:
                 if narration:
                     assistant_text += narration + "\n"
 
-                # --- `speak` calls: the spoken text was already streamed; finish them here
-                speak_calls = [c for c in calls if c["function"]["name"] == "speak"]
-                other_calls = [c for c in calls if c["function"]["name"] != "speak"]
-                spoken_texts: list[str] = []
-                for i, c in enumerate(speak_calls):
-                    speech, display = self._parse_speak(c["function"]["arguments"])
-                    speech = strip_filler(speech)
-                    if not spoke_this_round and speech:   # arguments arrived in one piece (non-streamed backend)
-                        await self.send({"type": "speech_delta", "content": speech})
-                    await self.send({"type": "speech_done", "display": display, "final": not other_calls})
-                    assistant_text += (display or speech) + "\n"
-                    spoken_texts.append(display or speech)
-                if speak_calls and settings.SPEAK_HISTORY == "content":
-                    # Keep what was said as a normal assistant message: the model then reads its own
-                    # replies as dialogue (and does not parrot the last tool call on unclear input).
-                    said = "\n".join(t for t in spoken_texts if t).strip()
-                    last = self.messages[-1]
-                    text_now = "\n".join(t for t in (narration, said) if t).strip()
-                    if other_calls:
-                        last["tool_calls"] = other_calls
-                        last["content"] = text_now or None
-                    else:
-                        self.messages[-1] = {"role": "assistant", "content": text_now}
-                elif speak_calls:
-                    for c, said in zip(speak_calls, spoken_texts):
-                        # the result repeats what was said, so the model sees its own reply as dialogue
-                        self.messages.append({"role": "tool", "tool_call_id": c["id"], "name": "speak",
-                                              "content": json.dumps({"ok": True, "said": said[:2000]}, ensure_ascii=False)})
-
-                if speak_calls and not other_calls:
-                    finish = "speak"
-                    break
-                spoke_last_round = bool(speak_calls)
-
-                results = await asyncio.gather(*(self._execute_call(ctx, c) for c in other_calls))
-                for call, result in zip(other_calls, results):
+                results = await asyncio.gather(*(self._execute_call(ctx, c) for c in calls))
+                for call, result in zip(calls, results):
                     self.messages.append({"role": "tool", "tool_call_id": call["id"],
                                           "name": call["function"]["name"], "content": compact_result(result)})
             else:
@@ -606,45 +366,6 @@ class AgentSession:
         if assistant_text.strip():
             asyncio.create_task(self.services.memory.remember_dialog(
                 self.id, text, assistant_text, {"source": source, "attachments": [a.name for a in atts]}))
-
-    async def _rewrite_for_speech(self, content: str) -> None:
-        """Fallback: turn a written answer into TTS-ready speech with a fast model, streamed."""
-        t0 = time.time()
-        router = ProseSpeechRouter()
-
-        async def on_event(kind: str, data: dict) -> None:
-            if kind == "delta":
-                for what, text in router.feed(data["content"]):
-                    if what == "speech":
-                        await self.send({"type": "speech_delta", "content": text})
-
-        try:
-            await self.services.nim.chat_stream(
-                [{"role": "system", "content": SPEECH_REWRITE_PROMPT},
-                 {"role": "user", "content": content[:6000]}],
-                None, model=settings.SPEAK_REWRITE_MODEL, thinking=False, temperature=0.2, max_tokens=900, on_event=on_event)
-            for what, text in router.finish():
-                if what == "speech":
-                    await self.send({"type": "speech_delta", "content": text})
-        except Exception as e:  # noqa: BLE001
-            log.warning("speech rewrite failed: %s", e)
-            if not router.speech:
-                await self.send({"type": "speech_delta", "content": strip_filler(content)})   # client sanitizes as best it can
-        await self.send({"type": "speech_done", "display": content, "final": True})
-        log.info("session %s: speech rewrite %d -> %d chars in %.1fs", self.id, len(content), len(router.speech), time.time() - t0)
-
-    @staticmethod
-    def _parse_speak(raw: str) -> tuple[str, Optional[str]]:
-        try:
-            args = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            st = JsonStringStreamer("speech")
-            return st.feed(raw), None
-        if not isinstance(args, dict):
-            return "", None
-        speech = str(args.get("speech") or "")
-        display = args.get("display")
-        return speech, (str(display) if display else None)
 
     async def _execute_call(self, ctx: ToolContext, call: dict) -> Any:
         name = call["function"]["name"]

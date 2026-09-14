@@ -63,7 +63,9 @@ class Speaker:
 
     def _enqueue(self, sentence: str, prepared: bool = False) -> None:
         self._prepared = prepared
-        cleaned = scrub_code(sentence if prepared else clean_for_tts(sentence))
+        # markdown cleaner is cheap and harmless on clean text, so it always runs: the model is asked
+        # to write speech, but a stray list marker or **bold** must never reach the vocoder
+        cleaned = scrub_code(clean_for_tts(sentence))
         if not has_speech(cleaned):
             return
         if cleaned == self._last_enqueued:      # a long command split into chunks -> one note, not three

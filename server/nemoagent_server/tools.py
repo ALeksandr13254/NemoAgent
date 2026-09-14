@@ -424,38 +424,9 @@ SERVER_TOOLS: dict[str, tuple[dict, ServerTool]] = {
 }
 
 
-# --------------------------------------------------------------------------- speak
-# The TTS engine on the client (TeraTTSv2) has a tiny character vocabulary: letters, space and
-# . , ! ? : ; - ( ) « » " ' — nothing else. Digits are expanded only in the nominative case, symbols
-# and abbreviations are dropped or read letter by letter. So the model writes the spoken text itself
-# through this tool, following SPEECH_RULES (see agent.py).
-SPEAK_TOOL: dict = {
-    "type": "function",
-    "function": {
-        "name": "speak",
-        "description": (
-            "Deliver your answer to the user out loud. `speech` is read by a text-to-speech engine with a very "
-            "limited vocabulary, so it must follow the speech rules from the system prompt: words only, numbers "
-            "and abbreviations spelled out; NEVER code, shell commands, file paths, URLs or markdown in `speech` — "
-            "describe those in words and put the exact text into `display` (optional screen version, markdown ok). "
-            "Calling speak alone ends your turn; it is the normal way to answer when it is available."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "speech": {"type": "string", "description": "What to say, TTS-ready (see speech rules). Write this first."},
-                "display": {"type": "string", "description": "Optional. Text to show on screen instead of `speech` (markdown allowed)."},
-            },
-            "required": ["speech"],
-        },
-    },
-}
-
-
-def all_schemas(client_tools_enabled: bool, vision_enabled: bool, speak_enabled: bool = False) -> list[dict]:
+def all_schemas(client_tools_enabled: bool, vision_enabled: bool) -> list[dict]:
+    """Tools are for actions only; talking is plain streamed text (see agent.py)."""
     schemas = []
-    if speak_enabled:
-        schemas.append(SPEAK_TOOL)
     for name, (schema, _) in SERVER_TOOLS.items():
         if not vision_enabled and name in ("analyze_attachments", "look_at_screen", "web_search"):
             continue
