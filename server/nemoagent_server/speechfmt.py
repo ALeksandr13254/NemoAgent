@@ -56,31 +56,76 @@ def strip_filler(text: str) -> str:
 
 
 DISPLAY_MARKER_RE = re.compile(r"(?:^|\n)\s*={3,}\s*(?:\n|$)")
+TASK_MARKER_RE = re.compile(r"(?:^|\n)\s*>{3,}\s*")
 
 # how much of the spoken stream is held back so a filler ending can be removed before it is heard
 HOLD_CHARS = 70
 
+# "Сейчас проверю." / "Let me check" with no task attached: the dialogue agent promised an action.
+# Only first-person future forms count ("проверю", "посмотрим"), so a recap of past actions
+# ("я проверил и сказал…") is not mistaken for a promise.
+_PROMISE_RE = re.compile(
+    r"(?:\b(?:сейчас|секунд\w*|минут\w*|давай\w*|попробую)\b[^.!?\n]{0,40}?"
+    r"\b(?:провер|посмотр|глян|сдела|запущ|запуст|найд|поищ|откро|узна|выполн|измер|прочита|прочт|скача|установ|"
+    r"зайд|переключ|закро|включ|выключ|удал|созда|сохран|отправ|скопир|перемещ|напиш|собер|посчита|подключ|запомн)"
+    r"\w{0,2}(?:ю|у|им|ем|ем)\b"
+    r"|\b(?:let me|i(?:'ll| will)|going to)\s+(?:check|look|see|run|open|find|search|read|try|do|execute|take a look))",
+    re.I)
+
+
+def looks_like_promise(text: str) -> bool:
+    """True when a SHORT spoken text announces an action ('Сейчас проверю место на диске.')."""
+    text = (text or "").strip()
+    if not text or len(text) > 220:
+        return False
+    first = re.split(r"(?<=[.!?…])\s+", text, maxsplit=1)[0]
+    return bool(_PROMISE_RE.search(first))
+
 
 class ProseSpeechRouter:
-    """Route a streamed plain-text answer: spoken part -> speech pieces, `===` part -> display.
+    """Route a streamed plain-text answer of the dialogue agent:
+      spoken part -> speech pieces;  `===` part -> display (screen only);  `>>>` part -> task for the executor.
 
-    feed() yields ("speech", text) or ("display", text); finish() flushes the held tail with the
-    filler stripped and returns the final (speech, display) strings.
+    feed() yields ("speech", text) or ("display", text); the task is never emitted as text.
+    finish() flushes the held tail with the filler stripped; `result` = (speech, display, task).
     """
 
     def __init__(self) -> None:
         self.buf = ""            # spoken text not yet released
         self.speech = ""         # everything released as speech
         self.display = ""        # screen-only part
-        self.in_display = False
+        self.task = ""           # task for the executor
+        self.mode = "speech"     # speech | display | task
+
+    def _enter_task(self, rest: str) -> None:
+        self.mode = "task"
+        self.task += rest
 
     def feed(self, chunk: str) -> Iterator[tuple[str, str]]:
-        if self.in_display:
-            self.display += chunk
-            yield ("display", chunk)
+        if self.mode == "task":
+            self.task += chunk
+            return
+        if self.mode == "display":
+            self.buf += chunk
+            m = TASK_MARKER_RE.search(self.buf)
+            if m:
+                before, rest = self.buf[:m.start()], self.buf[m.end():]
+                self.buf = ""
+                if before:
+                    self.display += before
+                    yield ("display", before)
+                self._enter_task(rest)
+                return
+            # keep a small tail so a ">>>" split across chunks is still caught
+            if len(self.buf) > 8:
+                piece, self.buf = self.buf[:-8], self.buf[-8:]
+                self.display += piece
+                yield ("display", piece)
             return
         self.buf += chunk
-        m = DISPLAY_MARKER_RE.search(self.buf)
+        md = DISPLAY_MARKER_RE.search(self.buf)
+        mt = TASK_MARKER_RE.search(self.buf)
+        m = min((x for x in (md, mt) if x), key=lambda x: x.start(), default=None)
         if m:
             spoken, rest = self.buf[:m.start()], self.buf[m.end():]
             self.buf = ""
@@ -88,10 +133,12 @@ class ProseSpeechRouter:
             if spoken.strip():
                 self.speech += spoken
                 yield ("speech", spoken)
-            self.in_display = True
+            if m is mt:
+                self._enter_task(rest)
+                return
+            self.mode = "display"
             if rest:
-                self.display += rest
-                yield ("display", rest)
+                yield from self.feed(rest)
             return
         # release all but a tail: enough to still remove a trailing "Чем могу помочь?" and to
         # catch a marker that arrives split across chunks
@@ -107,15 +154,25 @@ class ProseSpeechRouter:
                 yield ("speech", piece)
 
     def finish(self) -> Iterator[tuple[str, str]]:
-        if self.buf:
+        if self.mode == "speech" and self.buf:
             whole = strip_filler(self.speech + self.buf)
             tail = whole[len(self.speech):] if whole.startswith(self.speech) else self.buf
             self.buf = ""
             if tail.strip():
                 self.speech += tail
                 yield ("speech", tail)
+        elif self.mode == "display" and self.buf:
+            piece, self.buf = self.buf, ""
+            self.display += piece
+            yield ("display", piece)
         self.display = self.display.strip()
+        # the model sometimes appends a stray === block or another >>> after the task: keep the task only
+        task = self.task.split("===")[0]
+        task = re.split(r"\n\s*>{3,}", task)[0]
+        # an imagined "Результат исполнителя …" glued to the task is not part of the instruction
+        task = re.split(r"Результат исполнителя", task, maxsplit=1)[0]
+        self.task = " ".join(task.split()).strip(" >")
 
     @property
-    def result(self) -> tuple[str, Optional[str]]:
-        return self.speech.strip(), (self.display or None)
+    def result(self) -> tuple[str, Optional[str], Optional[str]]:
+        return self.speech.strip(), (self.display or None), (self.task or None)

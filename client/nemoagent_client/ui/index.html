@@ -33,7 +33,7 @@
     <div class="editor">
       <div class="panehead">
         <b>Редактирование</b>
-        <span class="muted small">Хранится на сервере, действует со следующего сообщения. В шаблоне работают подстановки <code>{env}</code> (окружение и текущее время) и <code>{voice_style}</code> (один из двух блоков ниже, по режиму).</span>
+        <span class="muted small">Хранится на сервере, действует со следующего сообщения. Голосовой (диалоговый) агент без инструментов отвечает пользователю и ставит задачу исполнителю строкой <code>&gt;&gt;&gt;</code>; исполнитель выполняет её инструментами и возвращает отчёт, после чего голосовой агент докладывает. Подстановки: <code>{env}</code> (окружение и время), <code>{voice_style}</code> (стиль по режиму).</span>
       </div>
       <label class="ed">Шаблон системного промпта <span id="ov-system" class="muted small"></span>
         <textarea id="ed-system" rows="18" spellcheck="false"></textarea></label>
@@ -41,6 +41,8 @@
         <textarea id="ed-voice_prose" rows="14" spellcheck="false"></textarea></label>
       <label class="ed">Стиль текстового режима <span id="ov-voice_text" class="muted small"></span>
         <textarea id="ed-voice_text" rows="3" spellcheck="false"></textarea></label>
+      <label class="ed">Промпт внутреннего исполнителя (работает с инструментами, получает задачу от голосового агента) <span id="ov-executor" class="muted small"></span>
+        <textarea id="ed-executor" rows="12" spellcheck="false"></textarea></label>
       <div class="row left">
         <button id="prompt-save" class="primary">Сохранить</button>
         <button id="prompt-reset">Сбросить к умолчанию</button>

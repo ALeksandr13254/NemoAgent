@@ -73,17 +73,20 @@
     if (m.kind === 'request') {
       const sys = (m.messages || []).find((x) => x.role === 'system');
       if (sys) { $('prompt-text').textContent = sys.content; $('prompt-meta').textContent = `${t} · ход ${m.turn}, раунд ${m.round} · ${m.model} · инструменты: ${(m.tools || []).join(', ') || 'нет'} · ${JSON.stringify(m.params)}`; }
-      logEntry('req', `→ <b>запрос</b> ${t} · ход ${m.turn} · раунд ${m.round} · ${esc(m.model)} · сообщений: ${m.messages.length} · инструменты: ${esc((m.tools || []).join(', ') || 'нет')} · ${esc(JSON.stringify(m.params))}`, renderMessages(m.messages), false);
+      const who = m.agent === 'executor' ? '🛠 исполнитель' : '🗣 голосовой агент';
+      logEntry('req', `→ <b>запрос</b> ${t} · ${who}${m.stage ? ' / ' + esc(m.stage) : ''} · ход ${m.turn} · вызов ${m.round} · ${esc(m.model)} · сообщений: ${m.messages.length} · инструменты: ${esc((m.tools || []).join(', ') || 'нет')} · ${esc(JSON.stringify(m.params))}`, renderMessages(m.messages), false);
     } else if (m.kind === 'response') {
+      const who = m.agent === 'executor' ? '🛠 исполнитель' : '🗣 голосовой агент';
       const tc = (m.tool_calls || []).map((c) => `${c.function?.name}(${c.function?.arguments})`).join('\n');
       const body = `<pre>${m.reasoning ? '🧠 reasoning:\n' + esc(m.reasoning) + '\n\n' : ''}${esc(m.content || '')}${tc ? '\n⚙ tool_calls:\n' + esc(tc) : ''}\n\nfinish_reason: ${esc(String(m.finish_reason))} · usage: ${esc(JSON.stringify(m.usage))} · ${m.ms} мс</pre>`;
-      logEntry('res', `← <b>ответ</b> ${t} · ход ${m.turn} · раунд ${m.round} · ${(m.content || '').length} симв. · ${(m.tool_calls || []).length} вызов. · ${m.ms} мс`, body, false);
+      logEntry('res', `← <b>ответ</b> ${t} · ${who} · ход ${m.turn} · вызов ${m.round} · ${(m.content || '').length} симв. · ${(m.tool_calls || []).length} вызов. · ${m.ms} мс`, body, false);
     }
   }
+  let execCard = null;
   $('log-clear').onclick = () => { logList.innerHTML = ''; logCount = 0; $('log-count').textContent = ''; };
 
   /* ---------------------------------------------------------------- prompt editor */
-  const PROMPT_KEYS = ['system', 'voice_prose', 'voice_text'];
+  const PROMPT_KEYS = ['system', 'voice_prose', 'voice_text', 'executor'];
   let promptState = null;
   function renderPrompts(p) {
     promptState = p;
@@ -107,6 +110,13 @@
       }
       case 'prompts': renderPrompts(m); break;
       case 'trace': handleTrace(m); break;
+      case 'stage': current = null; reasoningCard = null; execCard = null; break;
+      case 'task': card('task', `🎯 <b>задача исполнителю</b>`, m.task, true); current = null; break;
+      case 'executor_delta': {
+        if (!execCard) execCard = card('tool exec', '🛠 <b>исполнитель</b>', '', false);
+        execCard.querySelector('pre').textContent += m.content; break;
+      }
+      case 'report': card('report', `📋 <b>отчёт исполнителя</b> · ${(m.report || '').length} симв.`, m.report, true); current = null; break;
       case 'user_message': {
         const d = div('msg user');
         const src = m.source === 'voice' ? '🎙 голос' : '⌨ текст';
