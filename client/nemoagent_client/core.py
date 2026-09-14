@@ -2,10 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-import difflib
 import json
 import logging
-import re
 import threading
 import time
 import uuid
@@ -318,8 +316,14 @@ class ClientCore:
             self._post(self.broadcast, {"type": "mic", "level": round(min(1.0, level * 8), 3), "speech": speech})
 
     def _on_speech_start(self) -> None:
-        # only a hint for the UI; the decision to interrupt is made after transcription (echo check)
-        self._post(self.broadcast, {"type": "stt", "state": "listening_over_speech"})
+        # the VAD heard speech while the agent talks: stop talking right away (barge-in)
+        if self.state["barge_in"]:
+            self._post(self._barge_in)
+
+    async def _barge_in(self) -> None:
+        if self.speaker and self.speaker.is_speaking:
+            log.info("barge-in: user started speaking")
+            await self.interrupt("barge-in")
 
     def _on_utterance(self, audio: np.ndarray, duration: float, during_speech: bool = False) -> None:
         self._post(self._process_utterance, audio, duration, during_speech)
@@ -340,36 +344,8 @@ class ClientCore:
         if not text:
             await self.broadcast({"type": "stt", "state": "empty", "ms": ms})
             return
-        if self._is_echo(text):
-            log.info("ignored echo of own speech: %r", text[:60])
-            await self.broadcast({"type": "stt", "state": "echo", "text": text, "ms": ms})
-            return
-        if during_speech or (self.speaker and self.speaker.is_speaking):
-            log.info("barge-in confirmed by STT: %r", text[:60])
-            await self.interrupt("barge-in")
         await self.broadcast({"type": "stt", "state": "done", "text": text, "ms": ms})
         await self.send_user_message(text, [], "voice")
-
-    @staticmethod
-    def _words(s: str) -> list[str]:
-        return re.findall(r"[a-zA-Zа-яА-ЯёЁ]{2,}", s.lower())
-
-    def _is_echo(self, text: str) -> bool:
-        """Is this transcription the agent's own voice picked up by the microphone?"""
-        if not self.speaker or not self.speaker.recent:
-            return False
-        norm = " ".join(text.lower().split())
-        recent = [" ".join(s.lower().split()) for s in list(self.speaker.recent)[-8:] if s.strip()]
-        for s in recent:
-            if norm in s or s in norm or difflib.SequenceMatcher(None, norm, s).ratio() >= 0.7:
-                return True
-        # partial capture of a longer utterance: most of the heard words occur in what was just said
-        heard = self._words(norm)
-        if len(heard) >= 3:
-            said = set(self._words(" ".join(recent)))
-            if sum(w in said for w in heard) / len(heard) >= 0.6:
-                return True
-        return False
 
     # ============================================================== UI hub
     async def broadcast(self, msg: dict) -> None:

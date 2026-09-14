@@ -209,11 +209,18 @@ _SENT_END = re.compile(r"(?<=[.!?…])\s+|(?<=[.!?…])$|\n+")
 _BREAKS = (", ", "; ", ": ", " — ", " - ", " ")
 
 
+_PUNCT_BREAKS = (", ", "; ", ": ", " — ", " - ")
+
+
 def _hardwrap(s: str, limit: int) -> list[str]:
+    """Split an over-long sentence; prefer a punctuation break (natural pause) over a bare space so
+    phrases like "две тысячи двадцать шестого года" are not cut in the middle."""
     out = []
     while len(s) > limit:
         window = s[:limit]
-        cut = max((window.rfind(b) for b in _BREAKS), default=-1)
+        cut = max((window.rfind(b) for b in _PUNCT_BREAKS), default=-1)
+        if cut < int(limit * 0.35):
+            cut = window.rfind(" ")
         if cut <= 10:
             cut = limit - 1
         out.append(s[:cut + 1].strip())

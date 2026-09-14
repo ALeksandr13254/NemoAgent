@@ -1,9 +1,8 @@
-"""Microphone capture with Silero VAD end-pointing, push-to-talk and barge-in capture.
+"""Microphone capture with Silero VAD end-pointing, push-to-talk and barge-in.
 
-Barge-in is NOT decided here: while the agent talks, the speakers leak into the microphone and the
-VAD fires on the agent's own voice. Utterances captured during playback are handed to the core
-flagged `during_speech=True`; the core transcribes them, drops echoes of the TTS text and only
-then interrupts the agent and sends the user's words.
+While the agent talks the VAD threshold is raised (speaker bleed) and a longer run of speech is
+needed; once it is reached `on_speech_start` fires (the core stops the playback) and the utterance
+is collected and transcribed like any other.
 """
 from __future__ import annotations
 

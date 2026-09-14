@@ -105,8 +105,6 @@
         if (m.state === 'transcribing') s.textContent = `распознаю ${m.duration} с…`;
         else if (m.state === 'done') { s.textContent = ''; metrics.stt = m.ms; }
         else if (m.state === 'empty') s.textContent = 'ничего не распознано';
-        else if (m.state === 'echo') s.textContent = 'эхо собственной речи — пропущено';
-        else if (m.state === 'listening_over_speech') s.textContent = 'слышу речь поверх ответа…';
         else if (m.state === 'error') s.textContent = 'ошибка STT: ' + m.message;
         break;
       }
