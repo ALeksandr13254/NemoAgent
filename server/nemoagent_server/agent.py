@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
 import logging
 import platform
@@ -46,6 +47,7 @@ Style:
 - {voice_style}
 - Before dangerous or irreversible actions (deleting data, changing system settings, sending anything, payments) ask for explicit confirmation first.
 - Never claim you did something you did not do. If a tool fails, say so and suggest the next step.
+- When the user asks to check, run, execute or verify something, actually call the tool in this turn — even if a memory or an earlier answer already contains a plausible result.
 - When you use tools, keep the final answer focused on the outcome, not the mechanics."""
 
 VOICE_STYLE_VOICE = ("The user is talking by voice and your answer will be read aloud by a TTS engine: answer in short, natural spoken "
@@ -92,12 +94,19 @@ class AgentSession:
             parts.append(f"home dir: {ci['home']}")
         if not ci.get("tools_enabled", True):
             parts.append("computer-control tools are DISABLED by the user")
-        parts.append(f"server: {platform.system()}; current date/time is given by get_current_time")
+        parts.append(f"server: {platform.system()}")
         return "; ".join(parts) if parts else "unknown"
+
+    def _now_line(self) -> str:
+        """Current date/time on the user's machine — injected every turn so the model never guesses."""
+        from .tools import _client_tz
+        tz, name = _client_tz(self.client_info)
+        now = dt.datetime.now(tz)
+        return f"Current date and time on the user's machine: {now.strftime('%A, %d %B %Y, %H:%M')} ({name})."
 
     def _system_message(self, source: str) -> dict:
         return {"role": "system", "content": SYSTEM_PROMPT.format(
-            env=self._env_description(),
+            env=self._env_description() + "\n" + self._now_line(),
             voice_style=VOICE_STYLE_VOICE if source == "voice" else VOICE_STYLE_TEXT)}
 
     def note_screenshot(self, attachment_id: str) -> None:
@@ -194,7 +203,10 @@ class AgentSession:
                 log.warning("memory recall failed: %s", e)
         if recalled:
             block = self.services.memory.format_for_prompt(recalled)
-            self.messages.append({"role": "system", "content": f"Relevant memories from earlier conversations (may be outdated):\n{block}"})
+            self.messages.append({"role": "system", "content": (
+                "Relevant memories from earlier conversations. They are PAST exchanges, not current facts: "
+                "if the user asks you to check, run, look, measure or verify something, do it with tools now "
+                "instead of repeating an old answer.\n" + block)})
             await self.send({"type": "memory", "items": [{"kind": r["kind"], "score": round(r["score"], 2),
                                                           "text": r["text"][:300], "ts": r["ts"]} for r in recalled]})
 

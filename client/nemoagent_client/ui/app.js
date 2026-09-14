@@ -192,8 +192,9 @@
   const up = () => { if (!held) return; held = false; ptt.classList.remove('rec'); send({ type: 'ptt', state: 'up' }); };
   ptt.addEventListener('mousedown', down); ptt.addEventListener('touchstart', down, { passive: false });
   window.addEventListener('mouseup', up); window.addEventListener('touchend', up);
-  window.addEventListener('keydown', (e) => { if (e.code === 'Space' && document.activeElement !== input && !e.repeat) down(e); });
-  window.addEventListener('keyup', (e) => { if (e.code === 'Space' && document.activeElement !== input) up(); });
+  const typing = () => ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName);
+  window.addEventListener('keydown', (e) => { if (e.code === 'Space' && !typing() && !e.repeat && !e.ctrlKey && !e.altKey && !e.metaKey) down(e); });
+  window.addEventListener('keyup', (e) => { if (e.code === 'Space' && held) up(); });
 
   /* ---------------------------------------------------------------- confirm modal */
   let confirmId = null;

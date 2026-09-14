@@ -53,7 +53,7 @@ class Settings:
     STT_MODEL = _env("STT_MODEL", "large-v3-turbo")
     STT_DEVICE = _env("STT_DEVICE", "auto")            # auto | cuda | cpu
     STT_COMPUTE = _env("STT_COMPUTE", "auto")          # auto | float16 | int8_float16 | int8
-    STT_LANGUAGE = _env("STT_LANGUAGE", "auto")        # auto | ru | en | ...
+    STT_LANGUAGE = _env("STT_LANGUAGE", "ru")          # ru | en | auto (auto can drift to other languages on background audio)
     STT_BEAM = _int("STT_BEAM", 1)
 
     # --- microphone / VAD ---
