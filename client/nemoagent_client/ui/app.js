@@ -106,6 +106,7 @@
         else if (m.state === 'done') { s.textContent = ''; metrics.stt = m.ms; }
         else if (m.state === 'empty') s.textContent = 'ничего не распознано';
         else if (m.state === 'echo') s.textContent = 'эхо собственной речи — пропущено';
+        else if (m.state === 'listening_over_speech') s.textContent = 'слышу речь поверх ответа…';
         else if (m.state === 'error') s.textContent = 'ошибка STT: ' + m.message;
         break;
       }
@@ -131,8 +132,18 @@
     for (const k of ['tts_mode', 'confirm', 'stt_language']) $('s-' + k).value = s[k];
     for (const k of ['auto_listen', 'barge_in', 'tools_enabled']) $('s-' + k).checked = !!s[k];
     fillVoices('s-voice_ru', state.voices.ru, s.voice_ru); fillVoices('s-voice_en', state.voices.en, s.voice_en);
+    fillDevices('s-speaker_device', state.output_devices || [], s.speaker_device);
+    $('speaker-now').textContent = state.speaker ? 'сейчас: ' + state.speaker : '';
+    fillDevices('s-mic_device', state.input_devices || [], s.mic_device);
+    $('mic-now').textContent = state.microphone ? 'сейчас: ' + state.microphone + (state.mic && state.mic !== 'ready' ? ' · ' + state.mic : '') : (state.mic || '');
     $('s-tts_speed').value = s.tts_speed; $('s-tts_speed-v').textContent = Number(s.tts_speed).toFixed(2);
     $('settings-status').textContent = `сессия ${state.session_id || '—'} · mic ${state.mic || ''}`;
+  }
+  function fillDevices(id, devs, val) {
+    const sel = $(id);
+    const sig = devs.map((d) => d.index).join(',');
+    if (sel._sig !== sig) { sel.innerHTML = devs.map((d) => `<option value="${d.index === null ? '' : d.index}">${esc(d.name)}${d.api ? ' · ' + esc(d.api.replace('Windows ', '')) : ''}</option>`).join(''); sel._sig = sig; }
+    sel.value = val || '';
   }
   function fillVoices(id, list, val) {
     const sel = $(id); if (sel.options.length !== list.length) { sel.innerHTML = list.map((v) => `<option value="${v}">${v}</option>`).join(''); }
@@ -140,7 +151,7 @@
   }
   function pushSettings(patch) { send({ type: 'settings', settings: patch }); }
   $('btn-settings').onclick = () => $('settings').classList.toggle('hidden');
-  for (const k of ['tts_mode', 'confirm', 'stt_language', 'voice_ru', 'voice_en']) $('s-' + k).onchange = (e) => pushSettings({ [k]: e.target.value });
+  for (const k of ['tts_mode', 'confirm', 'stt_language', 'voice_ru', 'voice_en', 'speaker_device', 'mic_device']) $('s-' + k).onchange = (e) => pushSettings({ [k]: e.target.value });
   for (const k of ['auto_listen', 'barge_in', 'tools_enabled']) $('s-' + k).onchange = (e) => pushSettings({ [k]: e.target.checked });
   $('s-tts_speed').oninput = (e) => { $('s-tts_speed-v').textContent = Number(e.target.value).toFixed(2); };
   $('s-tts_speed').onchange = (e) => pushSettings({ tts_speed: Number(e.target.value) });

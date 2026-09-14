@@ -94,7 +94,9 @@ def sanitize_vocab(text: str) -> str:
             out.append(" ")
     t = "".join(out)
     t = re.sub(r"\s+([.,!?;:])", r"\1", t)
-    t = re.sub(r"([.,!?;:])(?=[^\s.,!?;:)\"»'])", r"\1 ", t)
+    # a space after punctuation glued to the next word, but keep decimals like 24,9 / 3.5 intact
+    t = re.sub(r"(?<!\d)([.,!?;:])(?=[^\s.,!?;:)\"»'])|(?<=\d)([!?;:])(?=[^\s.,!?;:)\"»'])|(?<=\d)([.,])(?=[^\s\d.,!?;:)\"»'])",
+               lambda m: (m.group(1) or m.group(2) or m.group(3)) + " ", t)
     t = re.sub(r"[ ]{2,}", " ", t).strip()
     return t
 
@@ -335,6 +337,13 @@ class TeraTTS:
         tagged, lang = tag_languages(text)
         if not tagged:
             return "", lang
+        # Same order as the model's own normalize_text: spacing/vocabulary -> numbers to words ->
+        # stress. Numbers must be words *before* RUAccent so they get stress marks too.
+        try:
+            tagged = self.rt.normalize_input_text(tagged, self.loaded.indexer)
+            tagged = self.rt.expand_tagged_numbers(tagged)
+        except Exception as e:  # noqa: BLE001
+            log.debug("normalize failed, passing raw text: %s", e)
         if self.loaded.accentizer is not None and "<ru>" in tagged:
             tagged = re.sub(r"<ru>(.*?)</ru>",
                             lambda m: "<ru>" + accentize_keep_manual(m.group(1), self.loaded.accentizer) + "</ru>",

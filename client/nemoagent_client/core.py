@@ -5,6 +5,7 @@ import asyncio
 import difflib
 import json
 import logging
+import re
 import threading
 import time
 import uuid
@@ -47,6 +48,8 @@ class ClientCore:
             "voice_en": settings.TTS_VOICE_EN,
             "tts_speed": settings.TTS_SPEED,
             "stt_language": settings.STT_LANGUAGE,
+            "speaker_device": settings.SPEAKER_DEVICE or "",
+            "mic_device": settings.MIC_DEVICE or "",
         }
         self.current_source = "text"
         self.turn_t0 = 0.0
@@ -315,19 +318,16 @@ class ClientCore:
             self._post(self.broadcast, {"type": "mic", "level": round(min(1.0, level * 8), 3), "speech": speech})
 
     def _on_speech_start(self) -> None:
-        if self.state["barge_in"]:
-            self._post(self._barge_in)
+        # only a hint for the UI; the decision to interrupt is made after transcription (echo check)
+        self._post(self.broadcast, {"type": "stt", "state": "listening_over_speech"})
 
-    async def _barge_in(self) -> None:
-        if self.speaker and self.speaker.is_speaking:
-            log.info("barge-in: user started speaking")
-            await self.interrupt("barge-in")
+    def _on_utterance(self, audio: np.ndarray, duration: float, during_speech: bool = False) -> None:
+        self._post(self._process_utterance, audio, duration, during_speech)
 
-    def _on_utterance(self, audio: np.ndarray, duration: float) -> None:
-        self._post(self._process_utterance, audio, duration)
-
-    async def _process_utterance(self, audio: np.ndarray, duration: float) -> None:
+    async def _process_utterance(self, audio: np.ndarray, duration: float, during_speech: bool = False) -> None:
         if not self.stt:
+            return
+        if during_speech and not self.state["barge_in"]:
             return
         await self.broadcast({"type": "stt", "state": "transcribing", "duration": round(duration, 2)})
         t0 = time.time()
@@ -344,20 +344,30 @@ class ClientCore:
             log.info("ignored echo of own speech: %r", text[:60])
             await self.broadcast({"type": "stt", "state": "echo", "text": text, "ms": ms})
             return
+        if during_speech or (self.speaker and self.speaker.is_speaking):
+            log.info("barge-in confirmed by STT: %r", text[:60])
+            await self.interrupt("barge-in")
         await self.broadcast({"type": "stt", "state": "done", "text": text, "ms": ms})
         await self.send_user_message(text, [], "voice")
 
+    @staticmethod
+    def _words(s: str) -> list[str]:
+        return re.findall(r"[a-zA-Zа-яА-ЯёЁ]{2,}", s.lower())
+
     def _is_echo(self, text: str) -> bool:
+        """Is this transcription the agent's own voice picked up by the microphone?"""
         if not self.speaker or not self.speaker.recent:
             return False
         norm = " ".join(text.lower().split())
-        for said in list(self.speaker.recent)[-6:]:
-            s = " ".join(said.lower().split())
-            if not s:
-                continue
-            if norm in s or s in norm:
+        recent = [" ".join(s.lower().split()) for s in list(self.speaker.recent)[-8:] if s.strip()]
+        for s in recent:
+            if norm in s or s in norm or difflib.SequenceMatcher(None, norm, s).ratio() >= 0.7:
                 return True
-            if difflib.SequenceMatcher(None, norm, s).ratio() >= 0.7:
+        # partial capture of a longer utterance: most of the heard words occur in what was just said
+        heard = self._words(norm)
+        if len(heard) >= 3:
+            said = set(self._words(" ".join(recent)))
+            if sum(w in said for w in heard) / len(heard) >= 0.6:
                 return True
         return False
 
@@ -376,8 +386,18 @@ class ClientCore:
             self.ui_clients.discard(ws)
 
     def status_payload(self) -> dict:
+        devices: list[dict] = []
+        inputs: list[dict] = []
+        try:
+            from .player import list_input_devices, list_output_devices
+            devices = list_output_devices()
+            inputs = list_input_devices()
+        except Exception:  # noqa: BLE001
+            pass
         return {"type": "status", "server": self.connected, "session_id": self.session_id, "server_info": self.server_info,
                 "stt": self.status["stt"], "tts": self.status["tts"], "mic": self.status["mic"],
+                "speaker": getattr(self.player, "device_name", None), "output_devices": devices,
+                "microphone": getattr(self.mic, "device_name", None), "input_devices": inputs,
                 "listening": bool(self.mic and self.mic.enabled), "settings": self.state,
                 "voices": {"ru": ["ru_f1", "ru_m5", "ru_f2", "ru_m1"],
                            "en": ["eng_f3", "eng_f5", "eng_m3", "eng_m4", "eng_f4_whisper", "eng_m2_whisper"]}}
@@ -421,6 +441,9 @@ class ClientCore:
         for key in ("tts_mode", "auto_listen", "barge_in", "tools_enabled", "confirm", "voice_ru", "voice_en", "tts_speed", "stt_language"):
             if key in s:
                 self.state[key] = s[key]
+        for key in ("speaker_device", "mic_device"):   # unchanged: don't reopen the stream
+            if key in s and self.state.get(key, "") == str(s[key] or ""):
+                s = {k: v for k, v in s.items() if k != key}
         settings.TTS_VOICE_RU = self.state["voice_ru"]
         settings.TTS_VOICE_EN = self.state["voice_en"]
         try:
@@ -435,4 +458,45 @@ class ClientCore:
             self.speaker.cancel()
         if "tools_enabled" in s and self.server_ws:
             await self.send_server({"type": "client_info", "client": {"tools_enabled": bool(self.state["tools_enabled"])}})
+        if "speaker_device" in s:
+            self.state["speaker_device"] = str(s["speaker_device"] or "")
+            await asyncio.to_thread(self._switch_output_device, self.state["speaker_device"])
+        if "mic_device" in s:
+            self.state["mic_device"] = str(s["mic_device"] or "")
+            await asyncio.to_thread(self._switch_input_device, self.state["mic_device"])
         await self.broadcast_status()
+
+    def _switch_input_device(self, spec: str) -> None:
+        if not self.mic:
+            return
+        try:
+            self.mic.reopen(spec or None)
+            settings.MIC_DEVICE = spec or None
+            self.status["mic"] = "ready"
+            log.info("microphone switched to %s", self.mic.device_name)
+        except Exception as e:  # noqa: BLE001
+            log.warning("cannot open microphone %r: %s", spec, e)
+            self.status["mic"] = f"error: {e}"[:120]
+
+    def _switch_output_device(self, spec: str) -> None:
+        """Re-open the output stream on another device (from the settings dropdown)."""
+        if not self.speaker:
+            return
+        from .player import StreamPlayer
+        try:
+            new_player = StreamPlayer(44100, device=spec or None)
+        except Exception as e:  # noqa: BLE001
+            log.warning("cannot open output device %r: %s", spec, e)
+            self.status["tts"] = f"ready, device error: {e}"[:120]
+            return
+        old = self.player
+        self.speaker.cancel()
+        self.speaker.player = new_player
+        self.player = new_player
+        settings.SPEAKER_DEVICE = spec or None
+        try:
+            old.close()
+        except Exception:
+            pass
+        self.status["tts"] = f"ready ({'GPU' if self.tts and 'CUDA' in self.tts.provider else 'CPU'})"
+        log.info("output device switched to %s", new_player.device_name)

@@ -1,4 +1,10 @@
-"""Microphone capture with Silero VAD end-pointing, push-to-talk and barge-in detection."""
+"""Microphone capture with Silero VAD end-pointing, push-to-talk and barge-in capture.
+
+Barge-in is NOT decided here: while the agent talks, the speakers leak into the microphone and the
+VAD fires on the agent's own voice. Utterances captured during playback are handed to the core
+flagged `during_speech=True`; the core transcribes them, drops echoes of the TTS text and only
+then interrupts the agent and sends the user's words.
+"""
 from __future__ import annotations
 
 import logging
@@ -19,11 +25,11 @@ FRAME = 512  # 32 ms
 
 
 class Microphone:
-    def __init__(self, on_utterance: Callable[[np.ndarray, float], None], on_speech_start: Callable[[], None],
+    def __init__(self, on_utterance: Callable[[np.ndarray, float, bool], None], on_speech_start: Callable[[], None],
                  is_agent_speaking: Callable[[], bool], on_level: Optional[Callable[[float, bool], None]] = None,
                  device=None):
-        self.on_utterance = on_utterance
-        self.on_speech_start = on_speech_start
+        self.on_utterance = on_utterance          # (audio16k, duration_s, during_agent_speech)
+        self.on_speech_start = on_speech_start    # UI hint only ("possible barge-in")
         self.is_agent_speaking = is_agent_speaking
         self.on_level = on_level or (lambda level, speech: None)
         self.vad = SileroVAD()
@@ -32,6 +38,8 @@ class Microphone:
         self._q: "queue.Queue[np.ndarray]" = queue.Queue()
         self._stream = None
         self._device = device
+        self._rate = SR
+        self.device_name = ""
         self._thread = threading.Thread(target=self._loop, daemon=True, name="mic-vad")
         self._running = True
         self._thread.start()
@@ -44,15 +52,65 @@ class Microphone:
             dev = dev.strip()
             if dev.isdigit():
                 dev = int(dev)
+            else:  # partial device name
+                wanted = dev.lower()
+                dev = next((i for i, d in enumerate(sd.query_devices())
+                            if d["max_input_channels"] > 0 and wanted in d["name"].lower()), dev)
         elif not dev:
             dev = None
-        self._stream = sd.InputStream(samplerate=SR, channels=1, dtype="float32", blocksize=FRAME, device=dev,
-                                      callback=self._callback)
-        self._stream.start()
-        log.info("microphone open: %s", sd.query_devices(self._stream.device)["name"] if self._stream.device is not None else "default")
+        # 16 kHz capture: WASAPI shared mode may refuse it -> auto-convert, then native rate + decimation
+        attempts = [dict(samplerate=SR)]
+        try:
+            info = sd.query_devices(dev if dev is not None else sd.default.device[0])
+            if "WASAPI" in sd.query_hostapis(info["hostapi"])["name"]:
+                attempts.append(dict(samplerate=SR, extra_settings=sd.WasapiSettings(auto_convert=True)))
+            native = int(info["default_samplerate"])
+            if native != SR:
+                attempts.append(dict(samplerate=native))
+        except Exception:
+            pass
+        last = None
+        for kw in attempts:
+            try:
+                rate = int(kw["samplerate"])
+                block = FRAME * rate // SR
+                self._stream = sd.InputStream(channels=1, dtype="float32", blocksize=block, device=dev,
+                                              callback=self._callback, **kw)
+                self._rate = rate
+                self._stream.start()
+                break
+            except Exception as e:  # noqa: BLE001
+                last = e
+                self._stream = None
+        if self._stream is None:
+            raise RuntimeError(f"cannot open microphone {device!r}: {last}")
+        self._device = device
+        try:
+            self.device_name = sd.query_devices(self._stream.device)["name"]
+        except Exception:
+            self.device_name = str(device or "default")
+        log.info("microphone open: %s @ %d Hz", self.device_name, self._rate)
+
+    def reopen(self, device) -> None:
+        """Switch to another input device (settings dropdown)."""
+        old = self._stream
+        self._stream = None
+        try:
+            if old is not None:
+                old.stop()
+                old.close()
+        except Exception:
+            pass
+        self._open(device)
+        self.vad.reset()
 
     def _callback(self, indata, frames, time_info, status):  # noqa: ARG002
-        self._q.put(indata[:, 0].copy())
+        mono = indata[:, 0]
+        if self._rate != SR:   # device opened at its native rate: resample to 16 kHz for the VAD/STT
+            n_out = int(round(mono.size * SR / self._rate))
+            mono = np.interp(np.linspace(0.0, 1.0, num=n_out, endpoint=False),
+                             np.linspace(0.0, 1.0, num=mono.size, endpoint=False), mono).astype(np.float32)
+        self._q.put(mono.copy())
 
     def set_enabled(self, enabled: bool) -> None:
         self.enabled = enabled
@@ -81,6 +139,7 @@ class Microphone:
         started_at = 0.0
         ptt_prev = False
         barge_notified = False
+        during_speech = False
 
         while self._running:
             try:
@@ -102,7 +161,7 @@ class Microphone:
                     self.on_level(level, True)
                 else:  # released
                     if collecting and len(collecting) > min_speech:
-                        self.on_utterance(np.concatenate(collecting), time.time() - started_at)
+                        self.on_utterance(np.concatenate(collecting), time.time() - started_at, False)
                     collecting = []
                 ptt_prev = self.ptt
                 in_utterance = False
@@ -132,8 +191,11 @@ class Microphone:
                     if agent_talking and settings.BARGE_IN and speech_run >= barge_frames and not barge_notified:
                         barge_notified = True
                         self.on_speech_start()
-                    if speech_run >= min_speech and (not agent_talking or settings.BARGE_IN):
+                    # while the agent talks we need a longer run before trusting it (speaker bleed)
+                    need = barge_frames if agent_talking else min_speech
+                    if speech_run >= need and (not agent_talking or settings.BARGE_IN):
                         in_utterance = True
+                        during_speech = agent_talking
                         collecting = list(pre)
                         started_at = time.time()
                         silence_run = 0
@@ -159,7 +221,8 @@ class Microphone:
                 # trim trailing silence a bit (keep 150 ms)
                 keep = max(0, len(audio) - (silence_frames - 5) * FRAME)
                 audio = audio[:max(keep, FRAME * min_speech)]
-                self.on_utterance(audio, duration)
+                self.on_utterance(audio, duration, during_speech)
+                during_speech = False
 
     def close(self) -> None:
         self._running = False

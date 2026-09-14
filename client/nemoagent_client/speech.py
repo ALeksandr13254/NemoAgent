@@ -94,8 +94,10 @@ class Speaker:
             try:
                 t0 = time.perf_counter()
                 first = True
+                samples = 0
                 for chunk in self.tts.synth_stream(sentence):
                     if gen != self._gen:
+                        log.debug("speech cancelled mid-sentence: %r", sentence[:50])
                         break
                     if first:
                         first = False
@@ -103,10 +105,14 @@ class Speaker:
                             self._first_audio_at = time.time()
                             self.on_state({"type": "tts_first_audio", "ms": int((self._first_audio_at - self._utt_started) * 1000),
                                            "synth_ms": int((time.perf_counter() - t0) * 1000)})
+                    samples += len(chunk)
                     self.player.feed(chunk, self.player.generation)
                 self.recent.append(sentence)
+                log.info("tts: %.1fs audio in %.2fs | %r | played %.1fs of %.1fs fed",
+                         samples / self.player.samplerate, time.perf_counter() - t0, sentence[:60],
+                         self.player.samples_played / self.player.samplerate, self.player.samples_fed / self.player.samplerate)
             except Exception as e:  # noqa: BLE001
-                log.warning("TTS failed for %r: %s", sentence[:60], e)
+                log.exception("TTS failed for %r: %s", sentence[:60], e)
             finally:
                 self._busy.clear()
 
