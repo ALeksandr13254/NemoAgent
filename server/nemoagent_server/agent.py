@@ -6,9 +6,10 @@ import datetime as dt
 import json
 import logging
 import platform
+import re
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
 from .attachments import AttachmentStore
@@ -50,9 +51,107 @@ Style:
 - When the user asks to check, run, execute or verify something, actually call the tool in this turn — even if a memory or an earlier answer already contains a plausible result.
 - When you use tools, keep the final answer focused on the outcome, not the mechanics."""
 
-VOICE_STYLE_VOICE = ("The user is talking by voice and your answer will be read aloud by a TTS engine: answer in short, natural spoken "
-                     "sentences, no markdown, no lists, no tables, no code blocks, no emojis, no URLs unless asked. Spell numbers naturally.")
-VOICE_STYLE_TEXT = ("The user typed the message: answer concisely; light markdown (short lists, `code`) is fine when it helps.")
+VOICE_STYLE_TEXT = ("The user typed the message and the answer is shown as text only: answer concisely; light markdown "
+                    "(short lists, `code`) is fine when it helps.")
+
+# Rules derived from the TeraTTSv2 model card + its character table (unicode_indexer.json):
+# vocabulary = letters, space, . , ! ? : ; - ( ) « » " ' ; digits expanded only in the nominative;
+# % ° № — … / \ _ * # @ & = + < > [ ] { } are dropped; abbreviations are read letter by letter.
+VOICE_STYLE_SPEAK = """Your answer is read aloud by a text-to-speech engine. ALWAYS finish your turn by calling the `speak` tool (do not write the final answer as plain text). In `speech` follow these rules strictly:
+  1. Words only. Allowed characters: letters, spaces and the punctuation . , ! ? : ; - ( ) « » " '. No digits, no symbols (% ° № $ € / \\ _ * # @ & = + < > [ ] ~ |), no emoji, no markdown.
+  1a. NEVER put code, shell commands, file paths, URLs, e-mails or identifiers into `speech` — the engine cannot pronounce them. Describe them in words ("команда из трёх частей: получить процессы, отсортировать по памяти, взять первые пять") and put the exact text into `display`.
+  2. Write every number in words, in the grammatically correct form: "двадцать четыре целых девять десятых гигабайта", "пятнадцать ноль две", "минус три градуса", "восемьдесят процентов", "в две тысячи двадцать шестом году".
+  3. Expand abbreviations and units into full words ("гигабайт", "операционная система", "компьютер", "километров в час"); if an abbreviation is pronounced letter by letter, write the letter names ("эс-ша-а", "ю-эс-би").
+  4. In Russian speech write foreign names, brands and products in Cyrillic transliteration ("Виндоус", "Гитхаб", "Пайтон", "Ютуб", "Визуал Студио Код"). Do not mix Latin and Cyrillic inside one sentence. If the whole answer is in English, write it in English.
+  5. Use the letter ё where it belongs (всё, ещё, идёт). Stress is placed automatically; only for an ambiguous homograph put + right before the stressed vowel (з+амок on a door, зам+ок on a hill).
+  6. Speak like a person: short natural sentences (up to about twenty words each), no lists, no headings, no tables. Put pauses with commas and full stops.
+  7. Be concise: what matters, then stop.
+Use the optional `display` argument for the screen version whenever the answer contains code, commands, paths, links, exact numbers or a table — there markdown is fine. If `display` is omitted, `speech` is shown on screen.
+Example. User: "Напиши команду PowerShell для топ пяти процессов по памяти." You call:
+  speak(speech="Команда на экране. Она берёт все процессы, сортирует по занятой памяти по убыванию и оставляет первые пять.", display="```powershell\nGet-Process | Sort-Object WorkingSet -Descending | Select-Object -First 5 Name, Id, WorkingSet\n```")
+Example. Tool result says free space is 24.9 GB of 1765.3 GB on drive C. You call:
+  speak(speech="На диске Це свободно двадцать четыре целых девять десятых гигабайта из тысячи семисот шестидесяти пяти.", display="Диск C: свободно 24,9 ГБ из 1765,3 ГБ")
+Before a long tool action you may call speak together with the other tools to say what you are doing ("Сейчас проверю."); the turn then continues after the tools return."""
+
+SPEECH_REWRITE_PROMPT = """You convert an assistant's written answer into text for a Russian/English text-to-speech engine with a tiny vocabulary. Output ONLY the spoken text, nothing else. Rules:
+- Keep the meaning and the language of the answer; drop markdown, lists, headings, code, commands, file paths, URLs, e-mails and identifiers (mention that they are shown on screen if they matter).
+- Allowed characters: letters, spaces and . , ! ? : ; - ( ) « » " '. No digits and no symbols: write every number in words in the correct grammatical form ("двадцать четыре целых девять десятых гигабайта", "пятнадцать ноль две", "минус три градуса", "восемьдесят процентов"); expand abbreviations and units ("гигабайт", "операционная система"); spell letter-by-letter abbreviations as letter names ("эс-ша-а").
+- In Russian text write foreign names and brands in Cyrillic ("Виндоус", "Гитхаб", "Пайтон"). Use ё where it belongs.
+- Short natural sentences, concise. No emoji."""
+
+
+class JsonStringStreamer:
+    """Incrementally extracts the value of one string key from JSON arriving in fragments.
+
+    Used to start speaking a `speak` call while the model is still streaming its arguments.
+    """
+
+    _ESC = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "/": "/", "\\": "\\", '"': '"'}
+
+    def __init__(self, key: str):
+        self.key = key
+        self.raw = ""
+        self.pos = 0
+        self.state = "seek"
+
+    @property
+    def done(self) -> bool:
+        return self.state == "done"
+
+    def feed(self, chunk: str) -> str:
+        self.raw += chunk
+        if self.state == "seek":
+            m = re.search(r'"' + re.escape(self.key) + r'"\s*:\s*"', self.raw)
+            if not m:
+                return ""
+            self.pos = m.end()
+            self.state = "in"
+        if self.state != "in":
+            return ""
+        out: list[str] = []
+        i = self.pos
+        n = len(self.raw)
+        while i < n:
+            c = self.raw[i]
+            if c == "\\":
+                if i + 1 >= n:
+                    break
+                e = self.raw[i + 1]
+                if e == "u":
+                    if i + 6 > n:
+                        break
+                    try:
+                        code = int(self.raw[i + 2:i + 6], 16)
+                    except ValueError:
+                        i += 2
+                        continue
+                    if 0xD800 <= code <= 0xDBFF:  # surrogate pair
+                        if i + 12 > n:
+                            break
+                        if self.raw[i + 6:i + 8] == "\\u":
+                            try:
+                                low = int(self.raw[i + 8:i + 12], 16)
+                                code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+                                i += 12
+                            except ValueError:
+                                i += 6
+                        else:
+                            i += 6
+                    else:
+                        i += 6
+                    out.append(chr(code))
+                    continue
+                out.append(self._ESC.get(e, e))
+                i += 2
+                continue
+            if c == '"':
+                self.state = "done"
+                i += 1
+                break
+            out.append(c)
+            i += 1
+        self.pos = i
+        return "".join(out)
 
 
 class AgentSession:
@@ -69,7 +168,6 @@ class AgentSession:
         self.last_attachment_ids: list[str] = []
         self.session_attachment_ids: list[str] = []
         self._task: Optional[asyncio.Task] = None
-        self._archived_note_added = False
         self.created_at = time.time()
 
     # ------------------------------------------------------------- prompt
@@ -104,10 +202,10 @@ class AgentSession:
         now = dt.datetime.now(tz)
         return f"Current date and time on the user's machine: {now.strftime('%A, %d %B %Y, %H:%M')} ({name})."
 
-    def _system_message(self, source: str) -> dict:
+    def _system_message(self, tts: bool) -> dict:
         return {"role": "system", "content": SYSTEM_PROMPT.format(
             env=self._env_description() + "\n" + self._now_line(),
-            voice_style=VOICE_STYLE_VOICE if source == "voice" else VOICE_STYLE_TEXT)}
+            voice_style=VOICE_STYLE_SPEAK if tts else VOICE_STYLE_TEXT)}
 
     def note_screenshot(self, attachment_id: str) -> None:
         self.session_attachment_ids.append(attachment_id)
@@ -129,8 +227,6 @@ class AgentSession:
         budget = settings.CONTEXT_BUDGET_TOKENS
         if self._estimate_tokens(self.messages) <= budget:
             return
-        # Messages are grouped into "turns" starting at each user message; drop whole turns from
-        # the front (they are already indexed in memory) but always keep the last few.
         while self._estimate_tokens(self.messages) > budget * 0.7:
             starts = [i for i, m in enumerate(self.messages) if m.get("role") == "user"]
             if len(starts) < 2 or len(starts) <= settings.CONTEXT_KEEP_TURNS:
@@ -168,16 +264,16 @@ class AgentSession:
         self.created_at = time.time()
 
     # ------------------------------------------------------------- main turn
-    async def handle_user_message(self, text: str, attachment_ids: list[str], source: str = "text") -> None:
+    async def handle_user_message(self, text: str, attachment_ids: list[str], source: str = "text", tts: bool = False) -> None:
         if self.busy():
             await self.interrupt()
-        self._task = asyncio.create_task(self._run_turn(text, attachment_ids, source))
+        self._task = asyncio.create_task(self._run_turn(text, attachment_ids, source, tts))
         try:
             await self._task
         except asyncio.CancelledError:
             pass
 
-    async def _run_turn(self, text: str, attachment_ids: list[str], source: str) -> None:
+    async def _run_turn(self, text: str, attachment_ids: list[str], source: str, tts: bool) -> None:
         t_start = time.time()
         text = (text or "").strip()
         atts = [self.services.attachments.get(a) for a in attachment_ids or []]
@@ -201,42 +297,67 @@ class AgentSession:
                     self.services.memory.search(text, exclude_session=self.id), timeout=6.0)
             except Exception as e:  # noqa: BLE001
                 log.warning("memory recall failed: %s", e)
+        self.messages.append({"role": "user", "content": user_content})
         if recalled:
+            # Presented as an automatic search_memory tool round (not as a transcript in the system
+            # prompt): the model then treats memories as observations and keeps its tool habits —
+            # a transcript-looking block made it drift into plain-prose answers.
             block = self.services.memory.format_for_prompt(recalled)
-            self.messages.append({"role": "system", "content": (
-                "Relevant memories from earlier conversations. They are PAST exchanges, not current facts: "
-                "if the user asks you to check, run, look, measure or verify something, do it with tools now "
-                "instead of repeating an old answer.\n" + block)})
+            call_id = f"mem_{uuid.uuid4().hex[:8]}"
+            self.messages.append({"role": "assistant", "content": None, "tool_calls": [{
+                "id": call_id, "type": "function",
+                "function": {"name": "search_memory", "arguments": json.dumps({"query": text[:200], "auto": True}, ensure_ascii=False)}}]})
+            self.messages.append({"role": "tool", "tool_call_id": call_id, "name": "search_memory", "content": json.dumps({
+                "note": ("Automatic recall from PAST conversations — context, not current facts. If the user asks to "
+                         "check, run, look, measure or verify something, do it with tools now."),
+                "results": block}, ensure_ascii=False)})
             await self.send({"type": "memory", "items": [{"kind": r["kind"], "score": round(r["score"], 2),
                                                           "text": r["text"][:300], "ts": r["ts"]} for r in recalled]})
-
-        self.messages.append({"role": "user", "content": user_content})
         self.turns += 1
         self._trim_context()
 
         tools_enabled = bool(self.client_info.get("tools_enabled", True))
-        schemas = all_schemas(tools_enabled, self.services.vision.enabled)
+        schemas = all_schemas(tools_enabled, self.services.vision.enabled, speak_enabled=tts)
         ctx = ToolContext(self, self.client_call)
-        assistant_text = ""
+        assistant_text = ""       # what goes to memory
         first_token_ms: Optional[int] = None
+        finish = "stop"
+        spoke_last_round = False
+        last_call_signature: Optional[str] = None
         try:
             for round_no in range(1, settings.MAX_TOOL_ROUNDS + 1):
                 await self.send({"type": "round", "round": round_no})
-                messages = [self._system_message(source)] + self.messages
+                messages = [self._system_message(tts)] + self.messages
                 round_t0 = time.time()
+                speech_streams: dict[int, JsonStringStreamer] = {}
+                spoke_this_round = False
 
                 async def on_event(kind: str, data: dict) -> None:
-                    nonlocal first_token_ms
+                    nonlocal first_token_ms, spoke_this_round
                     if kind == "delta":
                         if first_token_ms is None:
                             first_token_ms = int((time.time() - t_start) * 1000)
                         await self.send({"type": "delta", "content": data["content"]})
                     elif kind == "reasoning":
                         await self.send({"type": "reasoning", "content": data["content"]})
+                    elif kind == "tool_delta":
+                        if data.get("name") == "speak" and tts:
+                            st = speech_streams.setdefault(data["index"], JsonStringStreamer("speech"))
+                            piece = st.feed(data.get("arguments") or "")
+                            if piece:
+                                if first_token_ms is None:
+                                    first_token_ms = int((time.time() - t_start) * 1000)
+                                spoke_this_round = True
+                                await self.send({"type": "speech_delta", "content": piece})
                     else:
                         await self.send({"type": "wait", **data})
 
-                acc: Completion = await self.services.nim.chat_stream(messages, schemas, on_event=on_event)
+                # With `speak` on the table the model must go through a tool every round: otherwise it
+                # happily answers in plain text after tool results and the TTS gets raw prose. But right
+                # after a round where it already spoke (narration + tools), forcing a tool again makes it
+                # repeat the same calls forever — so that round runs on "auto".
+                choice = "required" if (tts and settings.SPEAK_REQUIRED and not spoke_last_round) else "auto"
+                acc: Completion = await self.services.nim.chat_stream(messages, schemas, tool_choice=choice, on_event=on_event)
                 log.info("session %s round %d: %d chars, %d tool calls, %.1fs", self.id, round_no,
                          len(acc.content), len(acc.tool_calls), time.time() - round_t0)
 
@@ -246,9 +367,12 @@ class AgentSession:
                 if not acc.tool_calls:
                     assistant_text = acc.content
                     self.messages.append({"role": "assistant", "content": acc.content})
+                    if tts and acc.content.strip() and settings.SPEAK_REWRITE:
+                        # plain prose although speech was requested: rewrite it for the TTS engine
+                        await self._rewrite_for_speech(acc.content)
+                        finish = "rewrite"
                     break
 
-                # --- execute tool calls (client tools may run concurrently)
                 calls = []
                 for i, tc in enumerate(acc.tool_calls):
                     calls.append({
@@ -256,22 +380,47 @@ class AgentSession:
                         "type": "function",
                         "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"] or "{}"},
                     })
+                signature = json.dumps([(c["function"]["name"], c["function"]["arguments"]) for c in calls], ensure_ascii=False)
+                if signature == last_call_signature:
+                    # exact repeat of the previous round's calls: the model is stuck — stop here
+                    log.warning("session %s: repeated tool calls, breaking the loop", self.id)
+                    await self.send({"type": "notice", "message": "Модель повторяет одни и те же вызовы, останавливаю."})
+                    self.messages.append({"role": "assistant", "content": assistant_text.strip() or "(stopped: repeated tool calls)"})
+                    finish = "loop"
+                    break
+                last_call_signature = signature
                 self.messages.append({"role": "assistant", "content": acc.content or None, "tool_calls": calls})
                 if acc.content:
                     assistant_text += acc.content + "\n"
 
-                results = await asyncio.gather(*(self._execute_call(ctx, c) for c in calls))
-                for call, result in zip(calls, results):
+                # --- `speak` calls: the spoken text was already streamed; finish them here
+                speak_calls = [c for c in calls if c["function"]["name"] == "speak"]
+                other_calls = [c for c in calls if c["function"]["name"] != "speak"]
+                for c in speak_calls:
+                    speech, display = self._parse_speak(c["function"]["arguments"])
+                    if not spoke_this_round and speech:   # arguments arrived in one piece (non-streamed backend)
+                        await self.send({"type": "speech_delta", "content": speech})
+                    await self.send({"type": "speech_done", "display": display, "final": not other_calls})
+                    assistant_text += (display or speech) + "\n"
+                    self.messages.append({"role": "tool", "tool_call_id": c["id"], "name": "speak",
+                                          "content": json.dumps({"ok": True, "spoken": True})})
+
+                if speak_calls and not other_calls:
+                    finish = "speak"
+                    break
+                spoke_last_round = bool(speak_calls)
+
+                results = await asyncio.gather(*(self._execute_call(ctx, c) for c in other_calls))
+                for call, result in zip(other_calls, results):
                     self.messages.append({"role": "tool", "tool_call_id": call["id"],
                                           "name": call["function"]["name"], "content": compact_result(result)})
             else:
                 await self.send({"type": "notice", "message": f"Достигнут лимит {settings.MAX_TOOL_ROUNDS} раундов вызова инструментов."})
                 self.messages.append({"role": "assistant", "content": assistant_text or "(tool round limit reached)"})
 
-            await self.send({"type": "done", "finish_reason": "stop", "ms": int((time.time() - t_start) * 1000),
+            await self.send({"type": "done", "finish_reason": finish, "ms": int((time.time() - t_start) * 1000),
                              "first_token_ms": first_token_ms})
         except asyncio.CancelledError:
-            # keep what was already said so the conversation stays coherent
             if assistant_text:
                 self.messages.append({"role": "assistant", "content": assistant_text + " [interrupted by user]"})
             await self.send({"type": "done", "finish_reason": "interrupted", "ms": int((time.time() - t_start) * 1000)})
@@ -285,6 +434,42 @@ class AgentSession:
         if assistant_text.strip():
             asyncio.create_task(self.services.memory.remember_dialog(
                 self.id, text, assistant_text, {"source": source, "attachments": [a.name for a in atts]}))
+
+    async def _rewrite_for_speech(self, content: str) -> None:
+        """Fallback: turn a written answer into TTS-ready speech with a fast model, streamed."""
+        t0 = time.time()
+        spoken = ""
+
+        async def on_event(kind: str, data: dict) -> None:
+            nonlocal spoken
+            if kind == "delta":
+                spoken += data["content"]
+                await self.send({"type": "speech_delta", "content": data["content"]})
+
+        try:
+            await self.services.nim.chat_stream(
+                [{"role": "system", "content": SPEECH_REWRITE_PROMPT},
+                 {"role": "user", "content": content[:6000]}],
+                None, model=settings.SPEAK_REWRITE_MODEL, thinking=False, temperature=0.2, max_tokens=900, on_event=on_event)
+        except Exception as e:  # noqa: BLE001
+            log.warning("speech rewrite failed: %s", e)
+            if not spoken:
+                await self.send({"type": "speech_delta", "content": content})   # client sanitizes as best it can
+        await self.send({"type": "speech_done", "display": content, "final": True})
+        log.info("session %s: speech rewrite %d -> %d chars in %.1fs", self.id, len(content), len(spoken), time.time() - t0)
+
+    @staticmethod
+    def _parse_speak(raw: str) -> tuple[str, Optional[str]]:
+        try:
+            args = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            st = JsonStringStreamer("speech")
+            return st.feed(raw), None
+        if not isinstance(args, dict):
+            return "", None
+        speech = str(args.get("speech") or "")
+        display = args.get("display")
+        return speech, (str(display) if display else None)
 
     async def _execute_call(self, ctx: ToolContext, call: dict) -> Any:
         name = call["function"]["name"]

@@ -52,6 +52,7 @@ class ClientCore:
         self.turn_t0 = 0.0
         self.assistant_buffer = ""
         self.turn_active = False
+        self.speech_mode = False        # the model answered through the `speak` tool this turn
         self._pending_confirms: dict[str, asyncio.Future] = {}
         self._last_level_sent = 0.0
         self._http = httpx.AsyncClient(timeout=120)
@@ -183,17 +184,32 @@ class ClientCore:
                 content = content.lstrip()      # models like to start with blank lines
                 if not content:
                     return
-                if self.speaker and self._speak_enabled():
-                    self.speaker.begin()
             self.assistant_buffer += content
-            if self.speaker and self._speak_enabled():
-                self.speaker.feed(content)
+            # Plain content is display-only: speech arrives separately as speech_delta (from the
+            # `speak` tool or the server-side rewrite). Only if the server sends none at all do we
+            # fall back to speaking the raw text at `done`.
+            await self.broadcast(msg)
+            return
+        if t == "speech_delta":
+            piece = msg.get("content") or ""
+            if not self.speech_mode:
+                self.speech_mode = True
+                if self.speaker:
+                    self.speaker.begin()        # drops any fallback speech started from plain content
+            if self.speaker and self.state["tts_mode"] != "off":
+                self.speaker.feed(piece, prepared=True)
+            await self.broadcast(msg)
+            return
+        if t == "speech_done":
+            if self.speaker:
+                self.speaker.end()
             await self.broadcast(msg)
             return
         if t == "done":
             self.turn_active = False
-            if self.speaker and self._speak_enabled():
-                self.speaker.end()
+            if self.speaker and self._speak_enabled() and not self.speech_mode and self.assistant_buffer.strip() \
+                    and msg.get("finish_reason") in ("stop", None):
+                self.speaker.say(self.assistant_buffer)     # last-resort fallback: raw text, cleaned locally
             msg = dict(msg, total_ms=int((time.time() - self.turn_t0) * 1000) if self.turn_t0 else None)
             await self.broadcast(msg)
             return
@@ -254,10 +270,13 @@ class ClientCore:
         self.turn_t0 = time.time()
         self.assistant_buffer = ""
         self.turn_active = True
+        self.speech_mode = False
         if self.speaker:
             self.speaker.cancel()
+        tts = self._speak_enabled()
         await self.broadcast({"type": "user_message", "text": text, "attachments": attachments, "source": source})
-        ok = await self.send_server({"type": "user_message", "text": text, "attachments": attachments, "source": source})
+        ok = await self.send_server({"type": "user_message", "text": text, "attachments": attachments,
+                                     "source": source, "tts": tts})
         if not ok:
             self.turn_active = False
             await self.broadcast({"type": "done", "finish_reason": "error"})

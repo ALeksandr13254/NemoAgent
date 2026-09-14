@@ -65,6 +65,103 @@ def has_speech(text: str) -> bool:
     return bool(re.search(r"[\wЀ-ӿ]", text or ""))
 
 
+# ----------------------------------------------------------------- vocabulary sanitizer
+# TeraTTSv2 knows 134 characters: letters (й/ё via NFKD decomposition), space, + and
+# . , ! ? : ; - ( ) « » " ' / < >. Everything else is silently skipped, which glues neighbouring
+# words together ("это—тест" -> "этотест"). We map the usual typography to supported punctuation
+# and turn the rest into spaces. Digits are kept: the runtime expands them with num2words.
+_CHAR_MAP = {
+    "—": ", ", "–": ", ", "―": ", ", "…": ". ", "“": '"', "”": '"', "„": '"', "‘": "'", "’": "'", "‚": "'",
+    " ": " ", " ": " ", " ": " ", "\t": " ", "\n": ". ", "\r": " ",
+    "%": " процентов ", "№": " номер ", "°": " градусов ", "€": " евро ", "₽": " рублей ", "$": " долларов ",
+    "&": " и ", "+": "+", "/": "/",
+}
+_ALLOWED = set(" !\"'()+,-./:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz«»"
+               "АБВГДЕЖЗИКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзиклмнопрстуфхцчшщъыьэюяЁёЙй0123456789")
+
+
+def sanitize_vocab(text: str) -> str:
+    """Keep only what the TeraTTS character table can encode; fix typography instead of dropping it."""
+    out: list[str] = []
+    for ch in text:
+        if ch in _CHAR_MAP:
+            out.append(_CHAR_MAP[ch])
+        elif ch in _ALLOWED:
+            out.append(ch)
+        elif ch.isalpha():
+            out.append(ch)          # other scripts: the runtime skips them with a warning
+        else:
+            out.append(" ")
+    t = "".join(out)
+    t = re.sub(r"\s+([.,!?;:])", r"\1", t)
+    t = re.sub(r"([.,!?;:])(?=[^\s.,!?;:)\"»'])", r"\1 ", t)
+    t = re.sub(r"[ ]{2,}", " ", t).strip()
+    return t
+
+
+_WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё̆̈+'-]+")
+
+# Things that must never reach the vocoder even if the model put them into `speech`: shell
+# commands, code, paths, URLs. A sentence is cut from the first code-like token to its end and the
+# cut is replaced by a short spoken note; the exact text stays on screen (display).
+_CODE_TOKEN = re.compile(
+    r"[|{}\[\]$\\<>=`~^#@]|://|::|->|=>|\s--?[a-zA-Z]+\b|\b\w+\.(?:exe|dll|py|js|ts|json|txt|docx?|pdf|xlsx?|csv|md|bat|ps1|sh|yaml|yml|ini|log|png|jpe?g|zip)\b"
+    r"|\b[A-Za-z]:[\\/]|\b(?:Get|Set|Select|Sort|Where|New|Remove|Start|Stop|Invoke|Format|Out|Write|Test|Add)-[A-Z]\w+"
+    r"|\b\w+-Object\b|\b(?:sudo|apt|pip|npm|git|docker|cmd|powershell|bash|python)\s+\S+\S*|\bwww\.\S+")
+
+
+def scrub_code(sentence: str) -> str:
+    m = _CODE_TOKEN.search(sentence)
+    if not m:
+        return sentence
+    start = sentence.rfind(" ", 0, m.start()) + 1
+    head = sentence[:start].rstrip(" :;,—-–(")
+    ru = bool(_CYR.search(sentence))
+    if not re.search(r"[A-Za-zА-Яа-яЁё]{3,}", head):
+        return "Команда показана на экране." if ru else "The command is shown on screen."
+    note = "команда на экране" if ru else "shown on screen"
+    end = "." if not sentence.rstrip().endswith(("!", "?")) else sentence.rstrip()[-1]
+    return f"{head}, {note}{end}"
+
+
+def accentize_keep_manual(text: str, accentizer) -> str:
+    """Run RUAccent over Russian text but keep the caller's `+` marks.
+
+    The bundled runtime skips *all* automatic stressing of a <ru> span as soon as it sees one manual
+    `+` (manual marks are "authoritative"), so a single homograph fixed by the model would leave every
+    other word unstressed. Here the manual words are protected and the rest still gets marked.
+    """
+    if accentizer is None or not text:
+        return text
+    if "+" not in text:
+        try:
+            return accentizer.process_all(text)
+        except Exception:  # noqa: BLE001
+            return text
+    original = _WORD_RE.findall(text)
+    try:
+        stressed = accentizer.process_all(text.replace("+", ""))
+    except Exception:  # noqa: BLE001
+        return text
+    result = _WORD_RE.findall(stressed)
+    if len(result) == len(original):
+        # same word sequence: restore manual marks by position (two homographs with different
+        # stress in one sentence — "з+амок … зам+ок" — must keep their own marks)
+        idx = 0
+
+        def by_position(m: re.Match) -> str:
+            nonlocal idx
+            word = m.group(0)
+            src = original[idx] if idx < len(original) else word
+            idx += 1
+            return src if "+" in src else word
+
+        return _WORD_RE.sub(by_position, stressed)
+    # tokenisation drifted (rare): fall back to matching by spelling
+    manual = {w.replace("+", "").lower(): w for w in original if "+" in w}
+    return _WORD_RE.sub(lambda m: manual.get(m.group(0).replace("+", "").lower(), m.group(0)), stressed)
+
+
 # ----------------------------------------------------------------- language tagging
 def tag_languages(text: str) -> tuple[str, str]:
     """Return (tagged_text, dominant_language) with <ru>/<en> spans per word run."""
@@ -232,10 +329,22 @@ class TeraTTS:
     def voice_for(lang: str) -> str:
         return settings.TTS_VOICE_RU if lang == "ru" else settings.TTS_VOICE_EN
 
+    def prepare(self, text: str) -> tuple[str, str]:
+        """Sanitize -> language tags -> Russian stress (keeping manual marks). Returns (tagged, lang)."""
+        text = sanitize_vocab(text)
+        tagged, lang = tag_languages(text)
+        if not tagged:
+            return "", lang
+        if self.loaded.accentizer is not None and "<ru>" in tagged:
+            tagged = re.sub(r"<ru>(.*?)</ru>",
+                            lambda m: "<ru>" + accentize_keep_manual(m.group(1), self.loaded.accentizer) + "</ru>",
+                            tagged, flags=re.S)
+        return tagged, lang
+
     def synth_stream(self, text: str, voice: Optional[str] = None, speed: Optional[float] = None,
                      chunk_frames: Optional[int] = None) -> Iterator[np.ndarray]:
         """Yield float32 44.1 kHz chunks for one sentence (already cleaned)."""
-        tagged, lang = tag_languages(text)
+        tagged, lang = self.prepare(text)
         if not tagged or not has_speech(tagged):
             return
         voice = voice or self.voice_for(lang)

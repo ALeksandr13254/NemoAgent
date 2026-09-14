@@ -90,6 +90,7 @@ class NIMClient:
         thinking: Optional[bool] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        tool_choice: Any = "auto",
         on_event: Optional[Callable[[str, dict], Awaitable[None]]] = None,
     ) -> Completion:
         """Stream one assistant turn. on_event(kind, data) gets 'delta' / 'reasoning' / 'wait' events."""
@@ -109,7 +110,7 @@ class NIMClient:
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         if tools:
             payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+            payload["tool_choice"] = tool_choice or "auto"
         payload.update(self._fixed_params.get(model, {}))
 
         attempt = 0
@@ -242,6 +243,10 @@ class NIMClient:
                         slot["function"]["name"] += fn["name"]
                     if fn.get("arguments"):
                         slot["function"]["arguments"] += fn["arguments"]
+                    if on_event and (fn.get("name") or fn.get("arguments")):
+                        # streamed so the agent can start speaking a `speak` call before it is complete
+                        await on_event("tool_delta", {"index": i, "name": slot["function"]["name"],
+                                                      "arguments": fn.get("arguments") or ""})
         except Exception as e:
             if emitted:
                 raise _Emitted(e)

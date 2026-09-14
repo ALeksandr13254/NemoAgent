@@ -60,6 +60,20 @@
         current._text += m.content; current.innerHTML = fmt(current._text); scroll();
         break;
       }
+      case 'speech_delta': {
+        // TTS-ready text from the `speak` tool: show it while it streams; `display` may replace it at the end
+        if (!current || !current._speech) { current = add(div('msg assistant streaming speech')); current._text = ''; current._speech = true; }
+        current._text += m.content; current.innerHTML = '<span class="spk" title="озвучено">🔊</span>' + fmt(current._text); scroll();
+        break;
+      }
+      case 'speech_done': {
+        if (current && current._speech) {
+          if (m.display) { current._text = m.display; current.innerHTML = '<span class="spk" title="озвучено (на экране — версия для чтения)">🔊</span>' + fmt(m.display); }
+          current.classList.remove('streaming');
+          if (!m.final) current = null;
+        }
+        break;
+      }
       case 'reasoning': {
         if (!reasoningCard) { reasoningCard = card('reasoning', '🧠 рассуждения', '', false); }
         const pre = reasoningCard.querySelector('pre'); pre.textContent += m.content; break;

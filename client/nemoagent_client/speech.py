@@ -9,7 +9,7 @@ from collections import deque
 from typing import Callable, Optional
 
 from .player import StreamPlayer
-from .tts import SentenceSplitter, TeraTTS, clean_for_tts, has_speech
+from .tts import SentenceSplitter, TeraTTS, clean_for_tts, has_speech, scrub_code
 
 log = logging.getLogger("speech")
 
@@ -26,6 +26,8 @@ class Speaker:
         self._utt_started = 0.0
         self._first_audio_at = 0.0
         self.recent: deque[str] = deque(maxlen=12)   # last spoken sentences (for echo rejection)
+        self._prepared = False
+        self._last_enqueued = ""
         self._thread = threading.Thread(target=self._worker, daemon=True, name="tts-worker")
         self._thread.start()
 
@@ -40,26 +42,33 @@ class Speaker:
         self.cancel()
         self._utt_started = time.time()
         self._first_audio_at = 0.0
+        self._last_enqueued = ""
         self.splitter.reset()
         return self._gen
 
-    def feed(self, delta: str) -> None:
+    def feed(self, delta: str, prepared: bool = False) -> None:
+        """Stream text in. prepared=True means the model wrote TTS-ready text via the `speak` tool:
+        only the vocabulary sanitizer runs, the markdown cleaner is skipped."""
         for sent in self.splitter.feed(delta):
-            self._enqueue(sent)
+            self._enqueue(sent, prepared)
 
     def end(self) -> None:
         for sent in self.splitter.finish():
-            self._enqueue(sent)
+            self._enqueue(sent, self._prepared)
 
     def say(self, text: str) -> None:
         self.begin()
         self.feed(text)
         self.end()
 
-    def _enqueue(self, sentence: str) -> None:
-        cleaned = clean_for_tts(sentence)
+    def _enqueue(self, sentence: str, prepared: bool = False) -> None:
+        self._prepared = prepared
+        cleaned = scrub_code(sentence if prepared else clean_for_tts(sentence))
         if not has_speech(cleaned):
             return
+        if cleaned == self._last_enqueued:      # a long command split into chunks -> one note, not three
+            return
+        self._last_enqueued = cleaned
         self._q.put((self._gen, cleaned))
 
     def cancel(self) -> None:
