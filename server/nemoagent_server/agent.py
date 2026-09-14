@@ -1,11 +1,15 @@
-"""Agent session: conversation state, streaming tool loop, memory recall and context trimming.
+"""Agent session: conversation state, the two-agent turn, memory recall and context trimming.
 
-Speech without function calling. When the client wants voice, the model is prompted to write the
-answer itself in a TTS-ready form (rules in prompts.py, editable from the UI) and the text is streamed to the
-client as speech while it is being generated (ProseSpeechRouter): the first sentence is spoken
-about a second after the request, the rest follows without gaps. A line with `===` separates an
-optional screen-only part (code, paths, links). Tools are used only for actions — commands, files,
-screen, attachments, web search — never for talking.
+One omni model, two prompts. The user's message goes to the model together with its attachments as
+media parts (images, audio, video; documents as text — see media.py), so the DIALOGUE agent answers
+about them directly, by voice, without any tool. Speech without function calling: when the client
+wants voice, the dialogue agent is prompted to write the answer itself in a TTS-ready form (rules in
+prompts.py, editable from the UI) and the text is streamed to the client as speech while it is
+generated (ProseSpeechRouter): the first sentence is spoken about a second after the request, the
+rest follows without gaps. A line with `===` separates an optional screen-only part (code, paths,
+links); a `>>>` line hands a task to the EXECUTOR, which runs the tools (commands, files, screen,
+web, memory — the screen and the attachments come back to it as images) and returns a report that
+the dialogue agent then tells the user.
 """
 from __future__ import annotations
 
@@ -19,6 +23,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
+from . import media
 from .attachments import AttachmentStore
 from .config import settings
 from .memory import MemoryStore
@@ -26,7 +31,6 @@ from .nim import Completion, NIMClient
 from .prompts import PromptStore
 from .speechfmt import ProseSpeechRouter, looks_like_promise, strip_filler
 from .tools import CLIENT_TOOL_NAMES, ToolContext, all_schemas, compact_result, run_server_tool
-from .vision import VisionService
 
 log = logging.getLogger("agent")
 
@@ -34,12 +38,19 @@ SendFn = Callable[[dict], Awaitable[None]]
 ClientCallFn = Callable[[str, dict, float], Awaitable[dict]]
 
 
+def _norm_args(raw: str) -> str:
+    """Tool arguments with sorted keys, so {"a":1,"b":2} and {"b":2,"a":1} count as the same call."""
+    try:
+        return json.dumps(json.loads(raw or "{}"), sort_keys=True, ensure_ascii=False)
+    except Exception:  # noqa: BLE001
+        return raw or ""
+
+
 @dataclass
 class Services:
     nim: NIMClient
     memory: MemoryStore
     attachments: AttachmentStore
-    vision: VisionService
     prompts: PromptStore
 
 
@@ -52,8 +63,6 @@ class AgentSession:
         self.client_info: dict = client_info or {}
         self.messages: list[dict] = []
         self.turns = 0
-        self.deepseek_session_id: Optional[str] = None
-        self.deepseek_parent_id: Optional[int] = None
         self.last_attachment_ids: list[str] = []
         self.session_attachment_ids: list[str] = []
         self._task: Optional[asyncio.Task] = None
@@ -104,9 +113,7 @@ class AgentSession:
     def _estimate_tokens(messages: list[dict]) -> int:
         n = 0
         for m in messages:
-            c = m.get("content")
-            if isinstance(c, str):
-                n += len(c) / 3.2
+            n += media.estimate_tokens(m.get("content"))
             if m.get("tool_calls"):
                 n += len(json.dumps(m["tool_calls"], ensure_ascii=False)) / 3.2
         return int(n)
@@ -128,6 +135,11 @@ class AgentSession:
         self.messages.insert(0, note)
         log.info("session %s: context trimmed to ~%d tokens, %d messages", self.id, self._estimate_tokens(self.messages), len(self.messages))
 
+    def _for_request(self) -> list[dict]:
+        """History as sent to the model: media only in the last MEDIA_KEEP_TURNS user messages that carry it
+        (older images/audio/video become a text stub — the answer about them is already in the history)."""
+        return media.prune_old_media(self.messages, settings.MEDIA_KEEP_TURNS)
+
     # ------------------------------------------------------------- lifecycle
     def busy(self) -> bool:
         return self._task is not None and not self._task.done()
@@ -145,8 +157,6 @@ class AgentSession:
     def reset(self) -> None:
         self.messages.clear()
         self.turns = 0
-        self.deepseek_session_id = None
-        self.deepseek_parent_id = None
         self.last_attachment_ids = []
         self.session_attachment_ids = []
         self.id = uuid.uuid4().hex[:12]
@@ -180,11 +190,13 @@ class AgentSession:
                                                       "text": r["text"][:300], "ts": r["ts"]} for r in recalled]})
 
     def _context_for_executor(self, limit: int = 10) -> list[dict]:
-        """Recent user/assistant turns (plain strings) so the executor understands what the task is about."""
+        """Recent user/assistant turns as plain text so the executor understands what the task is about."""
         out = []
         for m in self.messages:
-            if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str) and m["content"].strip():
-                out.append({"role": m["role"], "content": m["content"][:2000]})
+            if m.get("role") in ("user", "assistant"):
+                text = media.text_of(m.get("content"))
+                if text.strip():
+                    out.append({"role": m["role"], "content": text[:2000]})
         return out[-limit:]
 
     def _trace_params(self, tts: bool, use_memory: bool, source: str, tools: list) -> dict:
@@ -199,7 +211,7 @@ class AgentSession:
         Returns (speech, display, task, first_token_ms). Spoken text streams to the client while it
         is generated; the `===` part goes to the screen; a `>>>` task is handed to the executor.
         """
-        messages = [self._system_message(tts)] + self.messages
+        messages = [self._system_message(tts)] + self._for_request()
         router = ProseSpeechRouter()
         first_token_ms: Optional[int] = None
         await self.send({"type": "stage", "name": stage, "agent": "dialogue"})
@@ -224,7 +236,7 @@ class AgentSession:
 
         t0 = time.time()
         await self.send({"type": "trace", "kind": "request", "agent": "dialogue", "stage": stage, "turn": self.turns,
-                         "round": call_no, "model": settings.LLM_MODEL, "messages": messages, "tools": [],
+                         "round": call_no, "model": settings.LLM_MODEL, "messages": media.redact(messages), "tools": [],
                          "params": self._trace_params(tts, use_memory, source, [])})
         acc: Completion = await self.services.nim.chat_stream(messages, None, on_event=on_event)
         await emit(router.finish())
@@ -239,15 +251,23 @@ class AgentSession:
         return speech, display, task, first_token_ms
 
     async def _run_executor(self, task: str, ctx: ToolContext, use_memory: bool, tools_enabled: bool,
-                            tts: bool, source: str, call_no: int) -> tuple[str, int]:
-        """The executor agent: tools loop on the task; returns (report, calls_used)."""
+                            tts: bool, source: str, call_no: int, task_media: Optional[list[dict]] = None) -> tuple[str, int]:
+        """The executor agent: tools loop on the task; returns (report, calls_used).
+
+        `task_media` — the attachments of the current user message, so a task about them ("extract the
+        table from the photo and save it") starts with the model seeing them.
+        """
         await self.send({"type": "stage", "name": "executor", "agent": "executor"})
-        schemas = all_schemas(tools_enabled, self.services.vision.enabled, memory_enabled=use_memory)
+        schemas = all_schemas(tools_enabled, memory_enabled=use_memory)
         system = {"role": "system", "content": self.services.prompts.render_executor(
             self._env_description() + "\n" + self._now_line())}
-        work: list[dict] = self._context_for_executor() + [
-            {"role": "user", "content": f"Задача от диалогового агента: {task}"}]
-        last_signature: Optional[str] = None
+        task_text = f"Задача от диалогового агента: {task}"
+        task_msg: dict = {"role": "user", "content": task_text}
+        if task_media:
+            task_msg = {"role": "user", "content": [{"type": "text", "text": task_text + "\n(вложения пользователя приложены ниже)"},
+                                                    *task_media]}
+        work: list[dict] = self._context_for_executor() + [task_msg]
+        seen_calls: set[str] = set()
         narration = ""
         tools_used = 0
         forced_retry = False
@@ -259,7 +279,7 @@ class AgentSession:
             # streaming quirks of `required` do not matter here.
             choice = "required" if (tools_used == 0 and schemas and not forced_retry) else "auto"
             await self.send({"type": "trace", "kind": "request", "agent": "executor", "stage": "executor", "turn": self.turns,
-                             "round": call_no + round_no - 1, "model": settings.LLM_MODEL, "messages": messages,
+                             "round": call_no + round_no - 1, "model": settings.LLM_MODEL, "messages": media.redact(messages),
                              "tools": [s["function"]["name"] for s in schemas],
                              "params": dict(self._trace_params(tts, use_memory, source, schemas), tool_choice=choice)})
 
@@ -294,18 +314,25 @@ class AgentSession:
             for i, tc in enumerate(acc.tool_calls):
                 calls.append({"id": tc.get("id") or f"call_{round_no}_{i}_{uuid.uuid4().hex[:6]}", "type": "function",
                               "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"] or "{}"}})
-            signature = json.dumps([(c["function"]["name"], c["function"]["arguments"]) for c in calls], ensure_ascii=False)
-            if signature == last_signature:
+            signature = json.dumps([(c["function"]["name"], _norm_args(c["function"]["arguments"])) for c in calls], ensure_ascii=False)
+            if signature in seen_calls:
                 log.warning("session %s: executor repeats tool calls, stopping", self.id)
-                return (narration.strip() + "\n(исполнитель зациклился на одинаковых вызовах и был остановлен)").strip(), round_no
-            last_signature = signature
+                return (narration.strip() + "\n(исполнитель повторил уже сделанный вызов инструмента и был остановлен; "
+                        "результаты выше — всё, что удалось получить)").strip(), round_no
+            seen_calls.add(signature)
             if acc.content and acc.content.strip():
                 narration = acc.content.strip()
             work.append({"role": "assistant", "content": acc.content.strip() or None, "tool_calls": calls})
             results = await asyncio.gather(*(self._execute_call(ctx, c) for c in calls))
+            shown: list[tuple[str, list[dict]]] = []
             for call, result in zip(calls, results):
+                if isinstance(result, dict) and result.get("_media"):
+                    # a screenshot or an attachment: the tool result stays text, the media follows as a user message
+                    shown.append((call["function"]["name"], result.pop("_media")))
                 work.append({"role": "tool", "tool_call_id": call["id"], "name": call["function"]["name"],
                              "content": compact_result(result)})
+            for name, parts in shown:
+                work.append({"role": "user", "content": [{"type": "text", "text": f"[содержимое от инструмента {name}]"}, *parts]})
         return (narration.strip() + "\n(достигнут лимит раундов инструментов, задача могла остаться незавершённой)").strip(), settings.MAX_TOOL_ROUNDS
 
     async def _run_turn(self, text: str, attachment_ids: list[str], source: str, tts: bool, memory: bool = False) -> None:
@@ -319,11 +346,14 @@ class AgentSession:
         self.last_attachment_ids = [a.id for a in atts]
         self.session_attachment_ids.extend(a.id for a in atts)
 
-        user_content = text or ("(see attachments)" if atts else "")
+        # attachments go straight into the message: images/audio/video as media parts, documents as text
+        parts, notes, media_tokens = await media.build_parts(atts)
+        user_text = text or ("(see attachments)" if atts else "")
         if atts:
-            listing = "; ".join(self.services.attachments.describe(a) for a in atts)
-            user_content += f"\n\n[attachments: {listing}]"
-        self.messages.append({"role": "user", "content": user_content})
+            user_text += "\n\n[attachments: " + "; ".join(notes) + "]"
+            log.info("session %s: %d attachment(s) -> %d parts, ~%d tokens", self.id, len(atts), len(parts), media_tokens)
+        content: Any = [{"type": "text", "text": user_text}, *parts] if parts else user_text
+        self.messages.append({"role": "user", "content": content})
         use_memory = memory or settings.MEMORY_AUTO_RECALL
         if use_memory and text:
             await self._recall(text)
@@ -346,7 +376,7 @@ class AgentSession:
                 assistant_text = said
             if not task and looks_like_promise(speech):
                 # "Сейчас проверю." with nothing behind it: turn the user's request itself into the task
-                task = "Выполни то, о чём попросил пользователь: " + user_content
+                task = "Выполни то, о чём попросил пользователь: " + user_text
                 log.info("session %s: promise without a task -> auto task", self.id)
                 await self.send({"type": "notice", "message": "Голосовой агент пообещал действие без задачи — задача поставлена автоматически."})
 
@@ -357,13 +387,27 @@ class AgentSession:
                 if tts:
                     await self.send({"type": "speech_done", "display": display, "final": False})
                 await self.send({"type": "task", "task": task})
-                report, used = await self._run_executor(task, ctx, use_memory, tools_enabled, tts, source, call_no)
+                report, used = await self._run_executor(task, ctx, use_memory, tools_enabled, tts, source, call_no,
+                                                        task_media=[p for p in parts if p.get("type") != "text"] or None)
                 call_no += used
                 reports.append(report)
                 await self.send({"type": "report", "task": task, "report": report})
-                self.messages.append({"role": "system", "content": f"Результат исполнителя по задаче «{task}»:\n{report}"})
+                # the report comes in as a labelled user message: the model follows that far better than a
+                # system note (with a system note it just repeated its "Сейчас проверю")
+                self.messages.append({"role": "user", "content": (
+                    f"[Результат исполнителя по задаче «{task}»]\n{report}\n\n"
+                    "Сообщи пользователю итог своими словами: конкретные факты и цифры из результата; если что-то "
+                    "не удалось — что именно. Не повторяй обещание и не ставь новую задачу, если она не нужна.")})
                 speech, display, task, _ = await self._dialogue_call(tts, use_memory, source, t_start, "report", call_no)
                 call_no += 1
+                if not task and looks_like_promise(speech):
+                    # still a promise instead of the outcome: one more try, then give up
+                    log.warning("session %s: report stage answered with a promise, retrying", self.id)
+                    self.messages.append({"role": "assistant", "content": speech})
+                    self.messages.append({"role": "user", "content": "Ты снова пообещал проверить, но проверка уже выполнена. "
+                                                                     "Скажи результат из сообщения выше."})
+                    speech, display, task, _ = await self._dialogue_call(tts, use_memory, source, t_start, "report", call_no)
+                    call_no += 1
                 said = speech + (("\n" + display) if display else "")
                 if said.strip():
                     self.messages.append({"role": "assistant", "content": said})
@@ -387,8 +431,15 @@ class AgentSession:
             memo = assistant_text
             if reports:
                 memo += "\n[исполнитель] " + " | ".join(r[:600] for r in reports)
-            asyncio.create_task(self.services.memory.remember_dialog(
-                self.id, text, memo, {"source": source, "attachments": [a.name for a in atts]}))
+            meta = {"source": source, "attachments": [a.name for a in atts]}
+            images = [a for a in atts if a.is_image]
+            if images:
+                # turns with pictures go to the VL collection: reachable later by text or by a similar image
+                uris = [u for u in (self.services.attachments.image_data_uri(a) for a in images) if u]
+                asyncio.create_task(self.services.memory.remember_media(
+                    self.id, text or "(вложения)", memo, [a.public() for a in atts], uris))
+            else:
+                asyncio.create_task(self.services.memory.remember_dialog(self.id, text, memo, meta))
 
     async def _execute_call(self, ctx: ToolContext, call: dict) -> Any:
         name = call["function"]["name"]
@@ -416,7 +467,7 @@ class AgentSession:
         else:
             result = await run_server_tool(name, ctx, args)
         ms = int((time.time() - t0) * 1000)
-        preview = result if isinstance(result, dict) else {"result": result}
+        preview = {k: v for k, v in result.items() if k != "_media"} if isinstance(result, dict) else {"result": result}
         serialized = compact_result(preview, 4000)
         payload = preview if len(serialized) < 4000 else {"preview": serialized}
         await self.send({"type": "tool_result", "id": call["id"], "name": name, "ms": ms, "result": payload})

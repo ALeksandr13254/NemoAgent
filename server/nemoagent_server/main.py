@@ -4,25 +4,27 @@ Protocol (JSON text frames):
   client -> server
     {"type":"hello", "token": "...", "client": {os, hostname, user, shell, screen, timezone, tools_enabled}}
     {"type":"user_message", "text": "...", "attachments": ["id", ...], "source": "voice"|"text", "tts": bool, "memory": bool}
+        attachments (images, audio, video, documents) are sent to the omni model inside the message
         tts=true: the answer is written in TTS form and streamed as speech_delta events
         memory=true: long-term memory is recalled for this message and the search_memory tool is offered
     {"type":"tool_result", "call_id": "...", "result": {...}}
     {"type":"interrupt"}          # stop the current answer (barge-in)
     {"type":"new_session"}
     {"type":"client_info", "client": {...}}     # update capabilities/toggles
-    {"type":"get_prompts"} / {"type":"set_prompts","values":{system,voice_prose,voice_text}} / {"type":"reset_prompts","keys":[...]}
+    {"type":"get_prompts"} / {"type":"set_prompts","values":{system,voice_prose,voice_text,executor}} / {"type":"reset_prompts","keys":[...]}
         -> {"type":"prompts","current":{...},"defaults":{...},"overridden":[...]}   (editable system prompt parts)
     {"type":"ping"}
   server -> client
-    {"type":"ready", "session_id": "...", "vision": bool, "memory": {...}}
-    {"type":"round", "round": n}
+    {"type":"ready", "session_id": "...", "vision": true, "memory": {...}, "model": "..."}
+    {"type":"stage", "name": "answer"|"executor"|"report", "agent": "dialogue"|"executor"}
     {"type":"delta", "content": "..."}         {"type":"reasoning", "content": "..."}
+    {"type":"task", "task": "..."}             {"type":"executor_delta", "content": "..."}   {"type":"report", "task", "report"}
     {"type":"tool_call", "id","name","arguments"}            # informational (server tools)
     {"type":"client_tool", "call_id","name","arguments"}     # execute on the client, reply with tool_result
     {"type":"tool_result", "id","name","ms","result"}
     {"type":"speech_delta", "content": "..."}  # TTS-ready text (stream it to the TTS)
     {"type":"speech_done", "display": str|null, "final": bool}   # display = screen-only part after ===, if any
-    {"type":"trace", "kind":"request", "messages":[...full prompt...], "tools":[...], "params":{...}}
+    {"type":"trace", "kind":"request", "messages":[...full prompt, media as sizes...], "tools":[...], "params":{...}}
     {"type":"trace", "kind":"response", "content", "reasoning", "tool_calls", "usage", "ms"}
     {"type":"memory", "items":[...]}            {"type":"wait", ...}   {"type":"notice", "message"}
     {"type":"done", "finish_reason", "ms", "first_token_ms"}    {"type":"error", "message"}
@@ -33,13 +35,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 
 from .agent import AgentSession, Services
 from .attachments import AttachmentStore
@@ -47,7 +49,6 @@ from .config import settings
 from .memory import MemoryStore
 from .nim import NIMClient
 from .prompts import PromptStore
-from .vision import VisionService
 
 logging.basicConfig(level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
                     format="%(asctime)s %(levelname).1s %(name)s: %(message)s", datefmt="%H:%M:%S")
@@ -64,11 +65,12 @@ async def lifespan(app: FastAPI):
     nim = NIMClient()
     memory = MemoryStore(nim)
     attachments = AttachmentStore()
-    vision = VisionService(attachments, memory)
     prompts = PromptStore()
-    services = Services(nim=nim, memory=memory, attachments=attachments, vision=vision, prompts=prompts)
-    log.info("NemoAgent server ready on %s:%s | model %s | vision %s | memory %s",
-             settings.HOST, settings.PORT, settings.LLM_MODEL, "on" if vision.enabled else f"off ({vision.error})", memory.count())
+    services = Services(nim=nim, memory=memory, attachments=attachments, prompts=prompts)
+    ffmpeg = shutil.which(settings.FFMPEG)
+    log.info("NemoAgent server ready on %s:%s | model %s | ffmpeg %s | memory %s",
+             settings.HOST, settings.PORT, settings.LLM_MODEL, ffmpeg or "not found (only wav/mp3/mp4 attachments pass as they are)",
+             memory.count())
     try:
         yield
     finally:
@@ -86,9 +88,14 @@ def _check_token(authorization: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="bad token")
 
 
+def _ready(session: AgentSession) -> dict:
+    return {"type": "ready", "session_id": session.id, "vision": True, "modalities": ["text", "image", "audio", "video"],
+            "memory": services.memory.count(), "model": settings.LLM_MODEL}
+
+
 @app.get("/health")
 async def health():
-    return {"ok": True, "model": settings.LLM_MODEL, "vision": services.vision.enabled if services else False,
+    return {"ok": True, "model": settings.LLM_MODEL, "vision": True, "ffmpeg": bool(shutil.which(settings.FFMPEG)),
             "memory": services.memory.count() if services else {}, "time": time.time()}
 
 
@@ -121,14 +128,6 @@ async def memory_clear(authorization: Optional[str] = Header(default=None)):
     """Forget everything (irreversible)."""
     _check_token(authorization)
     return {"removed": services.memory.clear(), "left": services.memory.count()}
-
-
-@app.post("/deepseek/reload")
-async def deepseek_reload(authorization: Optional[str] = Header(default=None)):
-    """Re-read DeepSeek token/cookies after refreshing them in server/.env + cookies file."""
-    _check_token(authorization)
-    services.vision.reload_credentials()
-    return {"vision": services.vision.enabled, "error": services.vision.error}
 
 
 class ClientLink:
@@ -188,8 +187,7 @@ async def ws_endpoint(ws: WebSocket):
     link.client_info = hello.get("client") or {}
     link.session = AgentSession(services, link.send, link.call_client, link.client_info)
     log.info("client connected: %s", {k: link.client_info.get(k) for k in ("os", "hostname", "user")})
-    await link.send({"type": "ready", "session_id": link.session.id, "vision": services.vision.enabled,
-                     "vision_error": services.vision.error, "memory": services.memory.count(), "model": settings.LLM_MODEL})
+    await link.send(_ready(link.session))
 
     turn_task: Optional[asyncio.Task] = None
     try:
@@ -217,8 +215,7 @@ async def ws_endpoint(ws: WebSocket):
                 await link.session.interrupt()
                 link.cancel_pending()
                 link.session.reset()
-                await link.send({"type": "ready", "session_id": link.session.id, "vision": services.vision.enabled,
-                                 "memory": services.memory.count(), "model": settings.LLM_MODEL})
+                await link.send(_ready(link.session))
             elif t == "client_info":
                 link.client_info.update(msg.get("client") or {})
                 link.session.client_info = link.client_info

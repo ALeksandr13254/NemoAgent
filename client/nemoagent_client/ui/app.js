@@ -198,7 +198,7 @@
     setPill('pill-stt', st.startsWith('ready') ? 'ok' : st.startsWith('error') ? 'err' : st === 'off' ? '' : 'warn', 'STT ' + st.replace('ready ', ''));
     setPill('pill-tts', tt.startsWith('ready') ? 'ok' : tt.startsWith('error') ? 'err' : tt === 'off' ? '' : 'warn', 'TTS ' + tt.replace('ready ', ''));
     const si = state.server_info || {};
-    setPill('pill-vision', si.vision ? 'ok' : 'warn', si.vision ? 'vision' : 'vision off');
+    setPill('pill-vision', si.vision ? 'ok' : 'warn', si.vision ? 'omni' : 'omni off');
     const mem = si.memory ? Object.values(si.memory).reduce((a, b) => a + b, 0) : 0;
     setPill('pill-memory', 'ok', `память ${mem}`);
     $('model').textContent = si.model ? '· ' + si.model.split('/').pop() : '';

@@ -247,7 +247,6 @@ class NIMClient:
                     if fn.get("arguments"):
                         slot["function"]["arguments"] += fn["arguments"]
                     if on_event and (fn.get("name") or fn.get("arguments")):
-                        # streamed so the agent can start speaking a `speak` call before it is complete
                         await on_event("tool_delta", {"index": i, "name": slot["function"]["name"],
                                                       "arguments": fn.get("arguments") or ""})
         except Exception as e:
@@ -255,6 +254,9 @@ class NIMClient:
                 raise _Emitted(e)
             raise
         acc.tool_calls = [tool_slots[i] for i in sorted(tool_slots)]
+        if acc.finish_reason is None and not acc.content.strip() and not acc.tool_calls and not acc.reasoning:
+            # the pool sometimes closes the stream right away with nothing in it (seen with media inputs)
+            raise UpstreamError(502, "stream ended without a result")
         if holding and held:
             if held.lstrip().startswith(err_prefix) and not acc.tool_calls:
                 raise UpstreamError(502, f"backend error returned as content: {held.strip()[:300]}")

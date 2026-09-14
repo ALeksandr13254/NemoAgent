@@ -1,7 +1,8 @@
-"""Uploaded files registry (images, documents, screenshots) living in UPLOAD_DIR."""
+"""Uploaded files registry (images, audio, video, documents, screenshots) living in UPLOAD_DIR."""
 from __future__ import annotations
 
 import base64
+import dataclasses
 import io
 import json
 import mimetypes
@@ -14,6 +15,13 @@ from typing import Optional
 from .config import settings
 
 IMAGE_EXTS = {"png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "avif", "apng", "jfif"}
+AUDIO_EXTS = {"wav", "mp3", "m4a", "aac", "ogg", "oga", "opus", "flac", "wma", "amr", "aiff", "aif"}
+VIDEO_EXTS = {"mp4", "m4v", "mov", "mkv", "avi", "webm", "wmv", "mpg", "mpeg", "3gp", "ts", "flv"}
+TEXT_EXTS = {"txt", "md", "markdown", "rst", "py", "js", "ts", "tsx", "jsx", "json", "yaml", "yml", "toml", "ini", "cfg",
+             "conf", "csv", "tsv", "log", "xml", "html", "htm", "css", "scss", "sql", "sh", "bat", "ps1", "cmd", "c", "h",
+             "cpp", "hpp", "cs", "java", "kt", "go", "rs", "rb", "php", "swift", "lua", "r", "tex", "bib", "env", "srt",
+             "vtt", "diff", "patch", "gradle", "properties", "dockerfile", "makefile"}
+OFFICE_EXTS = {"docx", "pptx", "xlsx"}
 
 
 @dataclass
@@ -25,17 +33,41 @@ class Attachment:
     mime: str
     is_image: bool
     uploaded_at: float
-    deepseek_file_id: Optional[str] = None
-    analyzed: bool = False
     meta: dict = field(default_factory=dict)
+
+    @property
+    def ext(self) -> str:
+        return self.name.rsplit(".", 1)[-1].lower() if "." in self.name else ""
+
+    @property
+    def kind(self) -> str:
+        """image | audio | video | pdf | text | office | other — decides how the model gets the file."""
+        ext, mime = self.ext, (self.mime or "")
+        if self.is_image or mime.startswith("image/"):
+            return "image"
+        if ext in VIDEO_EXTS or mime.startswith("video/"):
+            return "video"
+        if ext in AUDIO_EXTS or mime.startswith("audio/"):
+            return "audio"
+        if ext == "pdf" or mime == "application/pdf":
+            return "pdf"
+        if ext in OFFICE_EXTS:
+            return "office"
+        if ext in TEXT_EXTS or mime.startswith("text/") or mime in ("application/json", "application/xml"):
+            return "text"
+        return "other"
 
     def public(self) -> dict:
         d = asdict(self)
         d.pop("path", None)
+        d["kind"] = self.kind
         return d
 
     def read(self) -> bytes:
         return Path(self.path).read_bytes()
+
+
+_FIELDS = {f.name for f in dataclasses.fields(Attachment)}
 
 
 class AttachmentStore:
@@ -52,7 +84,7 @@ class AttachmentStore:
         try:
             data = json.loads(self._index_path().read_text("utf-8"))
             for d in data:
-                a = Attachment(**d)
+                a = Attachment(**{k: v for k, v in d.items() if k in _FIELDS})  # tolerate fields of older versions
                 if Path(a.path).exists():
                     self._items[a.id] = a
         except Exception:
@@ -78,6 +110,8 @@ class AttachmentStore:
         path = self.root / f"{aid}_{safe}"
         path.write_bytes(data)
         mime = mime or self.guess_mime(safe)
+        if mime == "application/octet-stream":
+            mime = self.guess_mime(safe)
         att = Attachment(id=aid, name=safe, path=str(path), size=len(data), mime=mime,
                          is_image=ext in IMAGE_EXTS or mime.startswith("image/"),
                          uploaded_at=time.time(), meta=meta or {})
@@ -87,18 +121,6 @@ class AttachmentStore:
 
     def get(self, aid: str) -> Optional[Attachment]:
         return self._items.get(aid)
-
-    def set_deepseek_id(self, aid: str, file_id: str) -> None:
-        a = self._items.get(aid)
-        if a:
-            a.deepseek_file_id = file_id
-            self._save_index()
-
-    def mark_analyzed(self, aid: str) -> None:
-        a = self._items.get(aid)
-        if a:
-            a.analyzed = True
-            self._save_index()
 
     def image_data_uri(self, att: Attachment, max_side: int = 768, fmt: str = "JPEG", quality: int = 82) -> Optional[str]:
         """Downscaled data-URI for the vision-language embedding model (~780 tokens per image)."""
@@ -117,6 +139,5 @@ class AttachmentStore:
 
     @staticmethod
     def describe(att: Attachment) -> str:
-        kind = "image" if att.is_image else "file"
         size = f"{att.size/1024:.0f} KB" if att.size < 1048576 else f"{att.size/1048576:.1f} MB"
-        return f"{kind} '{att.name}' ({size}, id={att.id})"
+        return f"{att.kind} '{att.name}' ({size}, id={att.id})"

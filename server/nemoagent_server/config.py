@@ -49,9 +49,10 @@ class Settings:
     # --- NVIDIA NIM ---
     NVIDIA_API_KEY = _env("NVIDIA_API_KEY", "")
     NIM_BASE_URL = _env("NIM_BASE_URL", "https://integrate.api.nvidia.com/v1/")
-    LLM_MODEL = _env("LLM_MODEL", "nvidia/nemotron-3-super-120b-a12b")
-    LLM_THINKING = _bool("LLM_THINKING", False)     # reasoning adds seconds of latency; off for voice
-    LLM_TEMPERATURE = _float("LLM_TEMPERATURE", 0.6)
+    # One omni model for everything: text, images, audio and video go in as message parts; tools work.
+    LLM_MODEL = _env("LLM_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning")
+    LLM_THINKING = _bool("LLM_THINKING", False)     # the model reasons by default; off saves seconds per answer
+    LLM_TEMPERATURE = _float("LLM_TEMPERATURE", 0.3)  # model card: 0.2 without reasoning, 0.6 with it
     LLM_MAX_TOKENS = _int("LLM_MAX_TOKENS", 4096)
     LLM_TOP_P = _env("LLM_TOP_P")                   # unset = model default
     UPSTREAM_TIMEOUT = _int("UPSTREAM_TIMEOUT", 600)  # seconds of NIM silence we tolerate
@@ -59,6 +60,17 @@ class Settings:
 
     EMBED_TEXT_MODEL = _env("EMBED_TEXT_MODEL", "nvidia/nemotron-3-embed-1b")
     EMBED_VL_MODEL = _env("EMBED_VL_MODEL", "nvidia/llama-nemotron-embed-vl-1b-v2")
+
+    # --- media: attachments are sent to the model as image_url / audio_url / video_url parts ---
+    MEDIA_IMAGE_MAX_SIDE = _int("MEDIA_IMAGE_MAX_SIDE", 1600)   # ~1600 prompt tokens per image at this size
+    MEDIA_AUDIO_MAX_S = _int("MEDIA_AUDIO_MAX_S", 1200)         # longer recordings are cut (model limit: 1 hour)
+    MEDIA_VIDEO_MAX_S = _int("MEDIA_VIDEO_MAX_S", 120)          # model limit: 2 minutes
+    MEDIA_VIDEO_MAX_HEIGHT = _int("MEDIA_VIDEO_MAX_HEIGHT", 480)
+    MEDIA_PDF_MAX_PAGES = _int("MEDIA_PDF_MAX_PAGES", 20)
+    MEDIA_TEXT_MAX_CHARS = _int("MEDIA_TEXT_MAX_CHARS", 60000)  # per document, after which it is cut
+    MEDIA_MAX_INLINE_MB = _int("MEDIA_MAX_INLINE_MB", 24)       # biggest file we inline as base64 (a 19 MB request went through)
+    MEDIA_KEEP_TURNS = _int("MEDIA_KEEP_TURNS", 2)              # media of older user messages is replaced by a text stub
+    FFMPEG = _env("FFMPEG", "ffmpeg")                           # needed for anything but wav/mp3/mp4 and for long/large clips
 
     # --- memory (RAG over past dialogs) ---
     MEMORY_DB = Path(_env("MEMORY_DB", str(SERVER_DIR / "data" / "memory.sqlite3")))
@@ -70,14 +82,14 @@ class Settings:
     CONTEXT_BUDGET_TOKENS = _int("CONTEXT_BUDGET_TOKENS", 60000)
     CONTEXT_KEEP_TURNS = _int("CONTEXT_KEEP_TURNS", 6)
 
-    # --- DeepSeek reverse API (vision / documents / web search) ---
-    DEEPSEEK_AUTH_TOKEN = _env("DEEPSEEK_AUTH_TOKEN", "")
-    DEEPSEEK_COOKIES_FILE = Path(_env("DEEPSEEK_COOKIES_FILE", str(SERVER_DIR / "deepseek_cookies.json")))
-    DEEPSEEK_TIMEZONE_OFFSET = _int("DEEPSEEK_TIMEZONE_OFFSET", 10800)
-    DEEPSEEK_PROXY = _env("DEEPSEEK_PROXY")          # e.g. http://127.0.0.1:2080
-    DEEPSEEK_THINKING = _bool("DEEPSEEK_THINKING", False)
-    DEEPSEEK_MAX_FILES = _int("DEEPSEEK_MAX_FILES", 50)
-    DEEPSEEK_MAX_FILE_MB = _int("DEEPSEEK_MAX_FILE_MB", 100)
+    # --- web (web_search / fetch_page tools) ---
+    # Optional search API keys (first configured one is used; without any, Bing's RSS feed is the fallback):
+    TAVILY_API_KEY = _env("TAVILY_API_KEY", "")           # tavily.com — free tier, made for agents
+    BRAVE_SEARCH_API_KEY = _env("BRAVE_SEARCH_API_KEY", "")  # brave.com/search/api — free tier
+    SERPER_API_KEY = _env("SERPER_API_KEY", "")           # serper.dev — Google results
+    WEB_PROXY = _env("WEB_PROXY")                    # optional proxy for the search engine and page fetches
+    WEB_USER_AGENT = _env("WEB_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
 
     # --- uploads ---
     UPLOAD_DIR = Path(_env("UPLOAD_DIR", str(SERVER_DIR / "data" / "uploads")))
@@ -92,8 +104,6 @@ class Settings:
             problems.append("NVIDIA_API_KEY is not set (server/.env)")
         if not cls.AGENT_TOKEN:
             problems.append("AGENT_TOKEN is not set (server/.env) — clients cannot authenticate")
-        if not cls.DEEPSEEK_AUTH_TOKEN:
-            problems.append("DEEPSEEK_AUTH_TOKEN is not set — attachments / screen / web search will be unavailable")
         return problems
 
 

@@ -2,8 +2,8 @@
 
 Two collections, because the two embedding models live in different vector spaces:
   * "text"  — dialog turns with Nemotron, embedded by nvidia/nemotron-3-embed-1b;
-  * "vl"    — DeepSeek analyses (images + documents + answers), embedded by
-              nvidia/llama-nemotron-embed-vl-1b-v2 (text and data-URI images in one space).
+  * "vl"    — turns in which the user attached images (question + answer + the images as
+              data-URIs), embedded by nvidia/llama-nemotron-embed-vl-1b-v2 (text and images in one space).
 
 Storage: SQLite (source of truth) + an in-memory normalized numpy matrix per collection for
 cosine search. Thousands of turns search in well under a millisecond; embeddings are the only
@@ -127,16 +127,17 @@ class MemoryStore:
             return None
         return self._insert("text", session_id, "dialog", doc, meta or {}, [self._norm(vec)])
 
-    async def remember_analysis(self, session_id: str, question: str, answer: str, files: list[dict],
-                                image_data_uris: Optional[list[str]] = None) -> Optional[int]:
-        """Index a DeepSeek attachment/screen analysis in the VL collection.
+    async def remember_media(self, session_id: str, question: str, answer: str, files: list[dict],
+                             image_data_uris: Optional[list[str]] = None) -> Optional[int]:
+        """Index a turn with attached images in the VL collection.
 
         The text (question + file names + answer) and every image (as data-URI) each get their own
         vector, all pointing at the same memory row, so the memory is reachable by text or by
         visual similarity.
         """
+        from .speechfmt import strip_filler
         names = ", ".join(f.get("name", "?") for f in files) if files else ""
-        doc = f"Attachments: {names}\nQuestion: {question[:2000]}\nAnalysis: {answer[:6000]}"
+        doc = f"Attachments: {names}\nUser: {question[:2000]}\nAssistant: {strip_filler(answer)[:6000]}"
         inputs = [doc] + list(image_data_uris or [])[:8]
         try:
             vecs = await self.nim.embed(COLLECTION_MODEL["vl"], inputs, "passage")
@@ -148,7 +149,7 @@ class MemoryStore:
                 log.warning("embedding failed (vl, text only): %s", e2)
                 return None
         meta = {"files": [{"name": f.get("name"), "mime": f.get("mime")} for f in files]}
-        return self._insert("vl", session_id, "analysis", doc, meta, [self._norm(v) for v in vecs])
+        return self._insert("vl", session_id, "media", doc, meta, [self._norm(v) for v in vecs])
 
     # ------------------------------------------------------------- search
     def _search_vec(self, coll: str, q: np.ndarray, top_k: int, exclude_session: Optional[str], min_score: float) -> list[dict]:
