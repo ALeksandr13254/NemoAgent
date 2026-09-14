@@ -23,6 +23,7 @@ from typing import Iterator, Optional
 import numpy as np
 
 from .config import settings
+from .translit import is_russian_context, transliterate_latin
 
 log = logging.getLogger("tts")
 
@@ -170,11 +171,9 @@ def tag_languages(text: str) -> tuple[str, str]:
     tokens = re.findall(r"\S+|\s+", text)
     runs: list[list[str]] = []   # [lang, text]
     cur_lang = None
-    ru_chars = len(_CYR.findall(text))
-    en_chars = len(_LAT.findall(text))
     # Russian sentences are full of Latin product names ("открой Visual Studio Code"): lean towards
-    # the Russian voice unless the sentence is clearly English.
-    default = "ru" if ru_chars * 1.6 >= en_chars and ru_chars > 0 else "en"
+    # the Russian voice unless the sentence is clearly English (same rule as the transliteration).
+    default = "ru" if is_russian_context(text) else "en"
     for tok in tokens:
         if tok.isspace():
             if runs:
@@ -342,6 +341,8 @@ class TeraTTS:
     def prepare(self, text: str) -> tuple[str, str]:
         """Sanitize -> language tags -> Russian stress (keeping manual marks). Returns (tagged, lang)."""
         text = sanitize_vocab(text)
+        # Latin words inside Russian speech are read as noise by the Russian voice: say them in Cyrillic
+        text = transliterate_latin(text)
         tagged, lang = tag_languages(text)
         if not tagged:
             return "", lang
