@@ -11,11 +11,23 @@ import numpy as np
 log = logging.getLogger("player")
 
 
+IDLE_CLOSE_S = 20.0   # close the output stream after this much silence; it is re-opened on the next feed
+
+
 class StreamPlayer:
+    """Gapless player. The PortAudio stream is opened lazily and closed after ~20 s of silence:
+    a stream that stays open for hours keeps pointing at the endpoint it was opened on, and when
+    Windows/FxSound re-creates the default device (headphones plugged, enhancer restarted) that old
+    endpoint plays into nothing. Re-opening per utterance costs ~20 ms and always hits the current
+    default device.
+    """
+
     def __init__(self, samplerate: int, device=None, blocksize: int = 1024):
         import sounddevice as sd
         self._sd = sd
         self.samplerate = samplerate
+        self.blocksize = blocksize
+        self.device_spec = device
         self.q: "queue.Queue[np.ndarray | None]" = queue.Queue()
         self._cur = np.zeros(0, dtype=np.float32)
         self._lock = threading.Lock()
@@ -25,15 +37,41 @@ class StreamPlayer:
         self.samples_played = 0
         self.samples_fed = 0
         self.device_rate = samplerate       # rate of the opened stream (may differ -> we resample on feed)
-        dev = resolve_device(device)
-        self._stream = self._open(dev, samplerate, blocksize)
+        self._stream = None
+        self.device_name = ""
+        self._open_stream()                 # fail early if the device is wrong
+        self._closed = False
+        threading.Thread(target=self._idle_watch, daemon=True, name="player-idle").start()
+
+    def _open_stream(self) -> None:
+        sd = self._sd
+        dev = resolve_device(self.device_spec)
+        self._stream = self._open(dev, self.samplerate, self.blocksize)
         self._stream.start()
+        self._last_audio_at = time.time()
         try:
-            info = sd.query_devices(self._stream.device)
-            self.device_name = info["name"]
+            self.device_name = sd.query_devices(self._stream.device)["name"]
         except Exception:
-            self.device_name = str(device)
+            self.device_name = str(self.device_spec or "default")
         log.info("speaker output: %s @ %d Hz", self.device_name, self.device_rate)
+
+    def _close_stream(self) -> None:
+        s, self._stream = self._stream, None
+        if s is not None:
+            try:
+                s.stop()
+                s.close()
+            except Exception:
+                pass
+
+    def _idle_watch(self) -> None:
+        while not getattr(self, "_closed", False):
+            time.sleep(2.0)
+            with self._lock:
+                idle = time.time() - self._last_audio_at
+                if self._stream is not None and not self._playing.is_set() and self.q.empty() and idle > IDLE_CLOSE_S:
+                    self._close_stream()
+                    log.debug("output stream closed after %.0fs idle", idle)
 
     def _open(self, dev, samplerate: int, blocksize: int):
         """Open the output stream; WASAPI shared mode needs the device's own rate, so fall back to
@@ -78,8 +116,16 @@ class StreamPlayer:
     def feed(self, audio: np.ndarray, generation: int | None = None) -> None:
         if generation is not None and generation != self._generation:
             return  # stale audio from a cancelled utterance
+        with self._lock:
+            if self._stream is None:
+                try:
+                    self._open_stream()
+                except Exception as e:  # noqa: BLE001
+                    log.warning("cannot open output device: %s", e)
+                    return
         arr = self._resample(np.asarray(audio, dtype=np.float32).reshape(-1))
         self.samples_fed += arr.size
+        self._last_audio_at = time.time()
         self.q.put(arr)
         self._playing.set()
 
@@ -128,11 +174,9 @@ class StreamPlayer:
             time.sleep(0.02)
 
     def close(self) -> None:
-        try:
-            self._stream.stop()
-            self._stream.close()
-        except Exception:
-            pass
+        self._closed = True
+        with self._lock:
+            self._close_stream()
 
 
 def resolve_device(spec) -> int | str | None:
