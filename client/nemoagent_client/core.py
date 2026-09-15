@@ -55,6 +55,10 @@ class ClientCore:
         self.assistant_buffer = ""
         self.turn_active = False
         self.speech_mode = False        # the model answered through the `speak` tool this turn
+        self.dictation = False          # read-aloud tab: recognised speech goes into its text, not to the agent
+        self._dictate_once = False      # one push-to-talk phrase for the read-aloud tab
+        self._dictation_forced_listen = False
+        self._reader: Optional[dict] = None   # active read-aloud job: {"gen", "index", "total"}
         self._pending_confirms: dict[str, asyncio.Future] = {}
         self._last_level_sent = 0.0
         self._http = httpx.AsyncClient(timeout=120)
@@ -94,7 +98,7 @@ class ClientCore:
             from .tts import TeraTTS
             self.player = StreamPlayer(44100, device=settings.SPEAKER_DEVICE or None)
             self.tts = TeraTTS()
-            self.speaker = Speaker(self.tts, self.player, on_state=lambda d: self._post(self.broadcast, d))
+            self.speaker = Speaker(self.tts, self.player, on_state=lambda d: self._post(self._on_speaker_state, d))
             self.status["tts"] = f"ready ({'GPU' if 'CUDA' in self.tts.provider else 'CPU'})"
         except Exception as e:  # noqa: BLE001
             log.exception("TTS load failed")
@@ -347,7 +351,82 @@ class ClientCore:
             await self.broadcast({"type": "stt", "state": "empty", "ms": ms})
             return
         await self.broadcast({"type": "stt", "state": "done", "text": text, "ms": ms})
+        if self.dictation or self._dictate_once:
+            # read-aloud tab is dictating: the phrase goes into its text box instead of the conversation
+            self._dictate_once = False
+            await self.broadcast({"type": "dictation", "text": text, "ms": ms})
+            return
         await self.send_user_message(text, [], "voice")
+
+    # ============================================================== read-aloud tab
+    async def _on_speaker_state(self, d: dict) -> None:
+        """Events from the TTS worker: metrics go to the UI as they are; sentence progress drives the read-aloud tab."""
+        kind = d.get("type")
+        job = self._reader
+        if kind == "speaking":
+            if job and d.get("gen") == job["gen"]:
+                job["index"] += 1
+                await self.broadcast({"type": "read", "state": "sentence", "index": job["index"], "total": max(job["total"], job["index"]),
+                                      "text": d.get("text", "")})
+            return
+        if kind == "speech_drained":
+            if job and d.get("gen") == job["gen"]:
+                # everything is synthesised; wait for the player to finish the tail before saying "done"
+                for _ in range(300):
+                    if not (self.player and self.player.is_playing) or self._reader is not job:
+                        break
+                    await asyncio.sleep(0.2)
+                if self._reader is job:
+                    self._reader = None
+                    await self.broadcast({"type": "read", "state": "done"})
+            return
+        if kind == "speech_cancelled":
+            if job and d.get("gen") == job["gen"]:
+                self._reader = None
+                await self.broadcast({"type": "read", "state": "stopped"})
+            return
+        await self.broadcast(d)
+
+    async def _set_dictation(self, on: bool) -> None:
+        on = bool(on) and self.stt is not None and self.mic is not None
+        if on and self.speaker and self.speaker.is_speaking:
+            self.speaker.cancel()               # dictating into a text that is being read makes no sense
+        if on and not self.dictation:
+            self._dictation_forced_listen = not bool(self.state["auto_listen"])
+            self.mic.set_enabled(True)
+        elif not on and self.dictation and self._dictation_forced_listen and self.mic:
+            self.mic.set_enabled(bool(self.state["auto_listen"]) and self.stt is not None)
+            self._dictation_forced_listen = False
+        self.dictation = on
+        await self.broadcast({"type": "read", "state": "dictation", "dictation": on,
+                              **({} if on or self.stt else {"message": "распознавание речи не загружено"})})
+        await self.broadcast_status()
+
+    async def _start_reading(self, text: str) -> None:
+        text = (text or "").strip()
+        if not self.speaker:
+            await self.broadcast({"type": "read", "state": "error", "message": "синтез речи не загружен"})
+            return
+        if not text:
+            return
+        if self.dictation:
+            await self._set_dictation(False)
+        from .tts import SentenceSplitter
+        sp = SentenceSplitter()
+        total = len(list(sp.feed(text)) + list(sp.finish()))
+        gen = self.speaker.begin()
+        self._reader = {"gen": gen, "index": 0, "total": total}
+        await self.broadcast({"type": "read", "state": "start", "total": total, "chars": len(text)})
+        log.info("read aloud: %d chars, %d sentences", len(text), total)
+        self.speaker.feed(text)
+        self.speaker.end()
+
+    async def _stop_reading(self) -> None:
+        if self.speaker:
+            self.speaker.cancel()               # emits speech_cancelled -> "stopped" for the UI
+        if self._reader:
+            self._reader = None
+            await self.broadcast({"type": "read", "state": "stopped"})
 
     # ============================================================== UI hub
     async def broadcast(self, msg: dict) -> None:
@@ -376,7 +455,7 @@ class ClientCore:
                 "stt": self.status["stt"], "tts": self.status["tts"], "mic": self.status["mic"],
                 "speaker": getattr(self.player, "device_name", None), "output_devices": devices,
                 "microphone": getattr(self.mic, "device_name", None), "input_devices": inputs,
-                "listening": bool(self.mic and self.mic.enabled), "settings": self.state,
+                "listening": bool(self.mic and self.mic.enabled), "dictation": self.dictation, "settings": self.state,
                 "voices": {"ru": ["ru_f1", "ru_m5", "ru_f2", "ru_m1"],
                            "en": ["eng_f3", "eng_f5", "eng_m3", "eng_m4", "eng_f4_whisper", "eng_m2_whisper"]}}
 
@@ -402,7 +481,15 @@ class ClientCore:
             await self._apply_settings(msg.get("settings") or {})
         elif t == "ptt":
             if self.mic:
+                if msg.get("state") == "down" and msg.get("dictate"):
+                    self._dictate_once = True
                 self.mic.set_ptt(msg.get("state") == "down")
+        elif t == "dictate":
+            await self._set_dictation(bool(msg.get("on")))
+        elif t == "read":
+            await self._start_reading(str(msg.get("text") or ""))
+        elif t == "read_stop":
+            await self._stop_reading()
         elif t == "confirm_reply":
             fut = self._pending_confirms.get(msg.get("id", ""))
             if fut and not fut.done():

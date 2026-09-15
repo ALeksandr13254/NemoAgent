@@ -25,7 +25,29 @@
     <button class="tab active" data-tab="chat">Чат</button>
     <button class="tab" data-tab="prompt">Системный промпт</button>
     <button class="tab" data-tab="log">Полный лог <span id="log-count" class="muted"></span></button>
+    <button class="tab" data-tab="reader">Озвучка</button>
   </nav>
+
+  <section id="reader" class="tabpane hidden">
+    <div class="editor reader">
+      <div class="panehead">
+        <b>Озвучка текста</b>
+        <span class="muted small">Вставьте или надиктуйте текст любого размера и нажмите «Озвучить»: читает TeraTTS теми же голосами и с тем же темпом, что и агент, по предложениям. Если выделить фрагмент, прочитается только он. Текст сохраняется в браузере.</span>
+      </div>
+      <textarea id="reader-text" rows="22" placeholder="Текст для озвучки… (диктовка 🎙 добавляет распознанные фразы сюда, а не в чат)"></textarea>
+      <div class="row left">
+        <button id="reader-play" class="primary" title="Озвучить весь текст или выделенный фрагмент">▶ Озвучить</button>
+        <button id="reader-stop" title="Остановить озвучку">■ Стоп</button>
+        <button id="reader-dictate" class="icon" title="Диктовка: включает прослушивание, распознанная речь добавляется в текст, а не отправляется агенту">🎙</button>
+        <button id="reader-ptt" class="icon" title="Удерживайте, чтобы надиктовать фразу (push-to-talk в текст)">⏺</button>
+        <button id="reader-clear" class="link">очистить</button>
+        <span class="spacer"></span>
+        <span id="reader-count" class="muted small"></span>
+      </div>
+      <div class="progress"><div id="reader-bar"></div></div>
+      <div id="reader-now" class="muted small"></div>
+    </div>
+  </section>
 
   <main id="chat" class="tabpane"></main>
 

@@ -96,3 +96,11 @@ aside#settings hr { border: none; border-top: 1px solid var(--border); margin: 4
 .modal pre { background: #0b0d12; padding: 8px 10px; border-radius: 8px; white-space: pre-wrap; word-break: break-word; max-height: 40vh; overflow: auto; }
 .modal .row { display: flex; gap: 8px; justify-content: flex-end; }
 @media (max-width: 700px) { .msg, .card { max-width: 96%; } .metrics { display: none; } }
+
+/* ---- "Озвучка": read any text aloud, dictate into it */
+.editor.reader textarea { display: block; width: 100%; margin: 6px 0; background: #0b0d12; color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; resize: vertical; min-height: 200px; }
+.editor.reader textarea:focus { outline: none; border-color: var(--accent); }
+.editor.reader textarea.dictating { border-color: var(--err); }
+.progress { height: 5px; background: var(--panel2); border-radius: 3px; overflow: hidden; margin-top: 10px; }
+#reader-bar { height: 100%; width: 0; background: var(--accent); transition: width .2s linear; }
+#reader-now { margin-top: 6px; min-height: 18px; }

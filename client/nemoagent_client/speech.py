@@ -74,6 +74,7 @@ class Speaker:
         self._q.put((self._gen, cleaned))
 
     def cancel(self) -> None:
+        old = self._gen
         self._gen += 1
         try:
             while True:
@@ -82,6 +83,7 @@ class Speaker:
             pass
         self.player.flush()
         self.splitter.reset()
+        self.on_state({"type": "speech_cancelled", "gen": old})
 
     # ----------------------------------------------------------------- worker
     def _worker(self) -> None:
@@ -97,6 +99,8 @@ class Speaker:
                 t0 = time.perf_counter()
                 first = True
                 samples = 0
+                # progress for the UI (the read-aloud tab shows which sentence is being spoken)
+                self.on_state({"type": "speaking", "gen": gen, "text": sentence, "queued": self._q.qsize()})
                 for chunk in self.tts.synth_stream(sentence):
                     if gen != self._gen:
                         log.debug("speech cancelled mid-sentence: %r", sentence[:50])
@@ -117,6 +121,8 @@ class Speaker:
                 log.exception("TTS failed for %r: %s", sentence[:60], e)
             finally:
                 self._busy.clear()
+                if gen == self._gen and self._q.empty():
+                    self.on_state({"type": "speech_drained", "gen": gen})   # all sentences synthesised
 
     def close(self) -> None:
         self._q.put(None)

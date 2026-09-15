@@ -58,7 +58,7 @@
   /* ---------------------------------------------------------------- tabs, prompt & full log */
   document.querySelectorAll('nav.tabs .tab').forEach((b) => b.onclick = () => {
     document.querySelectorAll('nav.tabs .tab').forEach((x) => x.classList.toggle('active', x === b));
-    for (const id of ['chat', 'prompt', 'log']) $(id).classList.toggle('hidden', id !== b.dataset.tab);
+    for (const id of ['chat', 'prompt', 'log', 'reader']) $(id).classList.toggle('hidden', id !== b.dataset.tab);
     document.querySelector('footer').classList.toggle('hidden', b.dataset.tab !== 'chat');
     $('attachments').classList.toggle('hidden', b.dataset.tab !== 'chat');
   });
@@ -201,8 +201,59 @@
       }
       case 'confirm': showConfirm(m); break;
       case 'confirm_expired': hideConfirm(); break;
+      case 'dictation': readerAppend(m.text); break;
+      case 'read': readerProgress(m); break;
     }
   }
+
+  /* ---------------------------------------------------------------- read-aloud tab */
+  const READER_KEY = 'nemoagent-reader-text';
+  const rt = $('reader-text');
+  try { rt.value = localStorage.getItem(READER_KEY) || ''; } catch (e) { /* storage unavailable */ }
+  let readerTotal = 0, readerSaveTimer = null;
+  function readerCount() {
+    const n = rt.value.length, words = (rt.value.match(/\S+/g) || []).length;
+    const sec = Math.round(n / 14);   // TeraTTS at speed 1.0 reads roughly fourteen characters a second
+    $('reader-count').textContent = n ? `${n} симв. · ${words} слов · ≈ ${sec >= 60 ? Math.floor(sec / 60) + ' мин ' + (sec % 60) + ' с' : sec + ' с'}` : '';
+  }
+  function readerSave() {
+    clearTimeout(readerSaveTimer);
+    readerSaveTimer = setTimeout(() => { try { localStorage.setItem(READER_KEY, rt.value); } catch (e) { /* ignore */ } }, 300);
+  }
+  function readerAppend(text) {
+    if (!text) return;
+    const v = rt.value, sep = !v ? '' : /\s$/.test(v) ? '' : ' ';
+    rt.value = v + sep + text; rt.scrollTop = rt.scrollHeight; readerCount(); readerSave();
+  }
+  function readerProgress(m) {
+    const bar = $('reader-bar'), now = $('reader-now');
+    if (m.state === 'start') { readerTotal = m.total || 0; bar.style.width = '0%'; now.textContent = `синтезирую… (${readerTotal} предл.)`; $('reader-play').classList.add('active'); }
+    else if (m.state === 'sentence') {
+      const total = m.total || readerTotal || 1;
+      bar.style.width = Math.min(100, Math.round(100 * m.index / total)) + '%';
+      now.textContent = `${m.index} / ${total}: ${m.text}`;
+    }
+    else if (m.state === 'done') { bar.style.width = '100%'; now.textContent = 'готово'; $('reader-play').classList.remove('active'); }
+    else if (m.state === 'stopped') { bar.style.width = '0%'; now.textContent = 'остановлено'; $('reader-play').classList.remove('active'); }
+    else if (m.state === 'error') { now.textContent = '⚠ ' + (m.message || 'озвучка недоступна'); $('reader-play').classList.remove('active'); }
+    if (typeof m.dictation === 'boolean') readerDictation(m.dictation);
+  }
+  function readerDictation(on) {
+    $('reader-dictate').classList.toggle('active', !!on);
+    rt.classList.toggle('dictating', !!on);
+    if (on) $('reader-now').textContent = 'диктовка: говорите, распознанные фразы добавляются в текст';
+  }
+  rt.addEventListener('input', () => { readerCount(); readerSave(); });
+  $('reader-play').onclick = () => {
+    const a = rt.selectionStart, b = rt.selectionEnd;
+    const text = (a !== b ? rt.value.slice(a, b) : rt.value).trim();
+    if (!text) { $('reader-now').textContent = 'текст пустой'; return; }
+    send({ type: 'read', text });
+  };
+  $('reader-stop').onclick = () => send({ type: 'read_stop' });
+  $('reader-clear').onclick = () => { if (!rt.value || confirm('Очистить текст?')) { rt.value = ''; readerCount(); readerSave(); } };
+  $('reader-dictate').onclick = () => send({ type: 'dictate', on: !$('reader-dictate').classList.contains('active') });
+  readerCount();
 
   /* ---------------------------------------------------------------- status & settings */
   function renderStatus() {
@@ -216,6 +267,7 @@
     setPill('pill-memory', 'ok', `память ${mem}`);
     $('model').textContent = si.model ? '· ' + si.model.split('/').pop() : '';
     $('btn-listen').classList.toggle('active', !!state.listening);
+    readerDictation(!!state.dictation);
     $('btn-memory').classList.toggle('active', !!(state.settings && state.settings.memory_recall));
     $('pill-stt').title = state.mic ? 'микрофон: ' + state.mic : '';
     const s = state.settings || {};
@@ -308,6 +360,11 @@
   const up = () => { if (!held) return; held = false; ptt.classList.remove('rec'); send({ type: 'ptt', state: 'up' }); };
   ptt.addEventListener('mousedown', down); ptt.addEventListener('touchstart', down, { passive: false });
   window.addEventListener('mouseup', up); window.addEventListener('touchend', up);
+  // hold-to-dictate in the read-aloud tab: same push-to-talk, but the client routes the text into the textarea
+  const rptt = $('reader-ptt');
+  const rdown = (e) => { e.preventDefault(); if (held) return; held = true; rptt.classList.add('rec'); send({ type: 'ptt', state: 'down', dictate: true }); };
+  rptt.addEventListener('mousedown', rdown); rptt.addEventListener('touchstart', rdown, { passive: false });
+  window.addEventListener('mouseup', () => { if (held && rptt.classList.contains('rec')) rptt.classList.remove('rec'); });
   const typing = () => ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName);
   window.addEventListener('keydown', (e) => { if (e.code === 'Space' && !typing() && !e.repeat && !e.ctrlKey && !e.altKey && !e.metaKey) down(e); });
   window.addEventListener('keyup', (e) => { if (e.code === 'Space' && held) up(); });
