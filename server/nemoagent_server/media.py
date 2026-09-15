@@ -322,16 +322,17 @@ def estimate_tokens(content) -> int:
 
 
 def prune_old_media(messages: list[dict], keep_turns: int) -> list[dict]:
-    """Copy of the history where only the last `keep_turns` user messages keep their media parts;
-    older ones become plain text (the answer about them is already in the history)."""
+    """Copy of the history where media parts survive only in the last `keep_turns` user messages
+    (counting every user message, with or without media); older ones become plain text — the answer
+    about them is already in the history, and a request without media can go to the fast text model."""
     out = list(messages)
     seen = 0
     for i in range(len(out) - 1, -1, -1):
         m = out[i]
-        if m.get("role") != "user" or not has_media(m.get("content")):
+        if m.get("role") != "user":
             continue
         seen += 1
-        if seen > keep_turns:
+        if seen > keep_turns and has_media(m.get("content")):
             n = sum(1 for p in m["content"] if p.get("type") in MEDIA_KEYS)
             out[i] = dict(m, content=text_of(m["content"]) + f"\n[медиа этого сообщения ({n} шт.) уже были показаны и убраны из контекста]")
     return out

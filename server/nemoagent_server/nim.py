@@ -24,6 +24,8 @@ OPTIONAL_PARAMS = ("chat_template_kwargs", "reasoning_effort", "stream_options")
 # so start with short waits (this is a voice assistant — every second counts).
 RETRY_DELAYS = (0.8, 1.5, 3.0, 6.0, 10.0)
 _IMMUTABLE_RE = re.compile(r"`?([a-z_]+)`? is immutable for this model and must be ([-\d.]+)", re.I)
+# A repetition loop ("ellsellsellsells…" until max_tokens): a short piece repeated ten or more times at the end
+_DEGENERATE_RE = re.compile(r"(.{2,16}?)\1{9,}\s*$", re.S)
 
 
 class UpstreamError(Exception):
@@ -234,6 +236,15 @@ class NIMClient:
                         acc.first_token_at = time.time()
                     acc.content += d["content"]
                     await deliver(d["content"])
+                    if len(acc.content) >= 60:
+                        loop = _DEGENERATE_RE.search(acc.content[-400:])
+                        if loop:
+                            # the model fell into a repetition loop (seen on the free pool under load):
+                            # cut it here instead of waiting for max_tokens
+                            acc.content = acc.content[:-len(loop.group(0))]
+                            acc.finish_reason = "degenerate"
+                            log.warning("degenerate output after %d chars — stream aborted", len(acc.content))
+                            break
                 for tc in d.get("tool_calls") or []:
                     if not acc.first_token_at:
                         acc.first_token_at = time.time()

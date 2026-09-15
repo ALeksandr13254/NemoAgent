@@ -111,6 +111,21 @@ def _shell_argv(shell: str, command: str) -> list[str]:
     return [exe, "-lc", command]
 
 
+_PS_WRAPPER_RE = re.compile(r"^ *(?:powershell|pwsh)(?:[.]exe)? +(?:-[A-Za-z]+ +)*?-[cC](?:ommand)? +(.*)$", re.S)
+
+
+def _unwrap_powershell(command: str) -> str:
+    """Models like to write `powershell -Command "..."` although run_command already IS PowerShell;
+    the nested quoting then breaks. Strip that wrapper and its outer quotes."""
+    m = _PS_WRAPPER_RE.match(command)
+    if not m:
+        return command
+    rest = m.group(1).strip()
+    if len(rest) >= 2 and rest[0] == rest[-1] and rest[0] in ('"', "'"):
+        rest = rest[1:-1]
+    return rest or command
+
+
 def run_command(args: dict) -> dict:
     command = str(args.get("command") or "").strip()
     if not command:
@@ -126,6 +141,8 @@ def run_command(args: dict) -> dict:
         cwd = os.path.expanduser(str(cwd))
         if not os.path.isdir(cwd):
             return {"error": f"cwd does not exist: {cwd}"}
+    if shell == "powershell":
+        command = _unwrap_powershell(command)
     argv = _shell_argv(shell, command)
     t0 = time.time()
     try:

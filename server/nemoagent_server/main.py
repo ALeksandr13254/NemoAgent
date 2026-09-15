@@ -68,9 +68,9 @@ async def lifespan(app: FastAPI):
     prompts = PromptStore()
     services = Services(nim=nim, memory=memory, attachments=attachments, prompts=prompts)
     ffmpeg = shutil.which(settings.FFMPEG)
-    log.info("NemoAgent server ready on %s:%s | model %s | ffmpeg %s | memory %s",
-             settings.HOST, settings.PORT, settings.LLM_MODEL, ffmpeg or "not found (only wav/mp3/mp4 attachments pass as they are)",
-             memory.count())
+    log.info("NemoAgent server ready on %s:%s | text model %s | media model %s | ffmpeg %s | memory %s",
+             settings.HOST, settings.PORT, settings.LLM_MODEL, settings.LLM_MEDIA_MODEL,
+             ffmpeg or "not found (only wav/mp3/mp4 attachments pass as they are)", memory.count())
     try:
         yield
     finally:
@@ -90,13 +90,13 @@ def _check_token(authorization: Optional[str]) -> None:
 
 def _ready(session: AgentSession) -> dict:
     return {"type": "ready", "session_id": session.id, "vision": True, "modalities": ["text", "image", "audio", "video"],
-            "memory": services.memory.count(), "model": settings.LLM_MODEL}
+            "memory": services.memory.count(), "model": settings.LLM_MODEL, "media_model": settings.LLM_MEDIA_MODEL}
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "model": settings.LLM_MODEL, "vision": True, "ffmpeg": bool(shutil.which(settings.FFMPEG)),
-            "memory": services.memory.count() if services else {}, "time": time.time()}
+    return {"ok": True, "model": settings.LLM_MODEL, "media_model": settings.LLM_MEDIA_MODEL, "vision": True,
+            "ffmpeg": bool(shutil.which(settings.FFMPEG)), "memory": services.memory.count() if services else {}, "time": time.time()}
 
 
 @app.post("/upload")

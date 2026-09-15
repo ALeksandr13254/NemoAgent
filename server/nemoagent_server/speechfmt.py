@@ -55,6 +55,7 @@ def strip_filler(text: str) -> str:
     return first or text.strip()
 
 
+_DEGEN_TAIL_RE = re.compile(r"(.{2,16}?)\1{5,}\s*$", re.S)
 DISPLAY_MARKER_RE = re.compile(r"(?:^|\n)\s*={3,}\s*(?:\n|$)")
 TASK_MARKER_RE = re.compile(r"(?:^|\n)\s*>{3,}\s*")
 
@@ -154,6 +155,8 @@ class ProseSpeechRouter:
                 yield ("speech", piece)
 
     def finish(self) -> Iterator[tuple[str, str]]:
+        # a repetition loop the model fell into is held in the tail: never speak it
+        self.buf = _DEGEN_TAIL_RE.sub("", self.buf)
         if self.mode == "speech" and self.buf:
             whole = strip_filler(self.speech + self.buf)
             tail = whole[len(self.speech):] if whole.startswith(self.speech) else self.buf

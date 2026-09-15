@@ -49,11 +49,15 @@ class Settings:
     # --- NVIDIA NIM ---
     NVIDIA_API_KEY = _env("NVIDIA_API_KEY", "")
     NIM_BASE_URL = _env("NIM_BASE_URL", "https://integrate.api.nvidia.com/v1/")
-    # One omni model for everything: text, images, audio and video go in as message parts; tools work.
-    LLM_MODEL = _env("LLM_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning")
+    # Two models: the fast text model answers every request that carries no media (first token ~1 s,
+    # no queue), the omni model takes over automatically when a request contains images / audio / video
+    # (attachments, screenshots) — its free pool is small and often overloaded (503 "16/16").
+    LLM_MODEL = _env("LLM_MODEL", "nvidia/nemotron-3.5-lightning-30b-a3b")
+    LLM_MEDIA_MODEL = _env("LLM_MEDIA_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning")
     LLM_THINKING = _bool("LLM_THINKING", False)     # the model reasons by default; off saves seconds per answer
     LLM_TEMPERATURE = _float("LLM_TEMPERATURE", 0.3)  # model card: 0.2 without reasoning, 0.6 with it
-    LLM_MAX_TOKENS = _int("LLM_MAX_TOKENS", 4096)
+    LLM_MAX_TOKENS = _int("LLM_MAX_TOKENS", 4096)            # executor rounds (write_file content can be long)
+    DIALOGUE_MAX_TOKENS = _int("DIALOGUE_MAX_TOKENS", 1200)   # spoken answer + screen part; bounds a runaway to ~30 s
     LLM_TOP_P = _env("LLM_TOP_P")                   # unset = model default
     UPSTREAM_TIMEOUT = _int("UPSTREAM_TIMEOUT", 600)  # seconds of NIM silence we tolerate
     MAX_TOOL_ROUNDS = _int("MAX_TOOL_ROUNDS", 12)

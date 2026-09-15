@@ -199,10 +199,17 @@ class AgentSession:
                     out.append({"role": m["role"], "content": text[:2000]})
         return out[-limit:]
 
-    def _trace_params(self, tts: bool, use_memory: bool, source: str, tools: list) -> dict:
-        return {"temperature": settings.LLM_TEMPERATURE, "max_tokens": settings.LLM_MAX_TOKENS,
+    def _trace_params(self, tts: bool, use_memory: bool, source: str, tools: list, max_tokens: Optional[int] = None) -> dict:
+        return {"temperature": settings.LLM_TEMPERATURE, "max_tokens": max_tokens or settings.LLM_MAX_TOKENS,
                 "thinking": settings.LLM_THINKING, "tool_choice": "auto" if tools else None,
                 "tts": tts, "memory": use_memory, "source": source}
+
+    @staticmethod
+    def _model_for(messages: list[dict]) -> str:
+        """The fast text model unless the request carries images / audio / video — then the omni model."""
+        if any(media.has_media(m.get("content")) for m in messages):
+            return settings.LLM_MEDIA_MODEL
+        return settings.LLM_MODEL
 
     async def _dialogue_call(self, tts: bool, use_memory: bool, source: str, t_start: float, stage: str,
                              call_no: int) -> tuple[str, Optional[str], Optional[str], Optional[int]]:
@@ -235,14 +242,25 @@ class AgentSession:
                 await self.send({"type": "wait", **data})
 
         t0 = time.time()
-        await self.send({"type": "trace", "kind": "request", "agent": "dialogue", "stage": stage, "turn": self.turns,
-                         "round": call_no, "model": settings.LLM_MODEL, "messages": media.redact(messages), "tools": [],
-                         "params": self._trace_params(tts, use_memory, source, [])})
-        acc: Completion = await self.services.nim.chat_stream(messages, None, on_event=on_event)
-        await emit(router.finish())
-        await self.send({"type": "trace", "kind": "response", "agent": "dialogue", "stage": stage, "turn": self.turns,
-                         "round": call_no, "content": acc.content, "reasoning": acc.reasoning, "tool_calls": [],
-                         "finish_reason": acc.finish_reason, "usage": acc.usage, "ms": int((time.time() - t0) * 1000)})
+        model = self._model_for(messages)
+        for attempt in range(2):
+            router = ProseSpeechRouter()
+            await self.send({"type": "trace", "kind": "request", "agent": "dialogue", "stage": stage, "turn": self.turns,
+                             "round": call_no, "model": model, "messages": media.redact(messages), "tools": [],
+                             "params": self._trace_params(tts, use_memory, source, [], settings.DIALOGUE_MAX_TOKENS)})
+            acc: Completion = await self.services.nim.chat_stream(messages, None, model=model,
+                                                                  max_tokens=settings.DIALOGUE_MAX_TOKENS, on_event=on_event)
+            await emit(router.finish())
+            await self.send({"type": "trace", "kind": "response", "agent": "dialogue", "stage": stage, "turn": self.turns,
+                             "round": call_no, "content": acc.content, "reasoning": acc.reasoning, "tool_calls": [],
+                             "finish_reason": acc.finish_reason, "usage": acc.usage, "ms": int((time.time() - t0) * 1000)})
+            if acc.finish_reason == "degenerate":
+                if attempt == 0 and not router.speech.strip():
+                    # the loop started before anything was said: one more try
+                    log.warning("session %s: dialogue output degenerated before any speech, retrying", self.id)
+                    continue
+                await self.send({"type": "notice", "message": "Модель зациклилась, ответ обрезан."})
+            break
         if acc.finish_reason == "length":
             await self.send({"type": "notice", "message": "Ответ обрезан по лимиту max_tokens."})
         speech, display, task = router.result
@@ -268,18 +286,21 @@ class AgentSession:
                                                     *task_media]}
         work: list[dict] = self._context_for_executor() + [task_msg]
         seen_calls: set[str] = set()
+        recent_results: list[str] = []   # last tool outputs, so a report exists even when the round limit hits
         narration = ""
         tools_used = 0
-        forced_retry = False
+        force_tools = False
+        degenerate_retry = False
         for round_no in range(1, settings.MAX_TOOL_ROUNDS + 1):
             messages = [system] + work
             t0 = time.time()
-            # The executor's job is to act, so the first round must call a tool (tool_choice=required);
-            # later rounds are free to finish with the report. Its output is never spoken, so the
-            # streaming quirks of `required` do not matter here.
-            choice = "required" if (tools_used == 0 and schemas and not forced_retry) else "auto"
+            # The executor's job is to act. The first round runs with tool_choice=auto (the guided decoding
+            # behind `required` stalled for 90 s twice on the free pool); if it answers without calling any
+            # tool, the round is repeated once with `required`, so the result cannot simply be made up.
+            choice = "required" if (tools_used == 0 and schemas and force_tools) else "auto"
+            model = self._model_for(messages)   # switches to the omni model once a screenshot / attachment is in the loop
             await self.send({"type": "trace", "kind": "request", "agent": "executor", "stage": "executor", "turn": self.turns,
-                             "round": call_no + round_no - 1, "model": settings.LLM_MODEL, "messages": media.redact(messages),
+                             "round": call_no + round_no - 1, "model": model, "messages": media.redact(messages),
                              "tools": [s["function"]["name"] for s in schemas],
                              "params": dict(self._trace_params(tts, use_memory, source, schemas), tool_choice=choice)})
 
@@ -291,21 +312,25 @@ class AgentSession:
                 elif kind == "wait":
                     await self.send({"type": "wait", **data})
 
-            acc: Completion = await self.services.nim.chat_stream(messages, schemas, tool_choice=choice, on_event=on_event)
+            acc: Completion = await self.services.nim.chat_stream(messages, schemas, model=model, tool_choice=choice, on_event=on_event)
             await self.send({"type": "trace", "kind": "response", "agent": "executor", "stage": "executor", "turn": self.turns,
                              "round": call_no + round_no - 1, "content": acc.content, "reasoning": acc.reasoning,
                              "tool_calls": acc.tool_calls, "finish_reason": acc.finish_reason, "usage": acc.usage,
                              "ms": int((time.time() - t0) * 1000)})
             log.info("session %s executor round %d (%s): %d chars, %d tool calls, %.1fs", self.id, round_no, choice,
                      len(acc.content), len(acc.tool_calls), time.time() - t0)
+            if acc.finish_reason == "degenerate" and not acc.tool_calls and not degenerate_retry:
+                # a repetition loop instead of a tool call or a report: regenerate the round once
+                degenerate_retry = True
+                log.warning("session %s: executor output degenerated, retrying the round", self.id)
+                continue
             if not acc.tool_calls:
-                leaked = acc.content.lstrip().startswith(("[", "{")) and '"name"' in acc.content
-                if choice == "required" and not forced_retry and (leaked or not acc.content.strip()):
-                    # `required` sometimes comes back as raw JSON text: one more try without forcing
-                    forced_retry = True
-                    log.warning("session %s: executor returned a tool call as text, retrying with auto", self.id)
+                if tools_used == 0 and schemas and not force_tools:
+                    force_tools = True
+                    log.warning("session %s: executor answered without a tool call, retrying with tool_choice=required", self.id)
                     continue
-                report = acc.content.strip() or narration.strip() or "(исполнитель не вернул отчёт)"
+                leaked = acc.content.lstrip().startswith(("[", "{")) and '"name"' in acc.content
+                report = ("" if leaked else acc.content.strip()) or narration.strip() or "(исполнитель не вернул отчёт)"
                 if tools_used == 0:
                     report = "(ВНИМАНИЕ: исполнитель не вызвал ни одного инструмента, результат не проверен)\n" + report
                 return report, round_no
@@ -331,9 +356,13 @@ class AgentSession:
                     shown.append((call["function"]["name"], result.pop("_media")))
                 work.append({"role": "tool", "tool_call_id": call["id"], "name": call["function"]["name"],
                              "content": compact_result(result)})
+                recent_results.append(f"{call['function']['name']}({_norm_args(call['function']['arguments'])[:160]}) -> "
+                                      f"{compact_result(result, 500)}")
+            recent_results = recent_results[-3:]
             for name, parts in shown:
                 work.append({"role": "user", "content": [{"type": "text", "text": f"[содержимое от инструмента {name}]"}, *parts]})
-        return (narration.strip() + "\n(достигнут лимит раундов инструментов, задача могла остаться незавершённой)").strip(), settings.MAX_TOOL_ROUNDS
+        tail = "\n(достигнут лимит раундов инструментов, задача могла остаться незавершённой; последние результаты инструментов:)\n" + "\n".join(recent_results)
+        return (narration.strip() + tail).strip(), settings.MAX_TOOL_ROUNDS
 
     async def _run_turn(self, text: str, attachment_ids: list[str], source: str, tts: bool, memory: bool = False) -> None:
         t_start = time.time()
