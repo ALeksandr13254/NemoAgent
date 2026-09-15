@@ -23,7 +23,11 @@
     const d = document.createElement('details'); d.className = 'card ' + cls; if (open) d.open = true;
     d.innerHTML = `<summary>${title}</summary><pre>${esc(body)}</pre>`; return add(d);
   }
-  function send(msg) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg)); }
+  function send(msg) {
+    if (ws && ws.readyState === 1) { ws.send(JSON.stringify(msg)); return; }
+    // no link to the local client process: say so instead of dropping the message silently
+    if (msg.type === 'send' || msg.type === 'say') add(div('errline', '⚠ нет связи с клиентом NemoAgent (окно run_client.bat) — страница переподключается, обновите её (Ctrl+F5), если это не проходит'));
+  }
   function setPill(id, cls, text) { const p = $(id); p.className = 'pill ' + cls; if (text) p.textContent = text; }
   function updateMetrics() {
     const parts = [];
@@ -36,11 +40,20 @@
 
   /* ---------------------------------------------------------------- websocket */
   function connect() {
-    ws = new WebSocket(`ws://${location.host}/ui`);
+    setPill('pill-server', 'warn', 'подключаюсь…');
+    try {
+      ws = new WebSocket(`ws://${location.host}/ui`);
+    } catch (err) {
+      console.error('WebSocket to the client failed', err);
+      setPill('pill-server', 'err', 'нет клиента'); setTimeout(connect, 3000); return;
+    }
     ws.onopen = () => { send({ type: 'get_state' }); };
-    ws.onclose = () => { setPill('pill-server', 'err', 'клиент'); setTimeout(connect, 1500); };
+    ws.onerror = (e) => console.error('client websocket error', e);
+    ws.onclose = () => { setPill('pill-server', 'err', 'нет клиента'); setTimeout(connect, 1500); };
     ws.onmessage = (e) => { try { handle(JSON.parse(e.data)); } catch (err) { console.error(err, e.data); } };
   }
+  // connect first: a later script error must not leave the page without its link to the client
+  connect();
 
   /* ---------------------------------------------------------------- tabs, prompt & full log */
   document.querySelectorAll('nav.tabs .tab').forEach((b) => b.onclick = () => {
@@ -305,6 +318,5 @@
   function hideConfirm() { confirmId = null; $('confirm').classList.add('hidden'); }
   $('confirm-yes').onclick = () => { send({ type: 'confirm_reply', id: confirmId, approved: true }); hideConfirm(); };
   $('confirm-no').onclick = () => { send({ type: 'confirm_reply', id: confirmId, approved: false }); hideConfirm(); };
-
-  connect();
+  window.addEventListener('error', (e) => { $('stt-state').textContent = '⚠ ошибка страницы: ' + (e.message || e.type); });
 })();
