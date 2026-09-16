@@ -55,11 +55,10 @@
     'btn-send': ['send', 'Отправить (Enter)'],
     'btn-settings': ['gear', 'Настройки'],
     'btn-history': ['menu', 'Показать или спрятать левую панель'],
-    'reader-dictate': ['mic', 'Диктовка: включает прослушивание, распознанная речь добавляется в текст, а не отправляется агенту'],
-    'reader-ptt': ['record', 'Удерживайте, чтобы надиктовать одну фразу в текст'],
   };
   for (const [id, [name, title]] of Object.entries(ICON_BUTTONS)) { const b = $(id); if (b) { b.innerHTML = ICONS[name]; b.title = title; } }
   $('reader-play').innerHTML = ICONS.play + ' Озвучить'; $('reader-stop').innerHTML = ICONS.stop + ' Стоп';
+  $('reader-dictate').innerHTML = ICONS.mic + ' Диктовка';
 
   /* speaker button on every bubble: click = read this message aloud (again) with the local TTS */
   function spkBtn(spoken, title) {
@@ -580,11 +579,6 @@
   const up = () => { if (!held) return; held = false; ptt.classList.remove('rec'); send({ type: 'ptt', state: 'up' }); };
   ptt.addEventListener('mousedown', down); ptt.addEventListener('touchstart', down, { passive: false });
   window.addEventListener('mouseup', up); window.addEventListener('touchend', up);
-  // hold-to-dictate in the read-aloud tab: same push-to-talk, but the client routes the text into the textarea
-  const rptt = $('reader-ptt');
-  const rdown = (e) => { e.preventDefault(); if (held) return; held = true; rptt.classList.add('rec'); send({ type: 'ptt', state: 'down', dictate: true }); };
-  rptt.addEventListener('mousedown', rdown); rptt.addEventListener('touchstart', rdown, { passive: false });
-  window.addEventListener('mouseup', () => { if (held && rptt.classList.contains('rec')) rptt.classList.remove('rec'); });
   const typing = () => ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName);
   window.addEventListener('keydown', (e) => { if (e.code === 'Space' && !typing() && !e.repeat && !e.ctrlKey && !e.altKey && !e.metaKey) down(e); });
   window.addEventListener('keyup', (e) => { if (e.code === 'Space' && held) up(); });
