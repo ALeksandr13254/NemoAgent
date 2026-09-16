@@ -175,76 +175,6 @@
     </div>
   </footer>
 
-  <aside id="settings" class="hidden">
-    <h3>Настройки</h3>
-    <div class="muted small">Модели по ролям</div>
-    <label>Голосовой агент
-      <select id="s-model_dialogue" title="Отвечает вам и ставит задачи исполнителю. Текстовая роль: любой запрос с картинкой, аудио или видео всё равно уйдёт в медиа-модель">
-        <option value="nvidia/nemotron-3-super-120b-a12b">Nemotron 3 Super 120B</option>
-        <option value="nvidia/nemotron-3.5-lightning-30b-a3b">Nemotron 3.5 Lightning 30B — быстрее, проще</option>
-      </select>
-    </label>
-    <label>Исполнитель
-      <select id="s-model_executor" title="Выполняет задачи инструментами. Раунды со скриншотом или вложением уходят в медиа-модель">
-        <option value="nvidia/nemotron-3-super-120b-a12b">Nemotron 3 Super 120B</option>
-        <option value="nvidia/nemotron-3.5-lightning-30b-a3b">Nemotron 3.5 Lightning 30B — быстрее, проще</option>
-      </select>
-    </label>
-    <label>Маршрутизатор
-      <select id="s-model_router" title="Параллельно с ответом решает, нужен ли исполнитель, и формулирует задачу">
-        <option value="nvidia/nemotron-3-super-120b-a12b">Nemotron 3 Super 120B</option>
-        <option value="nvidia/nemotron-3.5-lightning-30b-a3b">Nemotron 3.5 Lightning 30B — быстрее, проще</option>
-      </select>
-    </label>
-    <label>Медиа (картинки, аудио, видео)
-      <select id="s-model_media" title="Берёт любой вызов, в котором есть картинка, аудио, видео или скриншот. Нужна мультимодальная модель — на бесплатном пуле это Nano Omni">
-        <option value="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning">Nemotron 3 Nano Omni 30B</option>
-      </select>
-    </label>
-    <hr>
-    <label>Озвучивать ответы
-      <select id="s-tts_mode">
-        <option value="always">всегда</option>
-        <option value="voice">только на голосовые</option>
-        <option value="off">выключено</option>
-      </select>
-    </label>
-    <label>Язык озвучки
-      <select id="s-tts_language" title="Каким голосом читать латинские слова и числа. «Авто» — по тексту предложения; «русский» — всё по-русски (латиница транслитерируется); «английский» — латиница и числа английским голосом">
-        <option value="auto">авто (по тексту)</option>
-        <option value="ru">русский</option>
-        <option value="en">английский</option>
-      </select>
-    </label>
-    <label>Русский голос <select id="s-voice_ru"></select></label>
-    <label>English voice <select id="s-voice_en"></select></label>
-    <label>Темп речи (меньше — быстрее) <input id="s-tts_speed" type="range" min="0.7" max="1.4" step="0.05"><span id="s-tts_speed-v"></span></label>
-    <label>Устройство вывода <select id="s-speaker_device"></select></label>
-    <div id="speaker-now" class="muted small"></div>
-    <label>Микрофон <select id="s-mic_device"></select></label>
-    <div id="mic-now" class="muted small"></div>
-    <label><input id="s-auto_listen" type="checkbox"> Слушать автоматически (VAD)</label>
-    <label><input id="s-barge_in" type="checkbox"> Перебивать голосом (barge-in)</label>
-    <label>Язык распознавания
-      <select id="s-stt_language">
-        <option value="auto">авто</option><option value="ru">русский</option><option value="en">english</option>
-      </select>
-    </label>
-    <hr>
-    <label><input id="s-tools_enabled" type="checkbox"> Разрешить управление компьютером</label>
-    <label>Подтверждение действий
-      <select id="s-confirm">
-        <option value="dangerous">только опасные</option>
-        <option value="always">все действия</option>
-        <option value="never">никогда</option>
-      </select>
-    </label>
-    <div class="muted small" title="Какие экраны попадают в скриншот: кнопка 🖥 в чате и look_at_screen у исполнителя. По одной картинке на каждый выбранный монитор">Скриншот: мониторы</div>
-    <div id="s-monitors"></div>
-    <hr>
-    <button id="btn-say" class="link">проверить голос</button>
-    <div id="settings-status" class="muted small"></div>
-  </aside>
 
   <div id="confirm" class="modal hidden">
     <div class="box">
@@ -258,6 +188,76 @@
     </div>
   </div>
 </div>
+<aside id="settings" class="hidden">
+  <h3>Настройки</h3>
+  <div class="muted small">Модели по ролям</div>
+  <label>Голосовой агент
+    <select id="s-model_dialogue" title="Отвечает вам и ставит задачи исполнителю. Текстовая роль: любой запрос с картинкой, аудио или видео всё равно уйдёт в медиа-модель">
+      <option value="nvidia/nemotron-3-super-120b-a12b">Nemotron 3 Super 120B</option>
+      <option value="nvidia/nemotron-3.5-lightning-30b-a3b">Nemotron 3.5 Lightning 30B — быстрее, проще</option>
+    </select>
+  </label>
+  <label>Исполнитель
+    <select id="s-model_executor" title="Выполняет задачи инструментами. Раунды со скриншотом или вложением уходят в медиа-модель">
+      <option value="nvidia/nemotron-3-super-120b-a12b">Nemotron 3 Super 120B</option>
+      <option value="nvidia/nemotron-3.5-lightning-30b-a3b">Nemotron 3.5 Lightning 30B — быстрее, проще</option>
+    </select>
+  </label>
+  <label>Маршрутизатор
+    <select id="s-model_router" title="Параллельно с ответом решает, нужен ли исполнитель, и формулирует задачу">
+      <option value="nvidia/nemotron-3-super-120b-a12b">Nemotron 3 Super 120B</option>
+      <option value="nvidia/nemotron-3.5-lightning-30b-a3b">Nemotron 3.5 Lightning 30B — быстрее, проще</option>
+    </select>
+  </label>
+  <label>Медиа (картинки, аудио, видео)
+    <select id="s-model_media" title="Берёт любой вызов, в котором есть картинка, аудио, видео или скриншот. Нужна мультимодальная модель — на бесплатном пуле это Nano Omni">
+      <option value="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning">Nemotron 3 Nano Omni 30B</option>
+    </select>
+  </label>
+  <hr>
+  <label>Озвучивать ответы
+    <select id="s-tts_mode">
+      <option value="always">всегда</option>
+      <option value="voice">только на голосовые</option>
+      <option value="off">выключено</option>
+    </select>
+  </label>
+  <label>Язык озвучки
+    <select id="s-tts_language" title="Каким голосом читать латинские слова и числа. «Авто» — по тексту предложения; «русский» — всё по-русски (латиница транслитерируется); «английский» — латиница и числа английским голосом">
+      <option value="auto">авто (по тексту)</option>
+      <option value="ru">русский</option>
+      <option value="en">английский</option>
+    </select>
+  </label>
+  <label>Русский голос <select id="s-voice_ru"></select></label>
+  <label>English voice <select id="s-voice_en"></select></label>
+  <label>Темп речи (меньше — быстрее) <input id="s-tts_speed" type="range" min="0.7" max="1.4" step="0.05"><span id="s-tts_speed-v"></span></label>
+  <label>Устройство вывода <select id="s-speaker_device"></select></label>
+  <div id="speaker-now" class="muted small"></div>
+  <label>Микрофон <select id="s-mic_device"></select></label>
+  <div id="mic-now" class="muted small"></div>
+  <label><input id="s-auto_listen" type="checkbox"> Слушать автоматически (VAD)</label>
+  <label><input id="s-barge_in" type="checkbox"> Перебивать голосом (barge-in)</label>
+  <label>Язык распознавания
+    <select id="s-stt_language">
+      <option value="auto">авто</option><option value="ru">русский</option><option value="en">english</option>
+    </select>
+  </label>
+  <hr>
+  <label><input id="s-tools_enabled" type="checkbox"> Разрешить управление компьютером</label>
+  <label>Подтверждение действий
+    <select id="s-confirm">
+      <option value="dangerous">только опасные</option>
+      <option value="always">все действия</option>
+      <option value="never">никогда</option>
+    </select>
+  </label>
+  <div class="muted small" title="Какие экраны попадают в скриншот: кнопка 🖥 в чате и look_at_screen у исполнителя. По одной картинке на каждый выбранный монитор">Скриншот: мониторы</div>
+  <div id="s-monitors"></div>
+  <hr>
+  <button id="btn-say" class="link">проверить голос</button>
+  <div id="settings-status" class="muted small"></div>
+</aside>
 </div>
 <script src="/static/app.js"></script>
 </body>

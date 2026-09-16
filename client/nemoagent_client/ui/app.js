@@ -416,7 +416,17 @@
       };
     });
   }
-  $('btn-settings').onclick = () => $('settings').classList.toggle('hidden');
+  // the settings column on the right is pinned like the chats sidebar; ⚙ hides or shows it, the choice is remembered
+  const SETTINGS_KEY = 'nemoagent-settings-open';
+  let settingsHidden = false;
+  try { settingsHidden = localStorage.getItem(SETTINGS_KEY) === '0'; } catch (e) { /* ignore */ }
+  function updateSettingsPane() { $('settings').classList.toggle('hidden', settingsHidden); $('btn-settings').classList.toggle('active', !settingsHidden); }
+  $('btn-settings').onclick = () => {
+    settingsHidden = !settingsHidden;
+    try { localStorage.setItem(SETTINGS_KEY, settingsHidden ? '0' : '1'); } catch (e) { /* ignore */ }
+    updateSettingsPane();
+  };
+  updateSettingsPane();
   for (const k of ['tts_mode', 'confirm', 'stt_language', 'tts_language', 'model_dialogue', 'model_executor', 'model_router', 'model_media', 'voice_ru', 'voice_en', 'speaker_device', 'mic_device']) $('s-' + k).onchange = (e) => pushSettings({ [k]: e.target.value });
   for (const k of ['auto_listen', 'barge_in', 'tools_enabled']) $('s-' + k).onchange = (e) => pushSettings({ [k]: e.target.checked });
   $('s-tts_speed').oninput = (e) => { $('s-tts_speed-v').textContent = Number(e.target.value).toFixed(2); };
