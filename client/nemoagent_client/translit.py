@@ -169,8 +169,9 @@ def is_russian_context(text: str) -> bool:
     return len(_CYR_WORD.findall(text)) >= 2 or ru >= 0.3 * (ru + en)
 
 
-def transliterate_latin(text: str) -> str:
-    """Rewrite Latin words in Cyrillic when the text is a Russian sentence; untouched otherwise."""
-    if not _LAT.search(text) or not is_russian_context(text):
+def transliterate_latin(text: str, force: bool = False) -> str:
+    """Rewrite Latin words in Cyrillic when the text is a Russian sentence (or force=True — the
+    'read everything in Russian' setting); untouched otherwise."""
+    if not _LAT.search(text) or not (force or is_russian_context(text)):
         return text
     return _LATIN_WORD.sub(lambda m: transliterate_word(m.group(0)), text)

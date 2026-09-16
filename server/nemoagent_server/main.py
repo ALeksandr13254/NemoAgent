@@ -90,7 +90,8 @@ def _check_token(authorization: Optional[str]) -> None:
 
 def _ready(session: AgentSession) -> dict:
     return {"type": "ready", "session_id": session.id, "vision": True, "modalities": ["text", "image", "audio", "video"],
-            "memory": services.memory.count(), "model": settings.LLM_MODEL, "media_model": settings.LLM_MEDIA_MODEL}
+            "memory": services.memory.count(), "model": session.text_model, "media_model": settings.LLM_MEDIA_MODEL,
+            "default_model": settings.LLM_MODEL}
 
 
 @app.get("/health")
@@ -219,6 +220,9 @@ async def ws_endpoint(ws: WebSocket):
             elif t == "client_info":
                 link.client_info.update(msg.get("client") or {})
                 link.session.client_info = link.client_info
+                if "text_model" in (msg.get("client") or {}):
+                    log.info("session %s: text model -> %s", link.session.id, link.session.text_model)
+                    await link.send({"type": "model", "model": link.session.text_model, "media_model": settings.LLM_MEDIA_MODEL})
             elif t == "get_prompts":
                 await link.send({"type": "prompts", **services.prompts.snapshot()})
             elif t == "set_prompts":

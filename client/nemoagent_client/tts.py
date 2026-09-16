@@ -166,14 +166,20 @@ def accentize_keep_manual(text: str, accentizer) -> str:
 
 
 # ----------------------------------------------------------------- language tagging
-def tag_languages(text: str) -> tuple[str, str]:
-    """Return (tagged_text, dominant_language) with <ru>/<en> spans per word run."""
+def tag_languages(text: str, force: Optional[str] = None) -> tuple[str, str]:
+    """Return (tagged_text, dominant_language) with <ru>/<en> spans per word run.
+
+    force="ru" / "en" (the "Язык озвучки" setting) pins the voice: every Latin word and every
+    number is read by that voice; Cyrillic words always stay Russian (the English voice cannot
+    pronounce them)."""
     tokens = re.findall(r"\S+|\s+", text)
     runs: list[list[str]] = []   # [lang, text]
-    cur_lang = None
     # Russian sentences are full of Latin product names ("открой Visual Studio Code"): lean towards
     # the Russian voice unless the sentence is clearly English (same rule as the transliteration).
-    default = "ru" if is_russian_context(text) else "en"
+    # A sentence without any Latin letters (digits only, "24,9.") is Russian too.
+    default = "ru" if (is_russian_context(text) or not _LAT.search(text)) else "en"
+    if force in ("ru", "en"):
+        default = force
     for tok in tokens:
         if tok.isspace():
             if runs:
@@ -182,14 +188,15 @@ def tag_languages(text: str) -> tuple[str, str]:
         if _CYR.search(tok):
             lang = "ru"
         elif _LAT.search(tok):
-            lang = "en"
+            lang = "ru" if force == "ru" else "en"
         else:
-            lang = cur_lang or default   # digits / punctuation follow the current run
+            # digits and punctuation follow the language of the SENTENCE, not of the previous word:
+            # "RTX 4070" inside Russian speech must give "четыре тысячи семьдесят", not "forty seventy"
+            lang = default
         if runs and runs[-1][0] == lang:
             runs[-1][1] += tok
         else:
             runs.append([lang, tok])
-        cur_lang = lang
     if not runs:
         return "", default
     parts = []
@@ -201,6 +208,64 @@ def tag_languages(text: str) -> tuple[str, str]:
         chunk = chunk.replace("<", " ").replace(">", " ")
         parts.append(f"<{lang}>{chunk}</{lang}>")
     return " ".join(parts), default
+
+
+# ----------------------------------------------------------------- Russian dates and times
+# The runtime expands plain numbers with num2words but skips "15.09.2026" and "15:02" (they are not
+# numbers to it), so the vocoder would get raw digits — read aloud as English digits or dropped.
+_MONTHS_GEN = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря")
+_DATE_RE = re.compile(r"(?<![\d.])(\d{1,2})\.(\d{1,2})\.(\d{4})(?![\d.])")
+_ISO_DATE_RE = re.compile(r"(?<![\d-])(\d{4})-(\d{2})-(\d{2})(?![\d-])")
+_TIME_RE = re.compile(r"(?<![\d:])(\d{1,2}):(\d{2})(?![\d:])")
+
+
+def _ru_ordinal(n: int, form: str) -> str:
+    """Ordinal in the form a date needs: 'n' neuter nominative (пятнадцатое), 'g' masculine genitive (шестого)."""
+    from num2words import num2words
+    w = num2words(n, lang="ru", to="ordinal")
+    endings = (("ий", "ье"), ("ой", "ое"), ("ый", "ое")) if form == "n" else (("ий", "ьего"), ("ой", "ого"), ("ый", "ого"))
+    for a, b in endings:
+        if w.endswith(a):
+            return w[:-2] + b
+    return w
+
+
+def expand_ru_dates_times(text: str) -> str:
+    from num2words import num2words
+
+    def date(d: int, mo: int, y: int, whole: str) -> str:
+        if not (1 <= d <= 31 and 1 <= mo <= 12):
+            return whole
+        return f"{_ru_ordinal(d, 'n')} {_MONTHS_GEN[mo - 1]} {_ru_ordinal(y, 'g')} года"
+
+    text = _DATE_RE.sub(lambda m: date(int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(0)), text)
+    text = _ISO_DATE_RE.sub(lambda m: date(int(m.group(3)), int(m.group(2)), int(m.group(1)), m.group(0)), text)
+
+    def clock(m: re.Match) -> str:
+        h, mi = int(m.group(1)), int(m.group(2))
+        if h > 23 or mi > 59:
+            return m.group(0)
+        minutes = "ноль ноль" if mi == 0 else ("ноль " if mi < 10 else "") + num2words(mi, lang="ru")
+        return f"{num2words(h, lang='ru')} {minutes}"
+
+    return _TIME_RE.sub(clock, text)
+
+
+# "24,9." — a decimal right before the full stop: the runtime's number regex refuses it and reads
+# "двадцать четыре,9". Decimals are expanded here (num2words: "двадцать четыре целых девять десятых").
+_DECIMAL_RE = re.compile(r"(?<![\w.,])(-?\d+)[.,](\d+)(?![\w])")
+
+
+def expand_ru_decimals(text: str) -> str:
+    from num2words import num2words
+
+    def dec(m: re.Match) -> str:
+        try:
+            return num2words(float(f"{m.group(1)}.{m.group(2)}"), lang="ru")
+        except Exception:  # noqa: BLE001
+            return m.group(0)
+
+    return _DECIMAL_RE.sub(dec, text)
 
 
 # ----------------------------------------------------------------- sentence splitting
@@ -340,10 +405,15 @@ class TeraTTS:
 
     def prepare(self, text: str) -> tuple[str, str]:
         """Sanitize -> language tags -> Russian stress (keeping manual marks). Returns (tagged, lang)."""
+        force = settings.TTS_LANGUAGE if settings.TTS_LANGUAGE in ("ru", "en") else None
+        russian = force == "ru" or (force is None and (is_russian_context(text) or not _LAT.search(text)))
+        if russian:
+            # before the vocabulary pass: it would put a space after the ':' of "15:02" and hide the time
+            text = expand_ru_decimals(expand_ru_dates_times(text))
         text = sanitize_vocab(text)
         # Latin words inside Russian speech are read as noise by the Russian voice: say them in Cyrillic
-        text = transliterate_latin(text)
-        tagged, lang = tag_languages(text)
+        text = transliterate_latin(text, force=(force == "ru"))
+        tagged, lang = tag_languages(text, force)
         if not tagged:
             return "", lang
         # Same order as the model's own normalize_text: spacing/vocabulary -> numbers to words ->

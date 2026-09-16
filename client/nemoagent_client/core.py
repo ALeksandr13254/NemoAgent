@@ -42,6 +42,8 @@ class ClientCore:
             "barge_in": settings.BARGE_IN,
             "tools_enabled": settings.TOOLS_ENABLED,
             "confirm": settings.TOOL_CONFIRM,
+            "tts_language": settings.TTS_LANGUAGE,   # auto | ru | en: voice for Latin words and numbers
+            "text_model": settings.TEXT_MODEL,       # text model asked from the server ("" = server default)
             "voice_ru": settings.TTS_VOICE_RU,
             "voice_en": settings.TTS_VOICE_EN,
             "tts_speed": settings.TTS_SPEED,
@@ -163,6 +165,8 @@ class ClientCore:
     def _client_info(self) -> dict:
         info = executor.client_description()
         info["tools_enabled"] = self.state["tools_enabled"]
+        if self.state.get("text_model"):
+            info["text_model"] = self.state["text_model"]
         return info
 
     async def send_server(self, msg: dict) -> bool:
@@ -181,7 +185,11 @@ class ClientCore:
         t = msg.get("type")
         if t == "ready":
             self.session_id = msg.get("session_id")
-            self.server_info = {k: msg.get(k) for k in ("vision", "vision_error", "memory", "model")}
+            self.server_info = {k: msg.get(k) for k in ("vision", "vision_error", "memory", "model", "media_model", "default_model")}
+            await self.broadcast_status()
+            return
+        if t == "model":   # the server confirmed the text model chosen in the settings
+            self.server_info["model"] = msg.get("model")
             await self.broadcast_status()
             return
         if t == "delta":
@@ -511,9 +519,12 @@ class ClientCore:
 
     async def _apply_settings(self, s: dict) -> None:
         for key in ("tts_mode", "auto_listen", "barge_in", "tools_enabled", "confirm", "voice_ru", "voice_en", "tts_speed",
-                    "stt_language", "memory_recall"):
+                    "stt_language", "tts_language", "text_model", "memory_recall"):
             if key in s:
                 self.state[key] = s[key]
+        if "text_model" in s and self.server_ws:
+            await self.send_server({"type": "client_info", "client": {"text_model": str(s["text_model"] or "")}})
+        settings.TTS_LANGUAGE = self.state.get("tts_language") if self.state.get("tts_language") in ("ru", "en") else "auto"
         for key in ("speaker_device", "mic_device"):   # unchanged: don't reopen the stream
             if key in s and self.state.get(key, "") == str(s[key] or ""):
                 s = {k: v for k, v in s.items() if k != key}

@@ -204,12 +204,17 @@ class AgentSession:
                 "thinking": settings.LLM_THINKING, "tool_choice": "auto" if tools else None,
                 "tts": tts, "memory": use_memory, "source": source}
 
-    @staticmethod
-    def _model_for(messages: list[dict]) -> str:
-        """The fast text model unless the request carries images / audio / video — then the omni model."""
+    @property
+    def text_model(self) -> str:
+        """The client may pick the text model in its settings (Lightning vs Super); otherwise the server default."""
+        chosen = str(self.client_info.get("text_model") or "").strip()
+        return chosen or settings.LLM_MODEL
+
+    def _model_for(self, messages: list[dict]) -> str:
+        """The text model unless the request carries images / audio / video — then the omni model."""
         if any(media.has_media(m.get("content")) for m in messages):
             return settings.LLM_MEDIA_MODEL
-        return settings.LLM_MODEL
+        return self.text_model
 
     async def _dialogue_call(self, tts: bool, use_memory: bool, source: str, t_start: float, stage: str,
                              call_no: int) -> tuple[str, Optional[str], Optional[str], Optional[int]]:

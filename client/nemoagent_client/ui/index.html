@@ -114,11 +114,25 @@
 
   <aside id="settings" class="hidden">
     <h3>Настройки</h3>
+    <label>Модель для текста
+      <select id="s-text_model" title="Какая модель ведёт диалог и выполняет задачи без картинок/аудио/видео. Медиа всегда идут в Nano Omni">
+        <option value="nvidia/nemotron-3.5-lightning-30b-a3b">Nemotron 3.5 Lightning 30B — быстрая</option>
+        <option value="nvidia/nemotron-3-super-120b-a12b">Nemotron 3 Super 120B — умнее, медленнее</option>
+      </select>
+    </label>
+    <hr>
     <label>Озвучивать ответы
       <select id="s-tts_mode">
         <option value="always">всегда</option>
         <option value="voice">только на голосовые</option>
         <option value="off">выключено</option>
+      </select>
+    </label>
+    <label>Язык озвучки
+      <select id="s-tts_language" title="Каким голосом читать латинские слова и числа. «Авто» — по тексту предложения; «русский» — всё по-русски (латиница транслитерируется); «английский» — латиница и числа английским голосом">
+        <option value="auto">авто (по тексту)</option>
+        <option value="ru">русский</option>
+        <option value="en">английский</option>
       </select>
     </label>
     <label>Русский голос <select id="s-voice_ru"></select></label>

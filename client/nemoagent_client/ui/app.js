@@ -29,6 +29,16 @@
     if (msg.type === 'send' || msg.type === 'say') add(div('errline', '⚠ нет связи с клиентом NemoAgent (окно run_client.bat) — страница переподключается, обновите её (Ctrl+F5), если это не проходит'));
   }
   function setPill(id, cls, text) { const p = $(id); p.className = 'pill ' + cls; if (text) p.textContent = text; }
+  /* 🔊 on every bubble: click = read this message aloud (again) with the local TTS */
+  function spkBtn(spoken, title) {
+    return `<button class="spk-btn${spoken ? ' spoken' : ''}" title="${title || (spoken ? 'озвучено · нажмите, чтобы повторить' : 'озвучить')}">🔊</button>`;
+  }
+  chat.addEventListener('click', (e) => {
+    const b = e.target.closest('.spk-btn'); if (!b) return;
+    const msg = b.closest('.msg'); if (!msg) return;
+    const text = (msg._spoken || msg._text || msg.innerText || '').trim();
+    if (text) send({ type: 'say', text });
+  });
   /* waiting indicator: seconds since the message went out, until the model's first token */
   let waitTimer = null;
   function waitingSince(t0) {
@@ -139,9 +149,9 @@
       }
       case 'report': card('report', `📋 <b>отчёт исполнителя</b> · ${(m.report || '').length} симв.`, m.report, true); current = null; break;
       case 'user_message': {
-        const d = div('msg user');
+        const d = div('msg user'); d._text = m.text || '';
         const src = m.source === 'voice' ? '🎙 голос' : '⌨ текст';
-        let html = `<div class="src">${src}${m.memory ? ' · 🗂 память' : ''}</div>${fmt(m.text || '')}`;
+        let html = `<div class="src">${src}${m.memory ? ' · 🗂 память' : ''}${spkBtn(false, 'озвучить это сообщение')}</div>${fmt(m.text || '')}`;
         if (m.attachments && m.attachments.length) html += `<div class="src">📎 ${m.attachments.length} влож.</div>`;
         d.innerHTML = html; add(d);
         current = null; reasoningCard = null; metrics = { stt: metrics.stt }; updateMetrics();
@@ -153,19 +163,21 @@
         if (waitTimer) { waitingSince(null); $('stt-state').textContent = ''; }
         if (!current) { current = add(div('msg assistant streaming')); current._text = ''; }
         current._text += m.content;
-        current.innerHTML = (current._speech ? '<span class="spk" title="озвучено">🔊</span>' : '') + fmt(current._text); scroll();
+        current.innerHTML = spkBtn(current._speech) + fmt(current._text); scroll();
         break;
       }
       case 'speech_delta': {
         if (waitTimer) { waitingSince(null); $('stt-state').textContent = ''; }
-        // TTS-ready text from the `speak` tool: show it while it streams; `display` may replace it at the end
-        if (!current || !current._speech) { current = add(div('msg assistant streaming speech')); current._text = ''; current._speech = true; }
-        current._text += m.content; current.innerHTML = '<span class="spk" title="озвучено">🔊</span>' + fmt(current._text); scroll();
+        // TTS-ready text: show it while it streams; `display` may replace it on screen at the end,
+        // the spoken version is kept for the 🔊 button
+        if (!current || !current._speech) { current = add(div('msg assistant streaming speech')); current._text = ''; current._spoken = ''; current._speech = true; }
+        current._text += m.content; current._spoken += m.content;
+        current.innerHTML = spkBtn(true) + fmt(current._text); scroll();
         break;
       }
       case 'speech_done': {
         if (current && current._speech) {
-          if (m.display) { current._text = m.display; current.innerHTML = '<span class="spk" title="озвучено (на экране — версия для чтения)">🔊</span>' + fmt(m.display); }
+          if (m.display) { current._text = m.display; current.innerHTML = spkBtn(true, 'озвучено (на экране — версия для чтения) · нажмите, чтобы повторить') + fmt(m.display); }
           current.classList.remove('streaming');
           if (!m.final) current = null;
         }
@@ -288,7 +300,8 @@
     $('btn-memory').classList.toggle('active', !!(state.settings && state.settings.memory_recall));
     $('pill-stt').title = state.mic ? 'микрофон: ' + state.mic : '';
     const s = state.settings || {};
-    for (const k of ['tts_mode', 'confirm', 'stt_language']) $('s-' + k).value = s[k];
+    for (const k of ['tts_mode', 'confirm', 'stt_language', 'tts_language']) $('s-' + k).value = s[k] || (k === 'tts_language' ? 'auto' : s[k]);
+    $('s-text_model').value = s.text_model || si.model || '';
     for (const k of ['auto_listen', 'barge_in', 'tools_enabled']) $('s-' + k).checked = !!s[k];
     fillVoices('s-voice_ru', state.voices.ru, s.voice_ru); fillVoices('s-voice_en', state.voices.en, s.voice_en);
     fillDevices('s-speaker_device', state.output_devices || [], s.speaker_device);
@@ -310,7 +323,7 @@
   }
   function pushSettings(patch) { send({ type: 'settings', settings: patch }); }
   $('btn-settings').onclick = () => $('settings').classList.toggle('hidden');
-  for (const k of ['tts_mode', 'confirm', 'stt_language', 'voice_ru', 'voice_en', 'speaker_device', 'mic_device']) $('s-' + k).onchange = (e) => pushSettings({ [k]: e.target.value });
+  for (const k of ['tts_mode', 'confirm', 'stt_language', 'tts_language', 'text_model', 'voice_ru', 'voice_en', 'speaker_device', 'mic_device']) $('s-' + k).onchange = (e) => pushSettings({ [k]: e.target.value });
   for (const k of ['auto_listen', 'barge_in', 'tools_enabled']) $('s-' + k).onchange = (e) => pushSettings({ [k]: e.target.checked });
   $('s-tts_speed').oninput = (e) => { $('s-tts_speed-v').textContent = Number(e.target.value).toFixed(2); };
   $('s-tts_speed').onchange = (e) => pushSettings({ tts_speed: Number(e.target.value) });

@@ -72,6 +72,8 @@ class Settings:
     TTS_MODEL_DIR = Path(_env("TTS_MODEL_DIR", str(CLIENT_DIR / "models" / "TeraTTSv2")))
     TTS_PROVIDER = _env("TTS_PROVIDER", "auto")        # auto | cuda | cpu
     TTS_THREADS = _int("TTS_THREADS", 0)               # 0 = automatic
+    TTS_LANGUAGE = _env("TTS_LANGUAGE", "auto")        # auto (by script) | ru | en — which voice reads Latin words and numbers
+    TEXT_MODEL = _env("TEXT_MODEL", "")                # text model asked from the server (empty = server default); switchable in the UI
     TTS_VOICE_RU = _env("TTS_VOICE_RU", "ru_f1")
     TTS_VOICE_EN = _env("TTS_VOICE_EN", "eng_f3")
     TTS_SPEED = _float("TTS_SPEED", 1.0)               # duration_scale: <1 faster, >1 slower

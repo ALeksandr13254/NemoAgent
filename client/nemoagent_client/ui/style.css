@@ -56,6 +56,10 @@ main#chat { overflow-y: auto; padding: 14px 4px; display: flex; flex-direction: 
 .msg.assistant { align-self: flex-start; background: var(--panel); border-bottom-left-radius: 4px; }
 .msg.assistant.streaming::after { content: "▍"; color: var(--accent); animation: blink 1s infinite; }
 .msg.assistant .spk { font-size: 11px; color: var(--muted); margin-right: 6px; }
+.msg .spk-btn { background: none; border: none; padding: 0 4px 0 0; margin: 0 4px 0 0; font-size: 12px; color: var(--muted); cursor: pointer; vertical-align: baseline; line-height: 1; }
+.msg .spk-btn.spoken { color: var(--accent); }
+.msg .spk-btn:hover { color: var(--text); border: none; }
+.msg.user .src .spk-btn { margin-left: 6px; }
 @keyframes blink { 50% { opacity: 0; } }
 .msg code { background: #0b0d12; padding: 1px 5px; border-radius: 4px; font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
 .msg pre { background: #0b0d12; padding: 8px 10px; border-radius: 8px; overflow-x: auto; margin: 6px 0; }
