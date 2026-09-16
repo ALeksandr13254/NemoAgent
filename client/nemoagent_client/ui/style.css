@@ -158,3 +158,5 @@ button svg { width: 16px; height: 16px; vertical-align: -3px; }
 .spk-btn svg { width: 14px; height: 14px; vertical-align: -2px; }
 #reader-play svg, #reader-stop svg { margin-right: 4px; }
 #reader-dictate.active { background: var(--accent2); border-color: var(--accent2); color: #fff; }
+#reader-mic-level { height: 100%; width: 0; background: var(--ok); transition: width .08s linear; }
+#reader-mic-level.speech { background: var(--accent); }

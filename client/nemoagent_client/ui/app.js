@@ -280,13 +280,18 @@
       case 'tts_first_audio': metrics.first_audio = m.ms; updateMetrics(); break;
       case 'interrupted': if (current) current.classList.remove('streaming'); break;
       case 'cleared': chat.innerHTML = ''; current = null; reasoningCard = null; break;
-      case 'mic': { const el = $('mic-level'); el.style.width = Math.round(m.level * 100) + '%'; el.classList.toggle('speech', !!m.speech); break; }
+      case 'mic': {
+        // the same level bar lives under the chat composer and in the read-aloud tab (dictation)
+        for (const el of [$('mic-level'), $('reader-mic-level')]) { el.style.width = Math.round(m.level * 100) + '%'; el.classList.toggle('speech', !!m.speech); }
+        break;
+      }
       case 'stt': {
-        const s = $('stt-state');
-        if (m.state === 'transcribing') s.textContent = `распознаю ${m.duration} с…`;
-        else if (m.state === 'done') { s.textContent = ''; metrics.stt = m.ms; }
-        else if (m.state === 'empty') s.textContent = 'ничего не распознано';
-        else if (m.state === 'error') s.textContent = 'ошибка STT: ' + m.message;
+        let text = '';
+        if (m.state === 'transcribing') text = `распознаю ${m.duration} с…`;
+        else if (m.state === 'done') { text = ''; metrics.stt = m.ms; }
+        else if (m.state === 'empty') text = 'ничего не распознано';
+        else if (m.state === 'error') text = 'ошибка STT: ' + m.message;
+        $('stt-state').textContent = text; $('reader-stt').textContent = text;
         break;
       }
       case 'confirm': showConfirm(m); break;
