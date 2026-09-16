@@ -14,6 +14,8 @@ import numpy as np
 import websockets
 
 from . import executor
+from pathlib import Path
+
 from .config import settings
 
 log = logging.getLogger("core")
@@ -52,6 +54,10 @@ class ClientCore:
             "mic_device": settings.MIC_DEVICE or "",
             "memory_recall": False,     # 🗂 button: recall long-term memory for the messages while it is on
         }
+        # what the user picks in the settings panel survives a restart (client/data/settings.json)
+        self._settings_path = Path(__file__).resolve().parent.parent / "data" / "settings.json"
+        self._load_state()
+        self._sync_runtime_settings()
         self.current_source = "text"
         self.turn_t0 = 0.0
         self.assistant_buffer = ""
@@ -64,6 +70,43 @@ class ClientCore:
         self._pending_confirms: dict[str, asyncio.Future] = {}
         self._last_level_sent = 0.0
         self._http = httpx.AsyncClient(timeout=120)
+
+    # ============================================================== settings persistence
+    PERSIST_KEYS = ("tts_mode", "auto_listen", "barge_in", "tools_enabled", "confirm", "voice_ru", "voice_en", "tts_speed",
+                    "stt_language", "tts_language", "text_model", "speaker_device", "mic_device")
+
+    def _load_state(self) -> None:
+        try:
+            if self._settings_path.exists():
+                saved = json.loads(self._settings_path.read_text("utf-8"))
+                for k in self.PERSIST_KEYS:
+                    if k in saved:
+                        self.state[k] = saved[k]
+                log.info("settings restored from %s", self._settings_path)
+        except Exception as e:  # noqa: BLE001
+            log.warning("cannot read %s: %s", self._settings_path, e)
+
+    def _save_state(self) -> None:
+        try:
+            self._settings_path.parent.mkdir(parents=True, exist_ok=True)
+            self._settings_path.write_text(json.dumps({k: self.state[k] for k in self.PERSIST_KEYS if k in self.state},
+                                                      ensure_ascii=False, indent=1), "utf-8")
+        except Exception as e:  # noqa: BLE001
+            log.warning("cannot save %s: %s", self._settings_path, e)
+
+    def _sync_runtime_settings(self) -> None:
+        """Push the settings state into the module-level `settings` the audio code reads."""
+        settings.TTS_VOICE_RU = self.state["voice_ru"]
+        settings.TTS_VOICE_EN = self.state["voice_en"]
+        try:
+            settings.TTS_SPEED = float(self.state["tts_speed"])
+        except (TypeError, ValueError):
+            pass
+        settings.STT_LANGUAGE = self.state["stt_language"] or "auto"
+        settings.TTS_LANGUAGE = self.state.get("tts_language") if self.state.get("tts_language") in ("ru", "en") else "auto"
+        settings.BARGE_IN = bool(self.state["barge_in"])
+        settings.SPEAKER_DEVICE = str(self.state.get("speaker_device") or "") or None
+        settings.MIC_DEVICE = str(self.state.get("mic_device") or "") or None
 
     # ============================================================== lifecycle
     async def run(self) -> None:
@@ -524,18 +567,10 @@ class ClientCore:
                 self.state[key] = s[key]
         if "text_model" in s and self.server_ws:
             await self.send_server({"type": "client_info", "client": {"text_model": str(s["text_model"] or "")}})
-        settings.TTS_LANGUAGE = self.state.get("tts_language") if self.state.get("tts_language") in ("ru", "en") else "auto"
         for key in ("speaker_device", "mic_device"):   # unchanged: don't reopen the stream
             if key in s and self.state.get(key, "") == str(s[key] or ""):
                 s = {k: v for k, v in s.items() if k != key}
-        settings.TTS_VOICE_RU = self.state["voice_ru"]
-        settings.TTS_VOICE_EN = self.state["voice_en"]
-        try:
-            settings.TTS_SPEED = float(self.state["tts_speed"])
-        except (TypeError, ValueError):
-            pass
-        settings.STT_LANGUAGE = self.state["stt_language"] or "auto"
-        settings.BARGE_IN = bool(self.state["barge_in"])
+        self._sync_runtime_settings()
         if self.mic:
             self.mic.set_enabled(bool(self.state["auto_listen"]) and self.stt is not None)
         if self.state["tts_mode"] == "off" and self.speaker:
@@ -548,6 +583,7 @@ class ClientCore:
         if "mic_device" in s:
             self.state["mic_device"] = str(s["mic_device"] or "")
             await asyncio.to_thread(self._switch_input_device, self.state["mic_device"])
+        self._save_state()
         await self.broadcast_status()
 
     def _switch_input_device(self, spec: str) -> None:

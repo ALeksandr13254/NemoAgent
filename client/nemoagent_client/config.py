@@ -53,7 +53,7 @@ class Settings:
     STT_MODEL = _env("STT_MODEL", "large-v3-turbo")
     STT_DEVICE = _env("STT_DEVICE", "auto")            # auto | cuda | cpu
     STT_COMPUTE = _env("STT_COMPUTE", "auto")          # auto | float16 | int8_float16 | int8
-    STT_LANGUAGE = _env("STT_LANGUAGE", "ru")          # ru | en | auto (auto can drift to other languages on background audio)
+    STT_LANGUAGE = _env("STT_LANGUAGE", "auto")          # ru | en | auto (auto can drift to other languages on background audio)
     STT_BEAM = _int("STT_BEAM", 3)                     # beam 3 costs nothing on GPU and drops fewer words
 
     # --- microphone / VAD ---
@@ -73,9 +73,9 @@ class Settings:
     TTS_PROVIDER = _env("TTS_PROVIDER", "auto")        # auto | cuda | cpu
     TTS_THREADS = _int("TTS_THREADS", 0)               # 0 = automatic
     TTS_LANGUAGE = _env("TTS_LANGUAGE", "auto")        # auto (by script) | ru | en — which voice reads Latin words and numbers
-    TEXT_MODEL = _env("TEXT_MODEL", "")                # text model asked from the server (empty = server default); switchable in the UI
+    TEXT_MODEL = _env("TEXT_MODEL", "nvidia/nemotron-3-super-120b-a12b")                # text model asked from the server (empty = server default); switchable in the UI
     TTS_VOICE_RU = _env("TTS_VOICE_RU", "ru_f1")
-    TTS_VOICE_EN = _env("TTS_VOICE_EN", "eng_f3")
+    TTS_VOICE_EN = _env("TTS_VOICE_EN", "eng_f5")
     TTS_SPEED = _float("TTS_SPEED", 1.0)               # duration_scale: <1 faster, >1 slower
     TTS_FIRST_CHUNK_CHARS = _int("TTS_FIRST_CHUNK_CHARS", 70)
     TTS_MAX_CHARS = _int("TTS_MAX_CHARS", 180)
