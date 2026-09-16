@@ -29,6 +29,14 @@
     if (msg.type === 'send' || msg.type === 'say') add(div('errline', '⚠ нет связи с клиентом NemoAgent (окно run_client.bat) — страница переподключается, обновите её (Ctrl+F5), если это не проходит'));
   }
   function setPill(id, cls, text) { const p = $(id); p.className = 'pill ' + cls; if (text) p.textContent = text; }
+  /* waiting indicator: seconds since the message went out, until the model's first token */
+  let waitTimer = null;
+  function waitingSince(t0) {
+    clearInterval(waitTimer);
+    if (!t0) { waitTimer = null; return; }
+    const tick = () => { const s = Math.round((Date.now() - t0) / 1000); if (s >= 2) $('stt-state').textContent = `модель думает… ${s} с`; };
+    waitTimer = setInterval(tick, 1000);
+  }
   function updateMetrics() {
     const parts = [];
     if (metrics.stt) parts.push(`STT ${metrics.stt} мс`);
@@ -137,16 +145,19 @@
         if (m.attachments && m.attachments.length) html += `<div class="src">📎 ${m.attachments.length} влож.</div>`;
         d.innerHTML = html; add(d);
         current = null; reasoningCard = null; metrics = { stt: metrics.stt }; updateMetrics();
+        waitingSince(Date.now());   // "думаю… N с" until the first token: the free pool can take 20 s
         break;
       }
       case 'round': if (m.round > 1) { current = null; } break;
       case 'delta': {
+        if (waitTimer) { waitingSince(null); $('stt-state').textContent = ''; }
         if (!current) { current = add(div('msg assistant streaming')); current._text = ''; }
         current._text += m.content;
         current.innerHTML = (current._speech ? '<span class="spk" title="озвучено">🔊</span>' : '') + fmt(current._text); scroll();
         break;
       }
       case 'speech_delta': {
+        if (waitTimer) { waitingSince(null); $('stt-state').textContent = ''; }
         // TTS-ready text from the `speak` tool: show it while it streams; `display` may replace it at the end
         if (!current || !current._speech) { current = add(div('msg assistant streaming speech')); current._text = ''; current._speech = true; }
         current._text += m.content; current.innerHTML = '<span class="spk" title="озвучено">🔊</span>' + fmt(current._text); scroll();
@@ -181,6 +192,7 @@
       case 'notice': add(div('notice', esc(m.message))); break;
       case 'error': add(div('errline', '⚠ ' + esc(m.message))); break;
       case 'done': {
+        waitingSince(null);
         if (current) current.classList.remove('streaming');
         if (m.first_token_ms) metrics.first_token = m.first_token_ms;
         if (m.total_ms) metrics.total = m.total_ms; updateMetrics();

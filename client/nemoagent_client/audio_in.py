@@ -26,11 +26,12 @@ FRAME = 512  # 32 ms
 class Microphone:
     def __init__(self, on_utterance: Callable[[np.ndarray, float, bool], None], on_speech_start: Callable[[], None],
                  is_agent_speaking: Callable[[], bool], on_level: Optional[Callable[[float, bool], None]] = None,
-                 device=None):
+                 device=None, on_health: Optional[Callable[[str], None]] = None):
         self.on_utterance = on_utterance          # (audio16k, duration_s, during_agent_speech)
         self.on_speech_start = on_speech_start    # UI hint only ("possible barge-in")
         self.is_agent_speaking = is_agent_speaking
         self.on_level = on_level or (lambda level, speech: None)
+        self.on_health = on_health or (lambda text: None)   # "ready" / "no audio from the device" for the UI
         self.vad = SileroVAD()
         self.enabled = settings.AUTO_LISTEN
         self.ptt = False          # push-to-talk held
@@ -39,13 +40,28 @@ class Microphone:
         self._device = device
         self._rate = SR
         self.device_name = ""
+        self.health = "ready"
+        self._last_frame_at = time.time()
+        self._last_reopen_at = 0.0
+        self._frames_seen = 0
         self._thread = threading.Thread(target=self._loop, daemon=True, name="mic-vad")
         self._running = True
         self._thread.start()
         self._open(device)
 
-    def _open(self, device) -> None:
+    def _candidates(self, device) -> list[dict]:
+        """Ways to open the microphone, best first. Each is {device, samplerate, extra_settings?}.
+
+        The default device is the MME entry, and an MME stream at 16 kHz on this webcam opens fine but
+        delivers no audio after a restart (and blocks the endpoint for every other program while it is
+        open), so the WASAPI entry of the same microphone at its native rate goes first; we resample."""
         import sounddevice as sd
+        devs = sd.query_devices()
+        apis = sd.query_hostapis()
+
+        def api_of(i: int) -> str:
+            return apis[devs[i]["hostapi"]]["name"]
+
         dev = device
         if isinstance(dev, str) and dev.strip():
             dev = dev.strip()
@@ -53,42 +69,85 @@ class Microphone:
                 dev = int(dev)
             else:  # partial device name
                 wanted = dev.lower()
-                dev = next((i for i, d in enumerate(sd.query_devices())
-                            if d["max_input_channels"] > 0 and wanted in d["name"].lower()), dev)
+                dev = next((i for i, d in enumerate(devs) if d["max_input_channels"] > 0 and wanted in d["name"].lower()), None)
         elif not dev:
             dev = None
-        # 16 kHz capture: WASAPI shared mode may refuse it -> auto-convert, then native rate + decimation
-        attempts = [dict(samplerate=SR)]
-        try:
-            info = sd.query_devices(dev if dev is not None else sd.default.device[0])
-            if "WASAPI" in sd.query_hostapis(info["hostapi"])["name"]:
-                attempts.append(dict(samplerate=SR, extra_settings=sd.WasapiSettings(auto_convert=True)))
-            native = int(info["default_samplerate"])
-            if native != SR:
-                attempts.append(dict(samplerate=native))
-        except Exception:
-            pass
+        base = dev if dev is not None else sd.default.device[0]
+        if base is None or base < 0 or base >= len(devs):
+            return [dict(device=None, samplerate=SR)]
+        name = devs[base]["name"]
+        # the same physical microphone under every host API (MME truncates names, so compare prefixes)
+        key = name.rstrip(")").lower()[:28]
+        same = [i for i, d in enumerate(devs) if d["max_input_channels"] > 0 and d["name"].rstrip(")").lower()[:28] == key]
+        out: list[dict] = []
+        for i in sorted(same, key=lambda i: (0 if "WASAPI" in api_of(i) else 1 if i == base else 2 if "DirectSound" in api_of(i) else 3)):
+            native = int(devs[i]["default_samplerate"] or SR)
+            if "WASAPI" in api_of(i):
+                out.append(dict(device=i, samplerate=native))
+                out.append(dict(device=i, samplerate=SR, extra_settings=sd.WasapiSettings(auto_convert=True)))
+            elif "WDM-KS" in api_of(i):
+                continue   # exclusive: would lock the microphone for other programs
+            else:
+                out.append(dict(device=i, samplerate=SR))
+                if native != SR:
+                    out.append(dict(device=i, samplerate=native))
+        return out or [dict(device=base, samplerate=SR)]
+
+    def _open(self, device) -> None:
+        import sounddevice as sd
         last = None
-        for kw in attempts:
+        for kw in self._candidates(device):
+            rate = int(kw["samplerate"])
+            block = FRAME * rate // SR
+            self._frames_seen = 0
             try:
-                rate = int(kw["samplerate"])
-                block = FRAME * rate // SR
-                self._stream = sd.InputStream(channels=1, dtype="float32", blocksize=block, device=dev,
-                                              callback=self._callback, **kw)
-                self._rate = rate
-                self._stream.start()
-                break
+                stream = sd.InputStream(channels=1, dtype="float32", blocksize=block, callback=self._callback, **kw)
+                stream.start()
             except Exception as e:  # noqa: BLE001
                 last = e
-                self._stream = None
+                continue
+            # an "open" stream is not proof of anything: wait for real frames before trusting it
+            deadline = time.time() + 1.5
+            while time.time() < deadline and self._frames_seen < 3:
+                time.sleep(0.05)
+            if self._frames_seen >= 3:
+                self._stream = stream
+                self._rate = rate
+                break
+            last = RuntimeError("stream opened but delivers no audio")
+            log.warning("microphone %r @ %d Hz delivers nothing — trying the next way", kw.get("device"), rate)
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
         if self._stream is None:
             raise RuntimeError(f"cannot open microphone {device!r}: {last}")
         self._device = device
+        self._last_frame_at = time.time()
         try:
             self.device_name = sd.query_devices(self._stream.device)["name"]
         except Exception:
             self.device_name = str(device or "default")
         log.info("microphone open: %s @ %d Hz", self.device_name, self._rate)
+
+    def _watchdog(self) -> None:
+        """No frames from the device for a while although the stream is 'open': Windows re-created the
+        endpoint or PortAudio silently stopped the stream. Re-open it (at most once per 5 s) and tell the UI."""
+        now = time.time()
+        if now - self._last_frame_at < 3.0:
+            return
+        if self.health == "ready":
+            self.health = "нет звука с микрофона"
+            self.on_health(self.health)
+            log.warning("microphone %s delivers no audio — reopening", self.device_name)
+        if now - self._last_reopen_at < 5.0:
+            return
+        self._last_reopen_at = now
+        try:
+            self.reopen(self._device)
+        except Exception as e:  # noqa: BLE001
+            log.warning("microphone reopen failed: %s", e)
 
     def reopen(self, device) -> None:
         """Switch to another input device (settings dropdown)."""
@@ -104,6 +163,7 @@ class Microphone:
         self.vad.reset()
 
     def _callback(self, indata, frames, time_info, status):  # noqa: ARG002
+        self._frames_seen += 1
         mono = indata[:, 0]
         if self._rate != SR:   # device opened at its native rate: resample to 16 kHz for the VAD/STT
             n_out = int(round(mono.size * SR / self._rate))
@@ -144,7 +204,13 @@ class Microphone:
             try:
                 frame = self._q.get(timeout=0.2)
             except queue.Empty:
+                self._watchdog()
                 continue
+            self._last_frame_at = time.time()
+            if self.health != "ready":
+                self.health = "ready"
+                self.on_health(self.health)
+                log.info("microphone delivers audio again")
             if frame.shape[0] != FRAME:
                 continue
             level = float(np.sqrt(np.mean(frame ** 2)))

@@ -120,7 +120,7 @@ class ClientCore:
             from .audio_in import Microphone
             self.mic = Microphone(on_utterance=self._on_utterance, on_speech_start=self._on_speech_start,
                                   is_agent_speaking=lambda: bool(self.speaker and self.speaker.is_speaking),
-                                  on_level=self._on_level, device=settings.MIC_DEVICE)
+                                  on_level=self._on_level, device=settings.MIC_DEVICE, on_health=self._on_mic_health)
             self.mic.set_enabled(self.state["auto_listen"] and self.stt is not None)
             self.status["mic"] = "ready"
         except Exception as e:  # noqa: BLE001
@@ -320,6 +320,11 @@ class ClientCore:
         if now - self._last_level_sent >= 0.1:
             self._last_level_sent = now
             self._post(self.broadcast, {"type": "mic", "level": round(min(1.0, level * 8), 3), "speech": speech})
+
+    def _on_mic_health(self, text: str) -> None:
+        # from the VAD thread: "ready" or a problem description, shown on the STT pill / settings
+        self.status["mic"] = text
+        self._post(self.broadcast_status)
 
     def _on_speech_start(self) -> None:
         # the VAD heard speech while the agent talks: stop talking right away (barge-in)
