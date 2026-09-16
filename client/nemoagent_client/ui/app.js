@@ -431,7 +431,15 @@
   for (const k of ['auto_listen', 'barge_in', 'tools_enabled']) $('s-' + k).onchange = (e) => pushSettings({ [k]: e.target.checked });
   $('s-tts_speed').oninput = (e) => { $('s-tts_speed-v').textContent = Number(e.target.value).toFixed(2); };
   $('s-tts_speed').onchange = (e) => pushSettings({ tts_speed: Number(e.target.value) });
-  $('btn-say').onclick = () => send({ type: 'say', text: 'Привет! Голос работает. Hello, the voice is working.' });
+  $('btn-say').onclick = () => {
+    // the test phrase follows the voice language: the Russian voice reads Russian, the English one English,
+    // "auto" reads both so you can hear the switch between them
+    const lang = $('s-tts_language').value || 'auto';
+    const text = lang === 'ru' ? 'Привет! Голос работает, всё в порядке.'
+      : lang === 'en' ? 'Hello! The voice is working, everything is fine.'
+        : 'Привет! Голос работает. Hello, the voice is working.';
+    send({ type: 'say', text });
+  };
 
   /* ---------------------------------------------------------------- composer */
   function renderAttachments() {
