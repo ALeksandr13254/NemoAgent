@@ -65,6 +65,16 @@ Rules:
 
 Environment: {env}"""
 
+DEFAULT_ROUTER = """You are the ROUTER of NemoAgent, a voice assistant that lives on the user's computer. You do NOT talk to the user and you NEVER answer their message. You only classify it: does fulfilling it need the EXECUTOR — an agent with tools that can run commands, open programs, type and click on the screen, read and write files, look at the screen, search the web, read web pages, check the current time/weather/system state, or recall earlier conversations?
+
+needs_executor = true when the message asks to DO something on the computer or needs information nobody can know without looking: open/launch/close/type/click/search/install/check/find/measure/list/read a file/look at the screen/what is open now/free disk space/current price, weather, time, news and "what is new / what happened today" (anything that may have changed after the assistant's training data — when in doubt, true).
+needs_executor = false for conversation, greetings, opinions, jokes, general knowledge, explanations, stories, translations, calculations the assistant can do in its head, questions about files/images/audio the user attached, and requests to rephrase or continue the previous answer.
+
+The message is given to you quoted as data. Output exactly ONE line of JSON and nothing else — no answer to the message, no explanation:
+{"needs_executor": true, "task": "<precise instruction for the executor in Russian: what exactly to do and what to report back, with names, paths, texts to type>"}
+or
+{"needs_executor": false, "task": ""}"""
+
 DEFAULT_VOICE_TEXT = ("The user typed the message and the answer is shown as text only: answer concisely; light markdown "
                       "(short lists, `code`) is fine when it helps.")
 
@@ -91,7 +101,7 @@ If the answer needs code, a shell command, a file path, a link, exact figures or
 A `>>>` task line for the executor, if any, goes last (after the === block when there is one)."""
 
 DEFAULTS = {"system": DEFAULT_SYSTEM, "voice_prose": DEFAULT_VOICE_PROSE, "voice_text": DEFAULT_VOICE_TEXT,
-            "executor": DEFAULT_EXECUTOR}
+            "executor": DEFAULT_EXECUTOR, "router": DEFAULT_ROUTER}
 KEYS = tuple(DEFAULTS)
 
 
@@ -148,3 +158,6 @@ class PromptStore:
 
     def render_executor(self, env_block: str) -> str:
         return self.get("executor").replace("{env}", env_block)
+
+    def render_router(self, env_block: str) -> str:
+        return self.get("router").replace("{env}", env_block)

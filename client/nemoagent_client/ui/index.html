@@ -65,6 +65,8 @@
         <textarea id="ed-voice_text" rows="3" spellcheck="false"></textarea></label>
       <label class="ed">Промпт внутреннего исполнителя (работает с инструментами, получает задачу от голосового агента) <span id="ov-executor" class="muted small"></span>
         <textarea id="ed-executor" rows="12" spellcheck="false"></textarea></label>
+      <label class="ed">Промпт маршрутизатора (быстрая модель параллельно с ответом решает, нужен ли исполнитель, и формулирует задачу — страховка на случай, если голосовой агент не поставил <code>&gt;&gt;&gt;</code>) <span id="ov-router" class="muted small"></span>
+        <textarea id="ed-router" rows="8" spellcheck="false"></textarea></label>
       <div class="row left">
         <button id="prompt-save" class="primary">Сохранить</button>
         <button id="prompt-reset">Сбросить к умолчанию</button>

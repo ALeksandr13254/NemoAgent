@@ -82,6 +82,7 @@
   });
   let logCount = 0;
   const logList = $('log-list');
+  const agentLabel = (a) => a === 'executor' ? '🛠 исполнитель' : a === 'router' ? '🧭 маршрутизатор' : '🗣 голосовой агент';
   function logEntry(cls, title, bodyHtml, open) {
     const d = document.createElement('details'); d.className = 'logent ' + cls; if (open) d.open = true;
     d.innerHTML = `<summary>${title}</summary>${bodyHtml}`; logList.appendChild(d);
@@ -103,11 +104,12 @@
     const t = new Date().toLocaleTimeString();
     if (m.kind === 'request') {
       const sys = (m.messages || []).find((x) => x.role === 'system');
-      if (sys) { $('prompt-text').textContent = sys.content; $('prompt-meta').textContent = `${t} · ход ${m.turn}, раунд ${m.round} · ${m.model} · инструменты: ${(m.tools || []).join(', ') || 'нет'} · ${JSON.stringify(m.params)}`; }
-      const who = m.agent === 'executor' ? '🛠 исполнитель' : '🗣 голосовой агент';
+      // the "last prompt" block follows the two agents; the router's parallel call is only in the log
+      if (sys && m.agent !== 'router') { $('prompt-text').textContent = sys.content; $('prompt-meta').textContent = `${t} · ход ${m.turn}, раунд ${m.round} · ${m.model} · инструменты: ${(m.tools || []).join(', ') || 'нет'} · ${JSON.stringify(m.params)}`; }
+      const who = agentLabel(m.agent);
       logEntry('req', `→ <b>запрос</b> ${t} · ${who}${m.stage ? ' / ' + esc(m.stage) : ''} · ход ${m.turn} · вызов ${m.round} · ${esc(m.model)} · сообщений: ${m.messages.length} · инструменты: ${esc((m.tools || []).join(', ') || 'нет')} · ${esc(JSON.stringify(m.params))}`, renderMessages(m.messages), false);
     } else if (m.kind === 'response') {
-      const who = m.agent === 'executor' ? '🛠 исполнитель' : '🗣 голосовой агент';
+      const who = agentLabel(m.agent);
       const tc = (m.tool_calls || []).map((c) => `${c.function?.name}(${c.function?.arguments})`).join('\n');
       const body = `<pre>${m.reasoning ? '🧠 reasoning:\n' + esc(m.reasoning) + '\n\n' : ''}${esc(m.content || '')}${tc ? '\n⚙ tool_calls:\n' + esc(tc) : ''}\n\nfinish_reason: ${esc(String(m.finish_reason))} · usage: ${esc(JSON.stringify(m.usage))} · ${m.ms} мс</pre>`;
       logEntry('res', `← <b>ответ</b> ${t} · ${who} · ход ${m.turn} · вызов ${m.round} · ${(m.content || '').length} симв. · ${(m.tool_calls || []).length} вызов. · ${m.ms} мс`, body, false);
@@ -117,7 +119,7 @@
   $('log-clear').onclick = () => { logList.innerHTML = ''; logCount = 0; $('log-count').textContent = ''; };
 
   /* ---------------------------------------------------------------- prompt editor */
-  const PROMPT_KEYS = ['system', 'voice_prose', 'voice_text', 'executor'];
+  const PROMPT_KEYS = ['system', 'voice_prose', 'voice_text', 'executor', 'router'];
   let promptState = null;
   function renderPrompts(p) {
     promptState = p;

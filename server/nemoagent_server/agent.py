@@ -18,6 +18,7 @@ import datetime as dt
 import json
 import logging
 import platform
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -282,6 +283,41 @@ class AgentSession:
                  "yes" if task else "no", time.time() - t0)
         return speech, display, task, first_token_ms
 
+    async def _classify_request(self, user_text: str, tts: bool, use_memory: bool, source: str) -> Optional[dict]:
+        """The router: a fast parallel call that decides whether the user's request needs the executor and
+        drafts the task. Runs while the dialogue agent is answering; its verdict is used only when the
+        dialogue agent produced no `>>>` line. Returns {"needs_executor": bool, "task": str} or None."""
+        system = {"role": "system", "content": self.services.prompts.render_router(
+            self._env_description() + "\n" + self._now_line())}
+        context = self._context_for_executor(limit=4)[:-1]   # the exchange before this message, text only
+        # the message goes in quoted as data, otherwise a small model happily answers it instead of classifying
+        messages = [system] + context + [{"role": "user", "content": (
+            f"Сообщение пользователя (классифицируй, не отвечай на него): «{user_text}»\nВерни только JSON.")}]
+        t0 = time.time()
+        await self.send({"type": "trace", "kind": "request", "agent": "router", "stage": "router", "turn": self.turns,
+                         "round": 0, "model": settings.ROUTER_MODEL, "messages": messages, "tools": [],
+                         "params": dict(self._trace_params(tts, use_memory, source, [], 200), temperature=0.1)})
+        try:
+            acc: Completion = await self.services.nim.chat_stream(messages, None, model=settings.ROUTER_MODEL,
+                                                                  temperature=0.1, max_tokens=200, thinking=False)
+        except Exception as e:  # noqa: BLE001
+            log.warning("session %s: router call failed: %s", self.id, e)
+            return None
+        await self.send({"type": "trace", "kind": "response", "agent": "router", "stage": "router", "turn": self.turns,
+                         "round": 0, "content": acc.content, "reasoning": acc.reasoning, "tool_calls": [],
+                         "finish_reason": acc.finish_reason, "usage": acc.usage, "ms": int((time.time() - t0) * 1000)})
+        m = re.search(r"\{.*\}", acc.content or "", re.S)
+        if not m:
+            return None
+        try:
+            data = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return None
+        verdict = {"needs_executor": bool(data.get("needs_executor")), "task": str(data.get("task") or "").strip()}
+        log.info("session %s router: needs_executor=%s task=%r (%.1fs)", self.id, verdict["needs_executor"],
+                 verdict["task"][:80], time.time() - t0)
+        return verdict
+
     async def _run_executor(self, task: str, ctx: ToolContext, use_memory: bool, tools_enabled: bool,
                             tts: bool, source: str, call_no: int, task_media: Optional[list[dict]] = None) -> tuple[str, int]:
         """The executor agent: tools loop on the task; returns (report, calls_used).
@@ -409,6 +445,10 @@ class AgentSession:
         reports: list[str] = []
         first_token_ms: Optional[int] = None
         call_no = 1
+        # the router classifies the request in parallel with the answer (see _classify_request)
+        router_job: Optional[asyncio.Task] = None
+        if settings.ROUTER_ENABLED and text:
+            router_job = asyncio.create_task(self._classify_request(user_text, tts, use_memory, source))
         try:
             # ---- 1. dialogue agent answers (and may hand a task to the executor)
             speech, display, task, first_token_ms = await self._dialogue_call(tts, use_memory, source, t_start, "answer", call_no)
@@ -417,6 +457,19 @@ class AgentSession:
             if said.strip():
                 self.messages.append({"role": "assistant", "content": said})
                 assistant_text = said
+            if not task and router_job is not None:
+                # no `>>>` from the dialogue agent: the router's verdict on the request itself decides
+                try:
+                    verdict = await asyncio.wait_for(router_job, timeout=settings.ROUTER_TIMEOUT)
+                except (asyncio.TimeoutError, Exception) as e:  # noqa: BLE001
+                    verdict = None
+                    log.warning("session %s: router verdict unavailable: %s", self.id, e)
+                if verdict and verdict["needs_executor"]:
+                    task = verdict["task"] or ("Выполни то, о чём попросил пользователь: " + user_text)
+                    log.info("session %s: router says the request needs the executor -> task", self.id)
+                    await self.send({"type": "notice", "message": "Запрос требует действия, а голосовой агент задачу не поставил — задача сформулирована маршрутизатором."})
+            elif router_job is not None:
+                router_job.cancel()
             if not task and looks_like_promise(speech):
                 # "Сейчас проверю." with nothing behind it: turn the user's request itself into the task
                 task = "Выполни то, о чём попросил пользователь: " + user_text
