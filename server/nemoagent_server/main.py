@@ -254,6 +254,30 @@ async def ws_endpoint(ws: WebSocket):
             elif t == "memory_clear":
                 removed = services.memory.clear()
                 await link.send({"type": "memory_stats", "memory": services.memory.count(), "removed": removed, "what": "clear"})
+            # ---- the client's memory tab: list / semantic search / add / edit / delete single records
+            elif t == "memory_list":
+                await link.send({"type": "memory_items", "items": services.memory.list_items(int(msg.get("limit") or 500), int(msg.get("offset") or 0)),
+                                 "total": sum(services.memory.count().values()), "query": ""})
+            elif t == "memory_search":
+                q = str(msg.get("query") or "").strip()
+                found = await services.memory.search(q, top_k=30, min_score=0.2) if q else []
+                await link.send({"type": "memory_items", "query": q, "total": sum(services.memory.count().values()),
+                                 "items": [{k: it.get(k) for k in ("id", "collection", "session_id", "kind", "text", "ts", "score")} for it in found]})
+            elif t == "memory_add":
+                mid = await services.memory.add_note(str(msg.get("text") or ""))
+                await link.send({"type": "memory_saved", "action": "add", "id": mid, "ok": mid is not None, "memory": services.memory.count()})
+            elif t == "memory_update":
+                try:
+                    ok = await services.memory.update_text(int(msg.get("id")), str(msg.get("text") or ""))
+                except (TypeError, ValueError):
+                    ok = False
+                await link.send({"type": "memory_saved", "action": "update", "id": msg.get("id"), "ok": ok, "memory": services.memory.count()})
+            elif t == "memory_delete":
+                try:
+                    n = services.memory.delete([int(msg.get("id"))])
+                except (TypeError, ValueError):
+                    n = 0
+                await link.send({"type": "memory_saved", "action": "delete", "id": msg.get("id"), "ok": n > 0, "memory": services.memory.count()})
             elif t == "get_prompts":
                 await link.send({"type": "prompts", **services.prompts.snapshot()})
             elif t == "set_prompts":

@@ -132,3 +132,15 @@ button.danger:hover { background: var(--err); color: #fff; }
 #hist-list { flex: 1; }
 .hist-foot { padding: 8px; border-top: 1px solid var(--border); }
 .hist-foot button { width: 100%; }
+
+/* ---- memory tab */
+#mem-search { flex: 1; min-width: 160px; background: #0b0d12; color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; font: inherit; }
+#mem-search:focus { outline: none; border-color: var(--accent); }
+#mem-list { display: flex; flex-direction: column; gap: 8px; padding: 4px 4px 16px; }
+.memitem { border: 1px solid var(--border); border-radius: 10px; background: var(--panel); padding: 8px 10px; }
+.memitem .mh { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.memitem textarea { display: block; width: 100%; background: #0b0d12; color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; resize: vertical; }
+.memitem textarea:focus { outline: none; border-color: var(--accent); }
+.memitem textarea.dirty { border-color: var(--warn); }
+.memitem .row.left { margin-top: 6px; }
+.memitem button:disabled { opacity: .5; cursor: default; }

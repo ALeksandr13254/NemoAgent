@@ -370,8 +370,9 @@ class ClientCore:
             self.server_info = {k: msg.get(k) for k in ("vision", "vision_error", "memory", "model", "models", "media_model", "default_model")}
             await self.broadcast_status()
             return
-        if t == "memory_stats":   # after forgetting a chat / pruning / clearing: new record count for the pill
-            self.server_info["memory"] = msg.get("memory")
+        if t in ("memory_stats", "memory_saved"):   # memory changed: new record count for the pill
+            if msg.get("memory") is not None:
+                self.server_info["memory"] = msg.get("memory")
             await self.broadcast(msg)
             await self.broadcast_status()
             return
@@ -710,6 +711,8 @@ class ClientCore:
                 await self._forget_chat(cid)
         elif t in ("memory_clear", "memory_prune"):
             await self.send_server({"type": t})
+        elif t in ("memory_list", "memory_search", "memory_add", "memory_update", "memory_delete"):
+            await self.send_server(msg)      # the server answers with memory_items / memory_saved, relayed to the UI
         elif t == "screenshot":
             res = await self.take_screenshot_attachment(msg.get("monitor"))
             await ws.send_text(json.dumps({"type": "attachment", "request_id": msg.get("request_id"), **res}, ensure_ascii=False))

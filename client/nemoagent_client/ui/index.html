@@ -39,7 +39,31 @@
     <button class="tab" data-tab="prompt">Системные промпты</button>
     <button class="tab" data-tab="log">Полные логи <span id="log-count" class="muted"></span></button>
     <button class="tab" data-tab="reader">Озвучка</button>
+    <button class="tab" data-tab="memory">Память</button>
   </nav>
+
+  <section id="memory" class="tabpane hidden">
+    <div class="editor">
+      <div class="panehead">
+        <b>Долговременная память</b>
+        <span class="muted small">Записи, которые сервер подмешивает в разговор при нажатой 🗂 и по которым ищет исполнитель. Текст можно править прямо здесь (эмбеддинг пересчитается), лишнее удалить, а нужное добавить руками: факт о вас, предпочтение, договорённость.</span>
+      </div>
+      <div class="row left">
+        <input id="mem-search" placeholder="поиск по смыслу: что искать в памяти…">
+        <button id="mem-search-btn">искать</button>
+        <button id="mem-all" class="link">показать все</button>
+        <span class="spacer"></span>
+        <span id="mem-total" class="muted small"></span>
+      </div>
+      <label class="ed">Новое воспоминание
+        <textarea id="mem-new" rows="3" placeholder="Например: Меня зовут Александр, видеокарта RTX 4070 Ti SUPER, отвечать кратко."></textarea></label>
+      <div class="row left">
+        <button id="mem-add" class="primary">Добавить</button>
+        <span id="mem-add-status" class="muted small"></span>
+      </div>
+    </div>
+    <div id="mem-list"></div>
+  </section>
 
   <section id="reader" class="tabpane hidden">
     <div class="editor reader">

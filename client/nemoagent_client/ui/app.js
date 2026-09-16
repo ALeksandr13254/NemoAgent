@@ -76,7 +76,8 @@
   /* ---------------------------------------------------------------- tabs, prompt & full log */
   document.querySelectorAll('nav.tabs .tab').forEach((b) => b.onclick = () => {
     document.querySelectorAll('nav.tabs .tab').forEach((x) => x.classList.toggle('active', x === b));
-    for (const id of ['chat', 'prompt', 'log', 'reader']) $(id).classList.toggle('hidden', id !== b.dataset.tab);
+    for (const id of ['chat', 'prompt', 'log', 'reader', 'memory']) $(id).classList.toggle('hidden', id !== b.dataset.tab);
+    if (b.dataset.tab === 'memory') memRefresh();
     document.querySelector('footer').classList.toggle('hidden', b.dataset.tab !== 'chat');
     $('attachments').classList.toggle('hidden', b.dataset.tab !== 'chat');
   });
@@ -148,6 +149,16 @@
         const total = m.memory ? Object.values(m.memory).reduce((a, b) => a + b, 0) : 0;
         const what = m.what === 'clear' ? 'память очищена' : m.what === 'prune' ? 'прибрано' : 'записи чата забыты';
         $('mem-status').textContent = `${what}: удалено ${m.removed}, осталось ${total}`;
+        if (!$('memory').classList.contains('hidden')) memRefresh();
+        break;
+      }
+      case 'memory_items': memRender(m); break;
+      case 'memory_saved': {
+        const label = m.action === 'add' ? (m.ok ? 'добавлено' : 'не добавлено (пустой текст?)') : m.action === 'update' ? (m.ok ? 'сохранено' : 'не сохранено') : (m.ok ? 'удалено' : 'не удалено');
+        if (m.action === 'add') { $('mem-add-status').textContent = label + ' ' + new Date().toLocaleTimeString(); if (m.ok) $('mem-new').value = ''; }
+        const item = m.id != null ? document.querySelector(`.memitem[data-id="${m.id}"]`) : null;
+        if (item && m.action === 'update') { item.querySelector('.st').textContent = label; item.querySelector('textarea').classList.remove('dirty'); item.querySelector('.save').disabled = true; }
+        if (m.action !== 'update') memRefresh();
         break;
       }
       case 'prompts': renderPrompts(m); break;
@@ -399,6 +410,34 @@
   };
   $('btn-stop').onclick = () => send({ type: 'interrupt' });
   $('btn-new').onclick = () => send({ type: 'new_session' });
+
+  /* ---------------------------------------------------------------- memory tab */
+  const memList = $('mem-list');
+  let memQuery = '';
+  function memRefresh() { if (memQuery) send({ type: 'memory_search', query: memQuery }); else send({ type: 'memory_list' }); }
+  const KIND_RU = { dialog: 'диалог', media: 'с картинками', note: 'заметка', analysis: 'анализ' };
+  function memRender(m) {
+    memList.innerHTML = '';
+    $('mem-total').textContent = m.query ? `найдено ${m.items.length} из ${m.total}` : `${m.total} записей`;
+    if (!m.items.length) { memList.innerHTML = `<div class="muted small" style="padding:8px 4px">${m.query ? 'ничего похожего' : 'память пуста'}</div>`; return; }
+    for (const it of m.items) {
+      const el = div('memitem'); el.dataset.id = it.id;
+      const when = new Date(it.ts * 1000).toLocaleString([], { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' });
+      const score = it.score != null ? ` · близость ${Number(it.score).toFixed(2)}` : '';
+      el.innerHTML = `<div class="mh"><span>#${it.id} · ${when} · ${KIND_RU[it.kind] || esc(it.kind || '')} · ${it.collection === 'vl' ? 'коллекция с картинками' : 'текстовая коллекция'}${score}</span><span class="spacer"></span><span class="st muted small"></span></div>
+        <textarea rows="3" spellcheck="false"></textarea>
+        <div class="row left"><button class="save" disabled>сохранить</button><button class="del link">удалить</button></div>`;
+      const ta = el.querySelector('textarea'); ta.value = it.text || ''; ta._orig = ta.value;
+      ta.addEventListener('input', () => { const d = ta.value !== ta._orig; ta.classList.toggle('dirty', d); el.querySelector('.save').disabled = !d; });
+      el.querySelector('.save').onclick = () => { el.querySelector('.st').textContent = 'сохраняю…'; ta._orig = ta.value; send({ type: 'memory_update', id: it.id, text: ta.value }); };
+      el.querySelector('.del').onclick = () => { if (confirm('Удалить эту запись из памяти?')) send({ type: 'memory_delete', id: it.id }); };
+      memList.appendChild(el);
+    }
+  }
+  $('mem-search-btn').onclick = () => { memQuery = $('mem-search').value.trim(); memRefresh(); };
+  $('mem-search').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('mem-search-btn').click(); } });
+  $('mem-all').onclick = () => { memQuery = ''; $('mem-search').value = ''; memRefresh(); };
+  $('mem-add').onclick = () => { const text = $('mem-new').value.trim(); if (!text) { $('mem-add-status').textContent = 'текст пустой'; return; } $('mem-add-status').textContent = 'добавляю…'; send({ type: 'memory_add', text }); };
 
   /* ---------------------------------------------------------------- chat history sidebar */
   const HIST_KEY = 'nemoagent-history-open';

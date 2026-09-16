@@ -244,6 +244,39 @@ class MemoryStore:
             seen.add(text)
         return self.delete(victims)
 
+    # ------------------------------------------------------------- editing (the client's memory tab)
+    def list_items(self, limit: int = 500, offset: int = 0) -> list[dict]:
+        rows = self._db.execute("SELECT id, collection, session_id, kind, text, ts FROM memories ORDER BY id DESC LIMIT ? OFFSET ?",
+                                (max(1, min(limit, 2000)), max(0, offset))).fetchall()
+        return [dict(zip(("id", "collection", "session_id", "kind", "text", "ts"), r)) for r in rows]
+
+    async def add_note(self, text: str) -> Optional[int]:
+        """A memory written by hand: a fact, a preference, an agreement. Searched like any dialog record."""
+        text = (text or "").strip()
+        if not text:
+            return None
+        vec = (await self.nim.embed(COLLECTION_MODEL["text"], [text[:6000]], "passage"))[0]
+        return self._insert("text", None, "note", text, {"manual": True}, [self._norm(vec)])
+
+    async def update_text(self, mid: int, text: str) -> bool:
+        """Replace a record's text and its text vector (a media record keeps its image vectors)."""
+        text = (text or "").strip()
+        row = self._db.execute("SELECT collection FROM memories WHERE id=?", (mid,)).fetchone()
+        if not row or not text:
+            return False
+        coll = row[0]
+        vec = self._norm((await self.nim.embed(COLLECTION_MODEL[coll], [text[:6000]], "passage"))[0]).astype(np.float32)
+        with self._lock:
+            self._db.execute("UPDATE memories SET text=? WHERE id=?", (text, mid))
+            first = self._db.execute("SELECT id FROM vectors WHERE memory_id=? ORDER BY id LIMIT 1", (mid,)).fetchone()
+            if first:   # the first vector of a record is always the text one
+                self._db.execute("UPDATE vectors SET dim=?, vec=? WHERE id=?", (int(vec.size), vec.tobytes(), first[0]))
+            else:
+                self._db.execute("INSERT INTO vectors(memory_id, collection, dim, vec) VALUES(?,?,?,?)", (mid, coll, int(vec.size), vec.tobytes()))
+            self._db.commit()
+        self._load()
+        return True
+
     def delete_sessions(self, session_ids: list[str]) -> int:
         """Forget everything remembered from the given server sessions (a chat deleted on the client)."""
         ids = [str(s) for s in session_ids if s]
