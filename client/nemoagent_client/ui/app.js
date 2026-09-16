@@ -139,8 +139,11 @@
       case 'status': {
         const wasConnected = state && state.server; state = m; renderStatus();
         if (m.server && (!wasConnected || !promptState)) send({ type: 'get_prompts' });
+        if (!wasConnected) send({ type: 'chats' });
         break;
       }
+      case 'chats': renderChats(m); break;
+      case 'chat_loaded': renderHistory(m.chat); break;
       case 'prompts': renderPrompts(m); break;
       case 'trace': handleTrace(m); break;
       case 'stage': current = null; reasoningCard = null; execCard = null; break;
@@ -389,6 +392,56 @@
   };
   $('btn-stop').onclick = () => send({ type: 'interrupt' });
   $('btn-new').onclick = () => send({ type: 'new_session' });
+
+  /* ---------------------------------------------------------------- chat history sidebar */
+  const HIST_KEY = 'nemoagent-history-open';
+  const histPane = $('history'), histList = $('hist-list');
+  let currentChatId = null;
+  try { if (localStorage.getItem(HIST_KEY) === '0') histPane.classList.add('hidden'); } catch (e) { /* ignore */ }
+  $('btn-history').onclick = () => {
+    histPane.classList.toggle('hidden');
+    try { localStorage.setItem(HIST_KEY, histPane.classList.contains('hidden') ? '0' : '1'); } catch (e) { /* ignore */ }
+  };
+  $('hist-new').onclick = () => send({ type: 'new_session' });
+  function fmtDate(ts) {
+    const d = new Date(ts * 1000), now = new Date();
+    const sameDay = d.toDateString() === now.toDateString();
+    return sameDay ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : d.toLocaleDateString([], { day: '2-digit', month: '2-digit' }) + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+  function renderChats(m) {
+    currentChatId = m.current || null;
+    const items = m.items || [];
+    histList.innerHTML = items.length ? '' : '<div id="hist-empty">Пока пусто: первый диалог появится здесь после первого сообщения.</div>';
+    for (const c of items) {
+      const el = div('hist-item' + (c.id === currentChatId ? ' active' : ''));
+      el.dataset.id = c.id;
+      el.innerHTML = `<div class="t">${esc(c.title)}</div><div class="d">${fmtDate(c.updated)} · ${c.count} сообщ.</div><button class="x" title="удалить чат">✕</button>`;
+      histList.appendChild(el);
+    }
+  }
+  histList.addEventListener('click', (e) => {
+    const x = e.target.closest('.x');
+    const item = e.target.closest('.hist-item'); if (!item) return;
+    if (x) { if (confirm('Удалить этот чат?')) send({ type: 'delete_chat', id: item.dataset.id }); return; }
+    if (item.dataset.id !== currentChatId) send({ type: 'open_chat', id: item.dataset.id });
+  });
+  function renderHistory(c) {
+    chat.innerHTML = ''; current = null; reasoningCard = null; execCard = null; waitingSince(null); $('stt-state').textContent = '';
+    for (const e of c.messages || []) {
+      if (e.role === 'user') {
+        const d = div('msg user'); d._text = e.text || '';
+        d.innerHTML = `<div class="src">${e.source === 'voice' ? '🎙 голос' : '⌨ текст'}${spkBtn(false, 'озвучить это сообщение')}</div>${fmt(e.text || '')}` + (e.attachments ? `<div class="src">📎 ${e.attachments} влож.</div>` : '');
+        add(d);
+      } else if (e.role === 'assistant') {
+        const d = div('msg assistant'); d._text = e.text || ''; d._spoken = e.spoken ? (e.text || '') : '';
+        d.innerHTML = spkBtn(!!e.spoken) + fmt(e.text || '') + (e.display ? `<div class="display">${fmt(e.display)}</div>` : '');
+        add(d);
+      } else if (e.role === 'task') card('task', '🎯 <b>задача исполнителю</b>', e.text || '', false);
+      else if (e.role === 'report') card('report', '📋 <b>отчёт исполнителя</b>', e.text || '', false);
+      else if (e.role === 'notice') add(div('notice', esc(e.text || '')));
+    }
+    document.querySelector('nav.tabs .tab[data-tab="chat"]').click();
+  }
   $('btn-listen').onclick = () => pushSettings({ auto_listen: !(state?.settings?.auto_listen) });
   $('btn-memory').onclick = () => pushSettings({ memory_recall: !(state?.settings?.memory_recall) });
 

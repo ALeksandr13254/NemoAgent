@@ -217,6 +217,18 @@ async def ws_endpoint(ws: WebSocket):
                 link.cancel_pending()
                 link.session.reset()
                 await link.send(_ready(link.session))
+            elif t == "load_session":
+                # the client reopens a chat from its history: the model gets the user/assistant turns back
+                await link.session.interrupt()
+                link.cancel_pending()
+                link.session.reset()
+                history = [{"role": m["role"], "content": str(m.get("content") or "")}
+                           for m in (msg.get("messages") or []) if isinstance(m, dict) and m.get("role") in ("user", "assistant")
+                           and str(m.get("content") or "").strip()]
+                link.session.messages = history[-200:]
+                link.session.turns = sum(1 for m in link.session.messages if m["role"] == "user")
+                log.info("session %s: chat restored, %d messages", link.session.id, len(link.session.messages))
+                await link.send(_ready(link.session))
             elif t == "client_info":
                 incoming = msg.get("client") or {}
                 old_gender = link.client_info.get("persona_gender")

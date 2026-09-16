@@ -110,3 +110,20 @@ aside#settings hr { border: none; border-top: 1px solid var(--border); margin: 4
 #reader-bar { height: 100%; width: 0; background: var(--accent); transition: width .2s linear; }
 #reader-now { margin-top: 6px; min-height: 18px; }
 .logent.error summary { border-left: 3px solid var(--err); }
+
+/* ---- chat history sidebar */
+#layout { display: flex; height: 100%; }
+#layout > #app { flex: 1; min-width: 0; }
+aside#history { width: 240px; flex: none; border-right: 1px solid var(--border); background: var(--panel); display: flex; flex-direction: column; overflow: hidden; }
+aside#history .panehead { padding: 10px 10px 6px; }
+#hist-list { overflow-y: auto; padding: 0 6px 10px; display: flex; flex-direction: column; gap: 4px; }
+.hist-item { position: relative; padding: 7px 26px 7px 10px; border-radius: 8px; cursor: pointer; border: 1px solid transparent; }
+.hist-item:hover { background: var(--panel2); }
+.hist-item.active { background: var(--panel2); border-color: var(--accent); }
+.hist-item .t { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hist-item .d { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.hist-item .x { position: absolute; right: 6px; top: 6px; background: none; border: none; color: var(--muted); padding: 0 4px; font-size: 12px; display: none; }
+.hist-item:hover .x { display: block; }
+.hist-item .x:hover { color: var(--err); }
+#hist-empty { color: var(--muted); font-size: 12px; padding: 8px 10px; }
+@media (max-width: 900px) { aside#history { position: fixed; left: 0; top: 0; bottom: 0; z-index: 30; box-shadow: 0 0 30px rgba(0,0,0,.5); } }

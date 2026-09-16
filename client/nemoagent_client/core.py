@@ -66,6 +66,9 @@ class ClientCore:
         self.turn_t0 = 0.0
         self.assistant_buffer = ""
         self.turn_active = False
+        self.chat: Optional[dict] = None       # current chat record (client/data/chats), created by the first message
+        self._asst_spoken = ""                  # spoken text of the dialogue agent's current stage
+        self._asst_display = ""                 # its screen-only part
         self.speech_mode = False        # the model answered through the `speak` tool this turn
         self.dictation = False          # read-aloud tab: recognised speech goes into its text, not to the agent
         self._dictate_once = False      # one push-to-talk phrase for the read-aloud tab
@@ -119,6 +122,107 @@ class ClientCore:
         settings.BARGE_IN = bool(self.state["barge_in"])
         settings.SPEAKER_DEVICE = str(self.state.get("speaker_device") or "") or None
         settings.MIC_DEVICE = str(self.state.get("mic_device") or "") or None
+
+    # ============================================================== chat history (client/data/chats/*.json)
+    CHATS_DIR = Path(__file__).resolve().parent.parent / "data" / "chats"
+
+    def _chat_start_new(self) -> None:
+        self.chat = None            # created lazily by the first message, so empty chats leave no files
+        self._asst_spoken = self._asst_display = ""
+
+    def _chat_record(self, entry: dict) -> None:
+        if self.chat is None:
+            self.chat = {"id": time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4], "title": "",
+                         "created": time.time(), "updated": time.time(), "messages": []}
+        entry["ts"] = time.time()
+        self.chat["messages"].append(entry)
+        if entry.get("role") == "user" and not self.chat["title"]:
+            self.chat["title"] = (entry.get("text") or "(вложение)").strip().replace("\n", " ")[:60]
+        self.chat["updated"] = time.time()
+        self._chat_save()
+        if self.loop:
+            asyncio.ensure_future(self._chat_broadcast_list())
+
+    def _chat_flush_assistant(self) -> None:
+        """One dialogue-agent stage (answer or report) becomes one assistant entry."""
+        spoken = self._asst_spoken.strip()
+        buf = self.assistant_buffer.strip()
+        if spoken:
+            text, display = spoken, (self._asst_display.strip() or buf)
+        else:
+            text, display = buf, ""
+        if text or display:
+            self._chat_record({"role": "assistant", "text": text or display, "display": display if text else "", "spoken": bool(spoken)})
+        self._asst_spoken = self._asst_display = ""
+        self.assistant_buffer = ""
+
+    def _chat_save(self) -> None:
+        if not self.chat or not self.chat["messages"]:
+            return
+        try:
+            self.CHATS_DIR.mkdir(parents=True, exist_ok=True)
+            (self.CHATS_DIR / f"{self.chat['id']}.json").write_text(json.dumps(self.chat, ensure_ascii=False, indent=1), "utf-8")
+        except Exception as e:  # noqa: BLE001
+            log.warning("cannot save chat: %s", e)
+
+    @staticmethod
+    def _chat_path_ok(cid: str) -> bool:
+        return bool(cid) and all(ch.isalnum() or ch == "-" for ch in cid)
+
+    def chat_list(self) -> list[dict]:
+        items = []
+        for p in self.CHATS_DIR.glob("*.json") if self.CHATS_DIR.exists() else []:
+            try:
+                d = json.loads(p.read_text("utf-8"))
+                items.append({"id": d["id"], "title": d.get("title") or "(без названия)", "updated": d.get("updated", 0),
+                              "count": sum(1 for m in d.get("messages", []) if m.get("role") in ("user", "assistant"))})
+            except Exception:  # noqa: BLE001
+                continue
+        items.sort(key=lambda x: -x["updated"])
+        return items
+
+    def chat_load(self, cid: str) -> Optional[dict]:
+        if not self._chat_path_ok(cid):
+            return None
+        try:
+            return json.loads((self.CHATS_DIR / f"{cid}.json").read_text("utf-8"))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def chat_delete(self, cid: str) -> bool:
+        if not self._chat_path_ok(cid):
+            return False
+        try:
+            (self.CHATS_DIR / f"{cid}.json").unlink()
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _chat_broadcast_list(self) -> None:
+        await self.broadcast({"type": "chats", "items": self.chat_list(), "current": self.chat["id"] if self.chat else None})
+
+    async def open_chat(self, ws, cid: str) -> None:
+        chat = self.chat_load(cid)
+        if not chat:
+            await ws.send_text(json.dumps({"type": "error", "message": "чат не найден"}, ensure_ascii=False))
+            return
+        await self.interrupt("open chat")
+        self._chat_flush_assistant()
+        self.chat = chat
+        self.assistant_buffer = ""
+        self._asst_spoken = self._asst_display = ""
+        # the model gets the user/assistant turns back (text only; media of old turns is gone anyway)
+        history = []
+        for m in chat.get("messages", []):
+            if m.get("role") == "user" and (m.get("text") or "").strip():
+                history.append({"role": "user", "content": m["text"]})
+            elif m.get("role") == "assistant":
+                content = (m.get("text") or "") + (("\n" + m["display"]) if m.get("display") else "")
+                if content.strip():
+                    history.append({"role": "assistant", "content": content})
+        await self.send_server({"type": "load_session", "messages": history})
+        await self.broadcast({"type": "chat_loaded", "chat": chat})
+        await self._chat_broadcast_list()
 
     # ============================================================== lifecycle
     async def run(self) -> None:
@@ -269,6 +373,7 @@ class ClientCore:
             return
         if t == "speech_delta":
             piece = msg.get("content") or ""
+            self._asst_spoken += piece
             if not self.speech_mode:
                 self.speech_mode = True
                 if self.speaker:
@@ -278,6 +383,8 @@ class ClientCore:
             await self.broadcast(msg)
             return
         if t == "speech_done":
+            if msg.get("display"):
+                self._asst_display = msg["display"]
             if self.speaker:
                 self.speaker.end()
             await self.broadcast(msg)
@@ -289,10 +396,23 @@ class ClientCore:
                 self.speaker.say(self.assistant_buffer)     # last-resort fallback: raw text, cleaned locally
             msg = dict(msg, total_ms=int((time.time() - self.turn_t0) * 1000) if self.turn_t0 else None)
             await self.broadcast(msg)
+            self._chat_flush_assistant()
+            if msg.get("finish_reason") == "interrupted":
+                self._chat_record({"role": "notice", "text": "прервано"})
             return
         if t == "client_tool":
             asyncio.ensure_future(self._handle_client_tool(msg.get("call_id"), msg.get("name"), msg.get("arguments") or {}))
             return
+        # everything below is also written into the chat history
+        if t == "stage":
+            self._chat_flush_assistant()
+        elif t == "task":
+            self._chat_flush_assistant()
+            self._chat_record({"role": "task", "text": msg.get("task") or ""})
+        elif t == "report":
+            self._chat_record({"role": "report", "text": msg.get("report") or ""})
+        elif t in ("notice", "error"):
+            self._chat_record({"role": "notice", "text": msg.get("message") or ""})
         await self.broadcast(msg)
 
     def _speak_enabled(self) -> bool:
@@ -353,6 +473,8 @@ class ClientCore:
         tts = self._speak_enabled()
         memory = bool(self.state.get("memory_recall"))
         await self.broadcast({"type": "user_message", "text": text, "attachments": attachments, "source": source, "memory": memory})
+        self._asst_spoken = self._asst_display = ""
+        self._chat_record({"role": "user", "text": text, "source": source, "attachments": len(attachments)})
         ok = await self.send_server({"type": "user_message", "text": text, "attachments": attachments,
                                      "source": source, "tts": tts, "memory": memory})
         if not ok:
@@ -532,6 +654,7 @@ class ClientCore:
                 "speaker": getattr(self.player, "device_name", None), "output_devices": devices,
                 "microphone": getattr(self.mic, "device_name", None), "input_devices": inputs,
                 "listening": bool(self.mic and self.mic.enabled), "dictation": self.dictation, "settings": self.state,
+                "chat_id": self.chat["id"] if self.chat else None,
                 "voices": {"ru": ["ru_f1", "ru_m5", "ru_f2", "ru_m1"],
                            "en": ["eng_f3", "eng_f5", "eng_m3", "eng_m4", "eng_f4_whisper", "eng_m2_whisper"]}}
 
@@ -548,8 +671,22 @@ class ClientCore:
             if self.speaker:
                 self.speaker.cancel()
             self.turn_active = False
+            self._chat_flush_assistant()
+            self._chat_start_new()
             await self.send_server({"type": "new_session"})
             await self.broadcast({"type": "cleared"})
+            await self._chat_broadcast_list()
+        elif t == "chats":
+            await self._chat_broadcast_list()
+        elif t == "open_chat":
+            await self.open_chat(ws, str(msg.get("id") or ""))
+        elif t == "delete_chat":
+            cid = str(msg.get("id") or "")
+            if self.chat_delete(cid) and self.chat and self.chat["id"] == cid:
+                self._chat_start_new()
+                await self.send_server({"type": "new_session"})
+                await self.broadcast({"type": "cleared"})
+            await self._chat_broadcast_list()
         elif t == "screenshot":
             res = await self.take_screenshot_attachment(msg.get("monitor"))
             await ws.send_text(json.dumps({"type": "attachment", "request_id": msg.get("request_id"), **res}, ensure_ascii=False))
