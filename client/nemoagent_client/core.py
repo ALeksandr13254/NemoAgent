@@ -46,7 +46,10 @@ class ClientCore:
             "tools_enabled": settings.TOOLS_ENABLED,
             "confirm": settings.TOOL_CONFIRM,
             "tts_language": settings.TTS_LANGUAGE,   # auto | ru | en: voice for Latin words and numbers
-            "text_model": settings.TEXT_MODEL,       # text model asked from the server ("" = server default)
+            "model_dialogue": settings.MODEL_DIALOGUE,   # models per role, asked from the server
+            "model_executor": settings.MODEL_EXECUTOR,
+            "model_router": settings.MODEL_ROUTER,
+            "model_media": settings.MODEL_MEDIA,
             "voice_ru": settings.TTS_VOICE_RU,
             "voice_en": settings.TTS_VOICE_EN,
             "tts_speed": settings.TTS_SPEED,
@@ -74,7 +77,13 @@ class ClientCore:
 
     # ============================================================== settings persistence
     PERSIST_KEYS = ("tts_mode", "auto_listen", "barge_in", "tools_enabled", "confirm", "voice_ru", "voice_en", "tts_speed",
-                    "stt_language", "tts_language", "text_model", "speaker_device", "mic_device")
+                    "stt_language", "tts_language", "model_dialogue", "model_executor", "model_router", "model_media",
+                    "speaker_device", "mic_device")
+    MODEL_KEYS = ("model_dialogue", "model_executor", "model_router", "model_media")
+
+    def _models(self) -> dict:
+        """{role: model id} for the server, only the roles that are set."""
+        return {k.removeprefix("model_"): str(self.state.get(k) or "") for k in self.MODEL_KEYS if self.state.get(k)}
 
     def _load_state(self) -> None:
         try:
@@ -83,6 +92,8 @@ class ClientCore:
                 for k in self.PERSIST_KEYS:
                     if k in saved:
                         self.state[k] = saved[k]
+                if saved.get("text_model") and "model_dialogue" not in saved:   # settings written by an older client
+                    self.state["model_dialogue"] = self.state["model_executor"] = saved["text_model"]
                 log.info("settings restored from %s", self._settings_path)
         except Exception as e:  # noqa: BLE001
             log.warning("cannot read %s: %s", self._settings_path, e)
@@ -217,8 +228,7 @@ class ClientCore:
         info = executor.client_description()
         info["tools_enabled"] = self.state["tools_enabled"]
         info["persona_gender"] = self._persona_gender()
-        if self.state.get("text_model"):
-            info["text_model"] = self.state["text_model"]
+        info["models"] = self._models()
         return info
 
     async def send_server(self, msg: dict) -> bool:
@@ -237,11 +247,12 @@ class ClientCore:
         t = msg.get("type")
         if t == "ready":
             self.session_id = msg.get("session_id")
-            self.server_info = {k: msg.get(k) for k in ("vision", "vision_error", "memory", "model", "media_model", "default_model")}
+            self.server_info = {k: msg.get(k) for k in ("vision", "vision_error", "memory", "model", "models", "media_model", "default_model")}
             await self.broadcast_status()
             return
-        if t == "model":   # the server confirmed the text model chosen in the settings
+        if t == "model":   # the server confirmed the models chosen in the settings
             self.server_info["model"] = msg.get("model")
+            self.server_info["models"] = msg.get("models") or self.server_info.get("models")
             await self.broadcast_status()
             return
         if t == "delta":
@@ -571,11 +582,11 @@ class ClientCore:
 
     async def _apply_settings(self, s: dict) -> None:
         for key in ("tts_mode", "auto_listen", "barge_in", "tools_enabled", "confirm", "voice_ru", "voice_en", "tts_speed",
-                    "stt_language", "tts_language", "text_model", "memory_recall"):
+                    "stt_language", "tts_language", "memory_recall", *self.MODEL_KEYS):
             if key in s:
                 self.state[key] = s[key]
-        if "text_model" in s and self.server_ws:
-            await self.send_server({"type": "client_info", "client": {"text_model": str(s["text_model"] or "")}})
+        if any(k in s for k in self.MODEL_KEYS) and self.server_ws:
+            await self.send_server({"type": "client_info", "client": {"models": self._models()}})
         if any(k in s for k in ("voice_ru", "voice_en", "tts_language")) and self.server_ws:
             self._sync_runtime_settings()
             await self.send_server({"type": "client_info", "client": {"persona_gender": self._persona_gender()}})

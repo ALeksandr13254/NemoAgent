@@ -52,14 +52,16 @@ class Settings:
     # Two models: the fast text model answers every request that carries no media (first token ~1 s,
     # no queue), the omni model takes over automatically when a request contains images / audio / video
     # (attachments, screenshots) — its free pool is small and often overloaded (503 "16/16").
-    LLM_MODEL = _env("LLM_MODEL", "nvidia/nemotron-3.5-lightning-30b-a3b")
+    # Server-side defaults per role; the client can override every role from its settings panel
+    # (client_info["models"] = {dialogue, executor, router, media}).
+    LLM_MODEL = _env("LLM_MODEL", "nvidia/nemotron-3-super-120b-a12b")          # dialogue + executor (text)
     LLM_MEDIA_MODEL = _env("LLM_MEDIA_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning")
     LLM_THINKING = _bool("LLM_THINKING", False)     # the model reasons by default; off saves seconds per answer
     LLM_TEMPERATURE = _float("LLM_TEMPERATURE", 0.3)  # model card: 0.2 without reasoning, 0.6 with it
     # Router: a fast parallel call that classifies the user's request (needs the executor or not) and drafts
     # the task, so an action is carried out even when the dialogue agent forgets its `>>>` line.
     ROUTER_ENABLED = _bool("ROUTER_ENABLED", True)
-    ROUTER_MODEL = _env("ROUTER_MODEL", "nvidia/nemotron-3.5-lightning-30b-a3b")
+    ROUTER_MODEL = _env("ROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b")
     ROUTER_TIMEOUT = _float("ROUTER_TIMEOUT", 4.0)             # seconds to wait for its verdict after the answer
     LLM_MAX_TOKENS = _int("LLM_MAX_TOKENS", 4096)            # executor rounds (write_file content can be long)
     DIALOGUE_MAX_TOKENS = _int("DIALOGUE_MAX_TOKENS", 1200)   # spoken answer + screen part; bounds a runaway to ~30 s

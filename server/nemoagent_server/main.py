@@ -90,8 +90,8 @@ def _check_token(authorization: Optional[str]) -> None:
 
 def _ready(session: AgentSession) -> dict:
     return {"type": "ready", "session_id": session.id, "vision": True, "modalities": ["text", "image", "audio", "video"],
-            "memory": services.memory.count(), "model": session.text_model, "media_model": settings.LLM_MEDIA_MODEL,
-            "default_model": settings.LLM_MODEL}
+            "memory": services.memory.count(), "model": session.text_model, "models": session.models,
+            "media_model": session.model_for_role("media"), "default_model": settings.LLM_MODEL}
 
 
 @app.get("/health")
@@ -229,9 +229,10 @@ async def ws_endpoint(ws: WebSocket):
                         "Голос ассистента переключён на " + ("мужской" if new_gender == "male" else "женский") +
                         ": с этого момента говори о себе в " + ("мужском" if new_gender == "male" else "женском") +
                         " роде, даже если раньше в разговоре было иначе.")})
-                if "text_model" in (msg.get("client") or {}):
-                    log.info("session %s: text model -> %s", link.session.id, link.session.text_model)
-                    await link.send({"type": "model", "model": link.session.text_model, "media_model": settings.LLM_MEDIA_MODEL})
+                if "text_model" in incoming or "models" in incoming:
+                    log.info("session %s: models -> %s", link.session.id, {k: v.split("/")[-1] for k, v in link.session.models.items()})
+                    await link.send({"type": "model", "model": link.session.text_model, "models": link.session.models,
+                                     "media_model": link.session.model_for_role("media")})
             elif t == "get_prompts":
                 await link.send({"type": "prompts", **services.prompts.snapshot()})
             elif t == "set_prompts":

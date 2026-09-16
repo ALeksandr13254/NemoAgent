@@ -116,10 +116,28 @@
 
   <aside id="settings" class="hidden">
     <h3>Настройки</h3>
-    <label>Модель для текста
-      <select id="s-text_model" title="Какая модель ведёт диалог и выполняет задачи без картинок/аудио/видео. Медиа всегда идут в Nano Omni">
-        <option value="nvidia/nemotron-3.5-lightning-30b-a3b">Nemotron 3.5 Lightning 30B — быстрая</option>
-        <option value="nvidia/nemotron-3-super-120b-a12b">Nemotron 3 Super 120B — умнее, медленнее</option>
+    <div class="muted small">Модели по ролям</div>
+    <label>Голосовой агент
+      <select id="s-model_dialogue" title="Отвечает вам и ставит задачи исполнителю. Текстовая роль: любой запрос с картинкой, аудио или видео всё равно уйдёт в медиа-модель">
+        <option value="nvidia/nemotron-3-super-120b-a12b">Nemotron 3 Super 120B</option>
+        <option value="nvidia/nemotron-3.5-lightning-30b-a3b">Nemotron 3.5 Lightning 30B — быстрее, проще</option>
+      </select>
+    </label>
+    <label>Исполнитель
+      <select id="s-model_executor" title="Выполняет задачи инструментами. Раунды со скриншотом или вложением уходят в медиа-модель">
+        <option value="nvidia/nemotron-3-super-120b-a12b">Nemotron 3 Super 120B</option>
+        <option value="nvidia/nemotron-3.5-lightning-30b-a3b">Nemotron 3.5 Lightning 30B — быстрее, проще</option>
+      </select>
+    </label>
+    <label>Маршрутизатор
+      <select id="s-model_router" title="Параллельно с ответом решает, нужен ли исполнитель, и формулирует задачу">
+        <option value="nvidia/nemotron-3-super-120b-a12b">Nemotron 3 Super 120B</option>
+        <option value="nvidia/nemotron-3.5-lightning-30b-a3b">Nemotron 3.5 Lightning 30B — быстрее, проще</option>
+      </select>
+    </label>
+    <label>Медиа (картинки, аудио, видео)
+      <select id="s-model_media" title="Берёт любой вызов, в котором есть картинка, аудио, видео или скриншот. Нужна мультимодальная модель — на бесплатном пуле это Nano Omni">
+        <option value="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning">Nemotron 3 Nano Omni 30B</option>
       </select>
     </label>
     <hr>

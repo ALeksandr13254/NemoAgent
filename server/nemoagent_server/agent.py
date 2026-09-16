@@ -214,17 +214,35 @@ class AgentSession:
                 "thinking": settings.LLM_THINKING, "tool_choice": "auto" if tools else None,
                 "tts": tts, "memory": use_memory, "source": source}
 
+    ROLES = ("dialogue", "executor", "router", "media")
+
+    def model_for_role(self, role: str) -> str:
+        """The client picks a model per role in its settings (client_info["models"]); otherwise the server defaults."""
+        models = self.client_info.get("models") or {}
+        chosen = str(models.get(role) or "").strip()
+        if not chosen and role in ("dialogue", "executor"):
+            chosen = str(self.client_info.get("text_model") or "").strip()   # older clients: one text model
+        if chosen:
+            return chosen
+        if role == "media":
+            return settings.LLM_MEDIA_MODEL
+        if role == "router":
+            return settings.ROUTER_MODEL
+        return settings.LLM_MODEL
+
+    @property
+    def models(self) -> dict:
+        return {role: self.model_for_role(role) for role in self.ROLES}
+
     @property
     def text_model(self) -> str:
-        """The client may pick the text model in its settings (Lightning vs Super); otherwise the server default."""
-        chosen = str(self.client_info.get("text_model") or "").strip()
-        return chosen or settings.LLM_MODEL
+        return self.model_for_role("dialogue")
 
-    def _model_for(self, messages: list[dict]) -> str:
-        """The text model unless the request carries images / audio / video — then the omni model."""
+    def _model_for(self, messages: list[dict], role: str = "dialogue") -> str:
+        """The role's model unless the request carries images / audio / video — then the media (omni) model."""
         if any(media.has_media(m.get("content")) for m in messages):
-            return settings.LLM_MEDIA_MODEL
-        return self.text_model
+            return self.model_for_role("media")
+        return self.model_for_role(role)
 
     async def _dialogue_call(self, tts: bool, use_memory: bool, source: str, t_start: float, stage: str,
                              call_no: int) -> tuple[str, Optional[str], Optional[str], Optional[int]]:
@@ -294,11 +312,12 @@ class AgentSession:
         messages = [system] + context + [{"role": "user", "content": (
             f"Сообщение пользователя (классифицируй, не отвечай на него): «{user_text}»\nВерни только JSON.")}]
         t0 = time.time()
+        model = self.model_for_role("router")
         await self.send({"type": "trace", "kind": "request", "agent": "router", "stage": "router", "turn": self.turns,
-                         "round": 0, "model": settings.ROUTER_MODEL, "messages": messages, "tools": [],
+                         "round": 0, "model": model, "messages": messages, "tools": [],
                          "params": dict(self._trace_params(tts, use_memory, source, [], 200), temperature=0.1)})
         try:
-            acc: Completion = await self.services.nim.chat_stream(messages, None, model=settings.ROUTER_MODEL,
+            acc: Completion = await self.services.nim.chat_stream(messages, None, model=model,
                                                                   temperature=0.1, max_tokens=200, thinking=False)
         except Exception as e:  # noqa: BLE001
             log.warning("session %s: router call failed: %s", self.id, e)
@@ -348,7 +367,7 @@ class AgentSession:
             # behind `required` stalled for 90 s twice on the free pool); if it answers without calling any
             # tool, the round is repeated once with `required`, so the result cannot simply be made up.
             choice = "required" if (tools_used == 0 and schemas and force_tools) else "auto"
-            model = self._model_for(messages)   # switches to the omni model once a screenshot / attachment is in the loop
+            model = self._model_for(messages, "executor")   # switches to the media model once a screenshot / attachment is in the loop
             await self.send({"type": "trace", "kind": "request", "agent": "executor", "stage": "executor", "turn": self.turns,
                              "round": call_no + round_no - 1, "model": model, "messages": media.redact(messages),
                              "tools": [s["function"]["name"] for s in schemas],
