@@ -136,6 +136,8 @@ class ClientCore:
                          "created": time.time(), "updated": time.time(), "messages": []}
         entry["ts"] = time.time()
         self.chat["messages"].append(entry)
+        if self.session_id and self.session_id not in self.chat.setdefault("sessions", []):
+            self.chat["sessions"].append(self.session_id)   # server sessions this chat lived in (for forgetting it)
         if entry.get("role") == "user" and not self.chat["title"]:
             self.chat["title"] = (entry.get("text") or "(вложение)").strip().replace("\n", " ")[:60]
         self.chat["updated"] = time.time()
@@ -197,6 +199,20 @@ class ClientCore:
             return True
         except Exception:  # noqa: BLE001
             return False
+
+    async def _forget_chat(self, cid: str) -> None:
+        """Delete a chat file and ask the server to drop what its sessions left in long-term memory."""
+        chat = self.chat_load(cid)
+        sessions = list((chat or {}).get("sessions") or [])
+        if self.chat and self.chat["id"] == cid:
+            sessions = sorted(set(sessions + list(self.chat.get("sessions") or [])))
+            self._chat_start_new()
+            await self.send_server({"type": "new_session"})
+            await self.broadcast({"type": "cleared"})
+        self.chat_delete(cid)
+        if sessions:
+            await self.send_server({"type": "forget_sessions", "ids": sessions})
+        await self._chat_broadcast_list()
 
     async def _chat_broadcast_list(self) -> None:
         await self.broadcast({"type": "chats", "items": self.chat_list(), "current": self.chat["id"] if self.chat else None})
@@ -352,6 +368,11 @@ class ClientCore:
         if t == "ready":
             self.session_id = msg.get("session_id")
             self.server_info = {k: msg.get(k) for k in ("vision", "vision_error", "memory", "model", "models", "media_model", "default_model")}
+            await self.broadcast_status()
+            return
+        if t == "memory_stats":   # after forgetting a chat / pruning / clearing: new record count for the pill
+            self.server_info["memory"] = msg.get("memory")
+            await self.broadcast(msg)
             await self.broadcast_status()
             return
         if t == "model":   # the server confirmed the models chosen in the settings
@@ -680,13 +701,15 @@ class ClientCore:
             await self._chat_broadcast_list()
         elif t == "open_chat":
             await self.open_chat(ws, str(msg.get("id") or ""))
-        elif t == "delete_chat":
-            cid = str(msg.get("id") or "")
-            if self.chat_delete(cid) and self.chat and self.chat["id"] == cid:
-                self._chat_start_new()
+        elif t in ("delete_chat", "clear_chat"):
+            cid = str(msg.get("id") or "") if t == "delete_chat" else (self.chat["id"] if self.chat else "")
+            if t == "clear_chat" and not self.chat:
                 await self.send_server({"type": "new_session"})
                 await self.broadcast({"type": "cleared"})
-            await self._chat_broadcast_list()
+            else:
+                await self._forget_chat(cid)
+        elif t in ("memory_clear", "memory_prune"):
+            await self.send_server({"type": t})
         elif t == "screenshot":
             res = await self.take_screenshot_attachment(msg.get("monitor"))
             await ws.send_text(json.dumps({"type": "attachment", "request_id": msg.get("request_id"), **res}, ensure_ascii=False))

@@ -13,6 +13,7 @@
     <b>Чаты</b>
     <span class="spacer"></span>
     <button id="hist-new" class="link" title="Начать новый диалог">+ новый</button>
+    <button id="hist-clear" class="link" title="Очистить текущий чат: убрать его из списка и стереть его записи из долговременной памяти">очистить</button>
   </div>
   <div id="hist-list"></div>
 </aside>
@@ -188,6 +189,13 @@
         <option value="never">никогда</option>
       </select>
     </label>
+    <hr>
+    <div class="muted small">Долговременная память: <span id="mem-count">—</span></div>
+    <div class="row left">
+      <button id="mem-prune" title="Удалить пустяковые и повторяющиеся записи">прибраться в памяти</button>
+      <button id="mem-clear" class="danger" title="Стереть всю долговременную память сервера (необратимо)">очистить память</button>
+    </div>
+    <div id="mem-status" class="muted small"></div>
     <hr>
     <button id="btn-say" class="link">проверить голос</button>
     <div id="settings-status" class="muted small"></div>

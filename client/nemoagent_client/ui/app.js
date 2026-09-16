@@ -144,6 +144,12 @@
       }
       case 'chats': renderChats(m); break;
       case 'chat_loaded': renderHistory(m.chat); break;
+      case 'memory_stats': {
+        const total = m.memory ? Object.values(m.memory).reduce((a, b) => a + b, 0) : 0;
+        const what = m.what === 'clear' ? 'память очищена' : m.what === 'prune' ? 'прибрано' : 'записи чата забыты';
+        $('mem-status').textContent = `${what}: удалено ${m.removed}, осталось ${total}`;
+        break;
+      }
       case 'prompts': renderPrompts(m); break;
       case 'trace': handleTrace(m); break;
       case 'stage': current = null; reasoningCard = null; execCard = null; break;
@@ -303,6 +309,7 @@
     setPill('pill-vision', si.vision ? 'ok' : 'warn', si.vision ? 'omni' : 'omni off');
     const mem = si.memory ? Object.values(si.memory).reduce((a, b) => a + b, 0) : 0;
     setPill('pill-memory', 'ok', `память ${mem}`);
+    $('mem-count').textContent = si.memory ? `${mem} записей (текст ${si.memory.text || 0}, с картинками ${si.memory.vl || 0})` : '—';
     $('model').textContent = si.model ? '· ' + si.model.split('/').pop() : '';
     $('btn-listen').classList.toggle('active', !!state.listening);
     readerDictation(!!state.dictation);
@@ -403,6 +410,9 @@
     try { localStorage.setItem(HIST_KEY, histPane.classList.contains('hidden') ? '0' : '1'); } catch (e) { /* ignore */ }
   };
   $('hist-new').onclick = () => send({ type: 'new_session' });
+  $('hist-clear').onclick = () => { if (confirm('Очистить текущий чат? Он исчезнет из списка, а его записи будут стёрты из долговременной памяти.')) send({ type: 'clear_chat' }); };
+  $('mem-prune').onclick = () => { $('mem-status').textContent = 'прибираюсь…'; send({ type: 'memory_prune' }); };
+  $('mem-clear').onclick = () => { if (confirm('Стереть ВСЮ долговременную память сервера? Это необратимо.')) { $('mem-status').textContent = 'очищаю…'; send({ type: 'memory_clear' }); } };
   function fmtDate(ts) {
     const d = new Date(ts * 1000), now = new Date();
     const sameDay = d.toDateString() === now.toDateString();
@@ -422,7 +432,7 @@
   histList.addEventListener('click', (e) => {
     const x = e.target.closest('.x');
     const item = e.target.closest('.hist-item'); if (!item) return;
-    if (x) { if (confirm('Удалить этот чат?')) send({ type: 'delete_chat', id: item.dataset.id }); return; }
+    if (x) { if (confirm('Удалить этот чат? Его записи будут стёрты и из долговременной памяти.')) send({ type: 'delete_chat', id: item.dataset.id }); return; }
     if (item.dataset.id !== currentChatId) send({ type: 'open_chat', id: item.dataset.id });
   });
   function renderHistory(c) {

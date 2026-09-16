@@ -127,3 +127,5 @@ aside#history .panehead { padding: 10px 10px 6px; }
 .hist-item .x:hover { color: var(--err); }
 #hist-empty { color: var(--muted); font-size: 12px; padding: 8px 10px; }
 @media (max-width: 900px) { aside#history { position: fixed; left: 0; top: 0; bottom: 0; z-index: 30; box-shadow: 0 0 30px rgba(0,0,0,.5); } }
+button.danger { border-color: var(--err); color: var(--err); }
+button.danger:hover { background: var(--err); color: #fff; }

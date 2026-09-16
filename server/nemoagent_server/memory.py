@@ -244,6 +244,16 @@ class MemoryStore:
             seen.add(text)
         return self.delete(victims)
 
+    def delete_sessions(self, session_ids: list[str]) -> int:
+        """Forget everything remembered from the given server sessions (a chat deleted on the client)."""
+        ids = [str(s) for s in session_ids if s]
+        if not ids:
+            return 0
+        with self._lock:
+            ph = ",".join("?" * len(ids))
+            rows = [r[0] for r in self._db.execute(f"SELECT id FROM memories WHERE session_id IN ({ph})", ids).fetchall()]
+        return self.delete(rows)
+
     def clear(self) -> int:
         with self._lock:
             n = self._db.execute("SELECT COUNT(*) FROM memories").fetchone()[0]

@@ -245,6 +245,15 @@ async def ws_endpoint(ws: WebSocket):
                     log.info("session %s: models -> %s", link.session.id, {k: v.split("/")[-1] for k, v in link.session.models.items()})
                     await link.send({"type": "model", "model": link.session.text_model, "models": link.session.models,
                                      "media_model": link.session.model_for_role("media")})
+            elif t == "forget_sessions":      # a chat was deleted on the client: drop what was remembered from it
+                removed = services.memory.delete_sessions(list(msg.get("ids") or []))
+                await link.send({"type": "memory_stats", "memory": services.memory.count(), "removed": removed, "what": "chat"})
+            elif t == "memory_prune":
+                removed = services.memory.prune()
+                await link.send({"type": "memory_stats", "memory": services.memory.count(), "removed": removed, "what": "prune"})
+            elif t == "memory_clear":
+                removed = services.memory.clear()
+                await link.send({"type": "memory_stats", "memory": services.memory.count(), "removed": removed, "what": "clear"})
             elif t == "get_prompts":
                 await link.send({"type": "prompts", **services.prompts.snapshot()})
             elif t == "set_prompts":
