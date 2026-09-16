@@ -144,6 +144,7 @@ CLIENT_TOOLS: list[dict] = [
                     "text": {"type": "string", "description": "For type: the text to type."},
                     "keys": {"type": "array", "items": {"type": "string"}, "description": "For hotkey/press: key names (pyautogui names, e.g. 'enter', 'ctrl', 'win', 'f5')."},
                     "amount": {"type": "integer", "description": "For scroll: positive = up, negative = down (clicks)."},
+                    "monitor": {"type": "integer", "description": "Which monitor's screenshot the coordinates refer to (its number from look_at_screen). Required when several monitors were captured."},
                 },
                 "required": ["action"],
             },
@@ -337,26 +338,42 @@ async def tool_view_attachments(ctx: ToolContext, args: dict) -> dict:
 
 
 async def tool_look_at_screen(ctx: ToolContext, args: dict) -> dict:
+    """One image per monitor: the requested monitor, or the monitors the user picked in the client settings."""
     try:
         shot = await ctx.client_call("__screenshot", {"monitor": args.get("monitor")}, 30.0)
     except Exception as e:  # noqa: BLE001
         return {"error": f"screenshot failed: {e}"}
     if shot.get("error"):
         return shot
-    try:
-        data = base64.b64decode(shot["png_base64"])
-    except Exception as e:  # noqa: BLE001
-        return {"error": f"bad screenshot payload: {e}"}
-    w, h = shot.get("width"), shot.get("height")
-    att = ctx.session.services.attachments.add(f"screen_{time.strftime('%Y%m%d_%H%M%S')}.png", data, "image/png",
-                                               meta={"screenshot": True, "width": w, "height": h})
-    ctx.session.note_screenshot(att.id)
-    # keep the client's pixel frame: the client maps these coordinates back onto the real screen
-    part, (pw, ph) = await asyncio.to_thread(media.image_part_from_bytes, data, max(int(w or 0), int(h or 0)) or None)
-    return {"screenshot_id": att.id, "width": pw, "height": ph, "monitor": shot.get("monitor"),
-            "note": f"the screenshot follows this result as an image ({pw}x{ph} px, origin top-left); "
-                    "give gui_action coordinates in that frame",
-            "_media": [part]}
+    shots = shot.get("shots") or ([shot] if shot.get("png_base64") else [])
+    if not shots:
+        return {"error": "the client returned no screenshot"}
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    parts, infos = [], []
+    for s in shots:
+        try:
+            data = base64.b64decode(s["png_base64"])
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"bad screenshot payload: {e}"}
+        w, h, mon = s.get("width"), s.get("height"), s.get("monitor")
+        att = ctx.session.services.attachments.add(f"screen_{stamp}_m{mon}.png", data, "image/png",
+                                                   meta={"screenshot": True, "width": w, "height": h, "monitor": mon})
+        ctx.session.note_screenshot(att.id)
+        # keep the client's pixel frame: the client maps these coordinates back onto the real screen
+        part, (pw, ph) = await asyncio.to_thread(media.image_part_from_bytes, data, max(int(w or 0), int(h or 0)) or None)
+        parts.append(part)
+        infos.append({"screenshot_id": att.id, "monitor": mon, "width": pw, "height": ph})
+    if len(infos) == 1:
+        i = infos[0]
+        return {**i, "note": f"the screenshot of monitor {i['monitor']} follows this result as an image "
+                             f"({i['width']}x{i['height']} px, origin top-left); give gui_action coordinates in that frame",
+                "_media": parts}
+    listing = ", ".join(f"monitor {i['monitor']} = {i['width']}x{i['height']} px" for i in infos)
+    return {"screenshots": infos, "monitors": shot.get("monitors"),
+            "note": f"{len(infos)} screenshots follow this result as images, in this order: {listing} "
+                    "(origin top-left in each); give gui_action coordinates in the frame of ONE of them and pass its "
+                    "monitor number",
+            "_media": parts}
 
 
 # ---- the web: a search engine's result page + readable page text
@@ -444,7 +461,7 @@ SERVER_TOOLS: dict[str, tuple[dict, ServerTool]] = {
             ),
             "parameters": {
                 "type": "object",
-                "properties": {"monitor": {"type": "integer", "description": "Monitor index (1 = primary). Optional."}},
+                "properties": {"monitor": {"type": "integer", "description": "Monitor number (1, 2, ...) to capture just that one. Omit to get the monitors the user selected in the settings (all of them by default, one image each)."}},
                 "required": [],
             },
         },

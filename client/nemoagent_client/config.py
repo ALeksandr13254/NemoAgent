@@ -100,6 +100,8 @@ class Settings:
     TOOL_CONFIRM = _env("TOOL_CONFIRM", "dangerous")   # never | dangerous | always
     TOOL_CONFIRM_TIMEOUT = _int("TOOL_CONFIRM_TIMEOUT", 90)
     SCREENSHOT_MAX_SIDE = _int("SCREENSHOT_MAX_SIDE", 1600)
+    # monitors the screenshot button / look_at_screen capture (1-based numbers, one image per monitor); empty = all
+    SCREENSHOT_MONITORS = [int(x) for x in (_env("SCREENSHOT_MONITORS", "") or "").replace(";", ",").split(",") if x.strip().isdigit()]
 
     LOG_LEVEL = _env("LOG_LEVEL", "info")
 

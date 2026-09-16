@@ -244,6 +244,8 @@ class _Gui:
         self._pg = None
         self.shot_scale = 1.0
         self.shot_offset = (0, 0)
+        self.shot_maps: dict[int, tuple[float, tuple[int, int]]] = {}   # monitor number -> (scale, (left, top))
+        self.last_monitor: Optional[int] = None
 
     @property
     def pg(self):
@@ -261,31 +263,72 @@ class _Gui:
         except Exception:
             return (0, 0)
 
-    def screenshot(self, monitor: Optional[int] = None) -> dict:
+    @staticmethod
+    def _physical(sct) -> list[dict]:
+        """mss lists the whole virtual screen first, then each monitor; we number the monitors from 1."""
+        mons = sct.monitors
+        return mons[1:] if len(mons) > 1 else mons[:1]
+
+    def list_monitors(self) -> list[dict]:
+        """Monitors as the settings panel shows them: number, size, position, which one is primary."""
+        try:
+            import mss
+            with mss.mss() as sct:
+                mons = self._physical(sct)
+        except Exception:  # noqa: BLE001
+            return []
+        return [{"index": i, "width": int(m.get("width", 0)), "height": int(m.get("height", 0)),
+                 "left": int(m.get("left", 0)), "top": int(m.get("top", 0)),
+                 "primary": int(m.get("left", 0)) == 0 and int(m.get("top", 0)) == 0}
+                for i, m in enumerate(mons, 1)]
+
+    def screenshot(self, monitor: Optional[int] = None, monitors: Optional[list] = None) -> dict:
+        """One PNG per monitor: the explicit `monitor` number if given, otherwise the monitors chosen in the
+        settings (SCREENSHOT_MONITORS; empty = all of them)."""
         import mss
         from PIL import Image
         with mss.mss() as sct:
-            mons = sct.monitors
-            idx = monitor if monitor and 0 < monitor < len(mons) else 1
-            mon = mons[idx] if len(mons) > 1 else mons[0]
-            raw = sct.grab(mon)
-            img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
-        ow, oh = img.size
-        scale = 1.0
-        max_side = settings.SCREENSHOT_MAX_SIDE
-        if max_side and max(ow, oh) > max_side:
-            scale = max(ow, oh) / max_side
-            img = img.resize((round(ow / scale), round(oh / scale)), Image.LANCZOS)
-        self.shot_scale = scale
-        self.shot_offset = (mon.get("left", 0), mon.get("top", 0))
-        buf = io.BytesIO()
-        img.save(buf, format="PNG", optimize=False, compress_level=3)
-        return {"png_base64": base64.b64encode(buf.getvalue()).decode(), "width": img.size[0], "height": img.size[1],
-                "monitor": idx, "scale": scale}
+            mons = self._physical(sct)
+            n = len(mons)
+            try:
+                want_one = int(monitor) if monitor is not None else 0
+            except (TypeError, ValueError):
+                want_one = 0
+            if 0 < want_one <= n:
+                wanted = [want_one]
+            else:
+                chosen = monitors if monitors is not None else settings.SCREENSHOT_MONITORS
+                wanted = sorted({int(i) for i in (chosen or []) if str(i).isdigit() and 0 < int(i) <= n}) or list(range(1, n + 1))
+            shots = []
+            for i in wanted:
+                mon = mons[i - 1]
+                raw = sct.grab(mon)
+                img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+                ow, oh = img.size
+                scale = 1.0
+                max_side = settings.SCREENSHOT_MAX_SIDE
+                if max_side and max(ow, oh) > max_side:
+                    scale = max(ow, oh) / max_side
+                    img = img.resize((round(ow / scale), round(oh / scale)), Image.LANCZOS)
+                # gui_action coordinates come back in this frame: remember how to map them onto this monitor
+                self.shot_maps[i] = (scale, (int(mon.get("left", 0)), int(mon.get("top", 0))))
+                buf = io.BytesIO()
+                img.save(buf, format="PNG", optimize=False, compress_level=3)
+                shots.append({"png_base64": base64.b64encode(buf.getvalue()).decode(), "width": img.size[0],
+                              "height": img.size[1], "monitor": i, "scale": scale, "screen": [ow, oh]})
+        if shots:
+            self.last_monitor = shots[0]["monitor"]
+            self.shot_scale, self.shot_offset = self.shot_maps[self.last_monitor]
+        return {"shots": shots, "monitors": n, "selected": wanted}
 
-    def _map(self, x, y) -> tuple[int, int]:
-        return (int(round(float(x) * self.shot_scale)) + self.shot_offset[0],
-                int(round(float(y) * self.shot_scale)) + self.shot_offset[1])
+    def _map(self, x, y, monitor=None) -> tuple[int, int]:
+        """Screenshot-frame pixels -> real screen pixels of the monitor the screenshot was taken from."""
+        try:
+            key = int(monitor) if monitor is not None else self.last_monitor
+        except (TypeError, ValueError):
+            key = self.last_monitor
+        scale, (ox, oy) = self.shot_maps.get(key, (self.shot_scale, self.shot_offset))
+        return int(round(float(x) * scale)) + ox, int(round(float(y) * scale)) + oy
 
     def action(self, args: dict) -> dict:
         pg = self.pg
@@ -294,21 +337,22 @@ class _Gui:
         has_xy = x is not None and y is not None
         if act in ("click", "double_click", "right_click", "move", "drag") and not has_xy:
             return {"error": f"{act} needs x and y"}
+        mon = args.get("monitor")   # which monitor's screenshot the coordinates refer to (several monitors)
         if act == "click":
-            sx, sy = self._map(x, y)
+            sx, sy = self._map(x, y, mon)
             pg.click(sx, sy)
         elif act == "double_click":
-            sx, sy = self._map(x, y)
+            sx, sy = self._map(x, y, mon)
             pg.doubleClick(sx, sy)
         elif act == "right_click":
-            sx, sy = self._map(x, y)
+            sx, sy = self._map(x, y, mon)
             pg.rightClick(sx, sy)
         elif act == "move":
-            sx, sy = self._map(x, y)
+            sx, sy = self._map(x, y, mon)
             pg.moveTo(sx, sy, duration=0.1)
         elif act == "drag":
-            sx, sy = self._map(x, y)
-            tx, ty = self._map(args.get("to_x", x), args.get("to_y", y))
+            sx, sy = self._map(x, y, mon)
+            tx, ty = self._map(args.get("to_x", x), args.get("to_y", y), mon)
             pg.moveTo(sx, sy)
             pg.dragTo(tx, ty, duration=0.4, button="left")
         elif act == "type":
@@ -344,7 +388,7 @@ class _Gui:
         elif act == "scroll":
             amount = int(args.get("amount") or -3)
             if has_xy:
-                sx, sy = self._map(x, y)
+                sx, sy = self._map(x, y, mon)
                 pg.scroll(amount, x=sx, y=sy)
             else:
                 pg.scroll(amount)
@@ -483,7 +527,7 @@ TOOLS: dict[str, Callable[[dict], dict]] = {
     "clipboard": clipboard,
     "list_windows": list_windows,
     "system_info": system_info,
-    "__screenshot": lambda a: GUI.screenshot(a.get("monitor")),
+    "__screenshot": lambda a: GUI.screenshot(a.get("monitor"), a.get("monitors")),
 }
 
 

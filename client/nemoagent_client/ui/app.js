@@ -379,6 +379,7 @@
     fillDevices('s-mic_device', state.input_devices || [], s.mic_device);
     $('mic-now').textContent = state.microphone ? 'сейчас: ' + state.microphone + (state.mic && state.mic !== 'ready' ? ' · ' + state.mic : '') : (state.mic || '');
     $('s-tts_speed').value = s.tts_speed; $('s-tts_speed-v').textContent = Number(s.tts_speed).toFixed(2);
+    renderMonitors(state.monitors || [], s.screenshot_monitors || []);
     $('settings-status').textContent = `сессия ${state.session_id || '—'} · mic ${state.mic || ''}`;
   }
   function fillDevices(id, devs, val) {
@@ -392,6 +393,29 @@
     sel.value = val;
   }
   function pushSettings(patch) { send({ type: 'settings', settings: patch }); }
+  /* which monitors the screenshot button / look_at_screen capture: "all" (an empty list) or a set of monitor numbers */
+  function renderMonitors(mons, chosen) {
+    const box = $('s-monitors');
+    const all = !chosen.length;
+    const sig = mons.map((m) => `${m.index}:${m.width}x${m.height}`).join(',') + '|' + chosen.join(',');
+    if (box._sig === sig) return;
+    box._sig = sig;
+    if (!mons.length) { box.innerHTML = '<div class="muted small">мониторы не найдены</div>'; return; }
+    const row = (val, label, checked, disabled) => `<label><input type="checkbox" data-mon="${val}"${checked ? ' checked' : ''}${disabled ? ' disabled' : ''}> ${label}</label>`;
+    box.innerHTML = row('all', 'все мониторы', all, false)
+      + mons.map((m) => row(m.index, `монитор ${m.index}${m.primary ? ' (основной)' : ''} · ${m.width}×${m.height}`, all || chosen.includes(m.index), all)).join('');
+    box.querySelectorAll('input').forEach((inp) => {
+      inp.onchange = () => {
+        let list;
+        if (inp.dataset.mon === 'all') list = inp.checked ? [] : mons.slice(0, 1).map((m) => m.index);   // "all" off: start from the first monitor
+        else {
+          list = [...box.querySelectorAll('input[data-mon]')].filter((b) => b.dataset.mon !== 'all' && b.checked).map((b) => Number(b.dataset.mon));
+          if (!list.length || list.length === mons.length) list = [];   // nothing or everything ticked = all monitors
+        }
+        box._sig = null; pushSettings({ screenshot_monitors: list });
+      };
+    });
+  }
   $('btn-settings').onclick = () => $('settings').classList.toggle('hidden');
   for (const k of ['tts_mode', 'confirm', 'stt_language', 'tts_language', 'model_dialogue', 'model_executor', 'model_router', 'model_media', 'voice_ru', 'voice_en', 'speaker_device', 'mic_device']) $('s-' + k).onchange = (e) => pushSettings({ [k]: e.target.value });
   for (const k of ['auto_listen', 'barge_in', 'tools_enabled']) $('s-' + k).onchange = (e) => pushSettings({ [k]: e.target.checked });
@@ -446,7 +470,13 @@
     const entry = { name: 'скриншот…', is_image: true, pending: true }; pending.push(entry); renderAttachments();
     const rid = String(Date.now());
     const h = (e) => { const m = JSON.parse(e.data); if (m.type === 'attachment' && m.request_id === rid) { ws.removeEventListener('message', h);
-      if (m.error) { add(div('errline', '⚠ ' + esc(m.error))); pending = pending.filter((p) => p !== entry); } else Object.assign(entry, m, { pending: false, name: m.name }); renderAttachments(); } };
+      if (m.error) { add(div('errline', '⚠ ' + esc(m.error))); pending = pending.filter((p) => p !== entry); }
+      else {   // one attachment per captured monitor
+        const list = (m.attachments || [m]).map((a) => Object.assign({}, a, { pending: false, is_image: true }));
+        pending.splice(pending.indexOf(entry), 1, ...list);
+        if (m.warning) add(div('errline', '⚠ ' + esc(m.warning)));
+      }
+      renderAttachments(); } };
     ws.addEventListener('message', h); send({ type: 'screenshot', request_id: rid });
   };
   $('btn-stop').onclick = () => send({ type: 'interrupt' });

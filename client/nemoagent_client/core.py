@@ -60,6 +60,7 @@ class ClientCore:
             "speaker_device": settings.SPEAKER_DEVICE or "",
             "mic_device": settings.MIC_DEVICE or "",
             "memory_recall": False,     # 🗂 button: recall long-term memory for the messages while it is on
+            "screenshot_monitors": list(settings.SCREENSHOT_MONITORS),   # monitors the 🖥 button / look_at_screen capture; [] = all
         }
         # what the user picks in the settings panel survives a restart (client/data/settings.json)
         self.CHATS_DIR = settings.DATA_DIR / "chats"
@@ -90,7 +91,7 @@ class ClientCore:
     # ============================================================== settings persistence
     PERSIST_KEYS = ("tts_mode", "auto_listen", "barge_in", "tools_enabled", "confirm", "voice_ru", "voice_en", "tts_speed",
                     "stt_language", "tts_language", "model_dialogue", "model_executor", "model_router", "model_media",
-                    "speaker_device", "mic_device")
+                    "speaker_device", "mic_device", "screenshot_monitors")
     MODEL_KEYS = ("model_dialogue", "model_executor", "model_router", "model_media")
 
     def _models(self) -> dict:
@@ -131,6 +132,7 @@ class ClientCore:
         settings.BARGE_IN = bool(self.state["barge_in"])
         settings.SPEAKER_DEVICE = str(self.state.get("speaker_device") or "") or None
         settings.MIC_DEVICE = str(self.state.get("mic_device") or "") or None
+        settings.SCREENSHOT_MONITORS = [int(i) for i in (self.state.get("screenshot_monitors") or []) if str(i).isdigit()]
 
     # ============================================================== long-term memory, prompts, attachments (all local)
     async def _embed(self, kind: str, inputs: list[str], input_type: str) -> list[list[float]]:
@@ -711,12 +713,25 @@ class ClientCore:
             return {"error": f"upload failed: {e}"}
 
     async def take_screenshot_attachment(self, monitor: Optional[int] = None) -> dict:
+        """One attachment per captured monitor: `monitor` if given, else the monitors chosen in the settings."""
         shot = await asyncio.to_thread(executor.execute, "__screenshot", {"monitor": monitor})
         if shot.get("error"):
             return shot
         import base64
-        data = base64.b64decode(shot["png_base64"])
-        return await self.upload_attachment(f"screenshot_{time.strftime('%H%M%S')}.png", data, "image/png")
+        shots = shot.get("shots") or []
+        stamp = time.strftime("%H%M%S")
+        out, errors = [], []
+        for s in shots:
+            data = base64.b64decode(s["png_base64"])
+            suffix = f"_m{s['monitor']}" if int(shot.get("monitors") or 1) > 1 else ""
+            att = await self.upload_attachment(f"screenshot_{stamp}{suffix}.png", data, "image/png")
+            (errors if att.get("error") else out).append(att)
+        if not out:
+            return {"error": errors[0]["error"] if errors else "no monitor to capture"}
+        res = {"attachments": out, "monitors": shot.get("monitors")}
+        if errors:
+            res["warning"] = f"{len(errors)} of {len(shots)} screenshots failed: {errors[0]['error']}"
+        return res
 
     # ------------------------------------------------------------ microphone callbacks (threads)
     def _on_level(self, level: float, speech: bool) -> None:
@@ -866,6 +881,7 @@ class ClientCore:
                 "speaker": getattr(self.player, "device_name", None), "output_devices": devices,
                 "microphone": getattr(self.mic, "device_name", None), "input_devices": inputs,
                 "listening": bool(self.mic and self.mic.enabled), "dictation": self.dictation, "settings": self.state,
+                "monitors": executor.GUI.list_monitors(),
                 "chat_id": self.chat["id"] if self.chat else None,
                 "voices": {"ru": ["ru_f1", "ru_m5", "ru_f2", "ru_m1"],
                            "en": ["eng_f3", "eng_f5", "eng_m3", "eng_m4", "eng_f4_whisper", "eng_m2_whisper"]}}
@@ -932,8 +948,10 @@ class ClientCore:
             await ws.send_text(json.dumps({"type": "pong", "t": msg.get("t")}))
 
     async def _apply_settings(self, s: dict) -> None:
+        if "screenshot_monitors" in s:   # a list of 1-based monitor numbers; empty = all monitors
+            s["screenshot_monitors"] = [int(i) for i in (s["screenshot_monitors"] or []) if str(i).isdigit()]
         for key in ("tts_mode", "auto_listen", "barge_in", "tools_enabled", "confirm", "voice_ru", "voice_en", "tts_speed",
-                    "stt_language", "tts_language", "memory_recall", *self.MODEL_KEYS):
+                    "stt_language", "tts_language", "memory_recall", "screenshot_monitors", *self.MODEL_KEYS):
             if key in s:
                 self.state[key] = s[key]
         if any(k in s for k in self.MODEL_KEYS) and self.server_ws:
