@@ -9,14 +9,29 @@
 <body>
 <div id="layout">
 <aside id="history">
-  <div class="panehead">
-    <b>Чаты</b>
-    <span class="spacer"></span>
-    <button id="hist-new" class="link" title="Начать новый диалог">+ новый</button>
+  <div id="side-chats" class="side">
+    <div class="panehead">
+      <b>Чаты</b>
+      <span class="spacer"></span>
+      <button id="hist-new" class="link" title="Начать новый диалог">+ новый</button>
+    </div>
+    <div id="hist-list" class="side-list"></div>
+    <div class="hist-foot">
+      <button id="hist-clear" class="danger" title="Очистить текущий чат: убрать его из списка и стереть его записи из долговременной памяти">Очистить чат</button>
+    </div>
   </div>
-  <div id="hist-list"></div>
-  <div class="hist-foot">
-    <button id="hist-clear" class="danger" title="Очистить текущий чат: убрать его из списка и стереть его записи из долговременной памяти">Очистить чат</button>
+  <div id="side-mem" class="side hidden">
+    <div class="panehead">
+      <b>Воспоминания</b> <span id="mem-total" class="muted small"></span>
+      <span class="spacer"></span>
+      <button id="mem-new-btn" class="link" title="Добавить воспоминание руками: факт о вас, предпочтение, договорённость">+ новое</button>
+    </div>
+    <div id="mem-items" class="side-list"></div>
+    <div class="hist-foot col">
+      <button id="mem-prune" title="Удалить пустяковые (короткий вопрос и короткий ответ) и повторяющиеся записи">Прибраться в памяти</button>
+      <button id="mem-clear" class="danger" title="Стереть всю долговременную память сервера (необратимо)">Очистить память</button>
+      <div id="mem-status" class="muted small"></div>
+    </div>
   </div>
 </aside>
 <div id="app">
@@ -37,32 +52,38 @@
   <nav class="tabs">
     <button class="tab active" data-tab="chat">Чат</button>
     <button class="tab" data-tab="prompt">Системные промпты</button>
+    <button class="tab" data-tab="memory">Память</button>
     <button class="tab" data-tab="log">Полные логи <span id="log-count" class="muted"></span></button>
     <button class="tab" data-tab="reader">Озвучка</button>
-    <button class="tab" data-tab="memory">Память</button>
   </nav>
 
   <section id="memory" class="tabpane hidden">
     <div class="editor">
       <div class="panehead">
         <b>Долговременная память</b>
-        <span class="muted small">Записи, которые сервер подмешивает в разговор при нажатой 🗂 и по которым ищет исполнитель. Текст можно править прямо здесь (эмбеддинг пересчитается), лишнее удалить, а нужное добавить руками: факт о вас, предпочтение, договорённость.</span>
+        <span class="muted small">Записи, которые сервер подмешивает в разговор при нажатой 🗂 и по которым ищет исполнитель. Слева список воспоминаний: выберите одно, чтобы прочитать, поправить (эмбеддинг пересчитается) или удалить; «+ новое воспоминание» добавляет запись руками.</span>
       </div>
       <div class="row left">
         <input id="mem-search" placeholder="поиск по смыслу: что искать в памяти…">
         <button id="mem-search-btn">искать</button>
         <button id="mem-all" class="link">показать все</button>
-        <span class="spacer"></span>
-        <span id="mem-total" class="muted small"></span>
-      </div>
-      <label class="ed">Новое воспоминание
-        <textarea id="mem-new" rows="3" placeholder="Например: Меня зовут Александр, видеокарта RTX 4070 Ti SUPER, отвечать кратко."></textarea></label>
-      <div class="row left">
-        <button id="mem-add" class="primary">Добавить</button>
-        <span id="mem-add-status" class="muted small"></span>
       </div>
     </div>
-    <div id="mem-list"></div>
+    <div id="mem-editor" class="editor hidden">
+      <div class="panehead">
+        <b id="mem-ed-title">Воспоминание</b>
+        <span id="mem-ed-meta" class="muted small"></span>
+        <span class="spacer"></span>
+        <span id="mem-ed-status" class="muted small"></span>
+      </div>
+      <textarea id="mem-ed-text" rows="10" spellcheck="false" placeholder="Например: Меня зовут Александр, видеокарта RTX 4070 Ti SUPER, отвечать кратко."></textarea>
+      <div class="row left">
+        <button id="mem-ed-save" class="primary" disabled>Сохранить</button>
+        <button id="mem-ed-del" class="danger">Удалить</button>
+        <button id="mem-ed-cancel" class="link">закрыть</button>
+      </div>
+    </div>
+    <div id="mem-empty" class="muted small">Выберите воспоминание слева или нажмите «+ новое воспоминание».</div>
   </section>
 
   <section id="reader" class="tabpane hidden">
@@ -215,13 +236,6 @@
         <option value="never">никогда</option>
       </select>
     </label>
-    <hr>
-    <div class="muted small">Долговременная память: <span id="mem-count">—</span></div>
-    <div class="row left">
-      <button id="mem-prune" title="Удалить пустяковые и повторяющиеся записи">прибраться в памяти</button>
-      <button id="mem-clear" class="danger" title="Стереть всю долговременную память сервера (необратимо)">очистить память</button>
-    </div>
-    <div id="mem-status" class="muted small"></div>
     <hr>
     <button id="btn-say" class="link">проверить голос</button>
     <div id="settings-status" class="muted small"></div>
