@@ -104,3 +104,4 @@ aside#settings hr { border: none; border-top: 1px solid var(--border); margin: 4
 .progress { height: 5px; background: var(--panel2); border-radius: 3px; overflow: hidden; margin-top: 10px; }
 #reader-bar { height: 100%; width: 0; background: var(--accent); transition: width .2s linear; }
 #reader-now { margin-top: 6px; min-height: 18px; }
+.logent.error summary { border-left: 3px solid var(--err); }

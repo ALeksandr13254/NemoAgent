@@ -190,7 +190,12 @@
       case 'memory': card('memory', `🗂 память: ${m.items.length} совпад.`, m.items.map((i) => `[${i.kind} ${i.score}] ${i.text}`).join('\n\n'), false); break;
       case 'wait': $('stt-state').textContent = m.stage === 'retry' ? `сервер NVIDIA перегружен, повтор ${m.attempt}…` : 'жду модель…'; break;
       case 'notice': add(div('notice', esc(m.message))); break;
-      case 'error': add(div('errline', '⚠ ' + esc(m.message))); break;
+      case 'error': {
+        const text = (m.message || '').trim() || (m.detail || '').trim() || 'ошибка без описания (см. окно сервера)';
+        const e = add(div('errline', '⚠ ' + esc(text))); if (m.detail) e.title = m.detail;
+        logEntry('error', `⚠ <b>ошибка</b> ${new Date().toLocaleTimeString()}`, `<pre>${esc(text)}${m.detail && m.detail !== text ? '\n' + esc(m.detail) : ''}</pre>`, true);
+        break;
+      }
       case 'done': {
         waitingSince(null);
         if (current) current.classList.remove('streaming');

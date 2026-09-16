@@ -452,7 +452,16 @@ class AgentSession:
             raise
         except Exception as e:  # noqa: BLE001
             log.exception("turn failed")
-            await self.send({"type": "error", "message": str(e)[:600]})
+            import httpx
+            detail = f"{type(e).__name__}: {e}".strip(": ")
+            if isinstance(e, httpx.TransportError):
+                # a VPN switch or a dropped network kills the pooled connection to NVIDIA mid-request
+                message = "Связь с NVIDIA оборвалась (сеть или VPN переключились) — повторите сообщение."
+            elif not str(e).strip():
+                message = f"Ошибка на сервере: {type(e).__name__} (подробности в окне сервера)."
+            else:
+                message = str(e)[:600]
+            await self.send({"type": "error", "message": message, "detail": detail[:600]})
             await self.send({"type": "done", "finish_reason": "error", "ms": int((time.time() - t_start) * 1000)})
             return
 
