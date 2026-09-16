@@ -83,13 +83,7 @@ class Settings:
     MEDIA_KEEP_TURNS = _int("MEDIA_KEEP_TURNS", 2)              # media of older user messages is replaced by a text stub
     FFMPEG = _env("FFMPEG", "ffmpeg")                           # needed for anything but wav/mp3/mp4 and for long/large clips
 
-    # --- memory (RAG over past dialogs) ---
-    MEMORY_DB = Path(_env("MEMORY_DB", str(SERVER_DIR / "data" / "memory.sqlite3")))
-    # Memory (RAG over past dialogs) is used only when the client asks for it (the 🗂 button); set
-    # true to recall automatically on every message instead.
-    MEMORY_AUTO_RECALL = _bool("MEMORY_AUTO_RECALL", False)
-    MEMORY_TOP_K = _int("MEMORY_TOP_K", 4)
-    MEMORY_MIN_SCORE = _float("MEMORY_MIN_SCORE", 0.5)
+    # --- live context of one session (RAM only; long-term memory lives on the client) ---
     CONTEXT_BUDGET_TOKENS = _int("CONTEXT_BUDGET_TOKENS", 60000)
     CONTEXT_KEEP_TURNS = _int("CONTEXT_KEEP_TURNS", 6)
 
@@ -102,9 +96,9 @@ class Settings:
     WEB_USER_AGENT = _env("WEB_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                                             "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
 
-    # --- uploads ---
-    UPLOAD_DIR = Path(_env("UPLOAD_DIR", str(SERVER_DIR / "data" / "uploads")))
+    # --- uploads: kept in RAM only, dropped after UPLOAD_TTL_S seconds without use ---
     UPLOAD_MAX_MB = _int("UPLOAD_MAX_MB", 100)
+    UPLOAD_TTL_S = _int("UPLOAD_TTL_S", 7200)
 
     LOG_LEVEL = _env("LOG_LEVEL", "info")
 

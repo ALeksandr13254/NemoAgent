@@ -6,7 +6,7 @@ Two agents share one conversation and one omni model (text + images + audio + vi
   * the executor gets that task plus the recent conversation (and the attachments, when the task is
     about them), runs the tools and returns a factual report, which the dialogue agent then tells the user.
 
-Four editable pieces, stored in server/data/prompts.json when changed:
+Five editable pieces; the client stores the overrides and sends them with its connection:
   system      — dialogue agent template; `{env}` = environment + current time, `{voice_style}` = one of
                 the two style blocks below;
   voice_prose — style block for voice answers (TTS rules);
@@ -70,6 +70,8 @@ DEFAULT_ROUTER = """You are the ROUTER of NemoAgent, a voice assistant that live
 needs_executor = true when the message asks to DO something on the computer or needs information nobody can know without looking: open/launch/close/type/click/search/install/check/find/measure/list/read a file/look at the screen/what is open now/free disk space/current price, weather, time, news and "what is new / what happened today" (anything that may have changed after the assistant's training data — when in doubt, true).
 needs_executor = false for conversation, greetings, opinions, jokes, general knowledge, explanations, stories, translations, calculations the assistant can do in its head, questions about files/images/audio the user attached, and requests to rephrase or continue the previous answer.
 
+A trailing [attachments: ...] note means those files (screenshots included) are ALREADY attached and visible to the assistant: questions about their content do not need the executor.
+
 The message is given to you quoted as data. Output exactly ONE line of JSON and nothing else — no answer to the message, no explanation:
 {"needs_executor": true, "task": "<precise instruction for the executor in Russian: what exactly to do and what to report back, with names, paths, texts to type>"}
 or
@@ -106,31 +108,22 @@ KEYS = tuple(DEFAULTS)
 
 
 class PromptStore:
-    def __init__(self, path: Path | None = None):
-        self.path = path or (settings.MEMORY_DB.parent / "prompts.json")
+    """Defaults plus one client's overrides, held in memory for that client's session.
+
+    The server keeps no files: the client stores its overrides (client/data/prompts.json) and sends them
+    on connect (hello.client.prompts) and after every edit.
+    """
+
+    def __init__(self, overrides: dict | None = None):
         self.overrides: dict[str, str] = {}
-        self._load()
-
-    def _load(self) -> None:
-        try:
-            if self.path.exists():
-                data = json.loads(self.path.read_text("utf-8"))
-                self.overrides = {k: str(v) for k, v in data.items() if k in KEYS and isinstance(v, str) and v.strip()}
-                if self.overrides:
-                    log.info("prompt overrides loaded: %s", ", ".join(self.overrides))
-        except Exception as e:  # noqa: BLE001
-            log.warning("cannot read %s: %s", self.path, e)
-
-    def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.overrides, ensure_ascii=False, indent=1), "utf-8")
+        self.set(overrides or {})
 
     def get(self, key: str) -> str:
         return self.overrides.get(key) or DEFAULTS[key]
 
     def snapshot(self) -> dict:
-        return {"current": {k: self.get(k) for k in KEYS}, "defaults": DEFAULTS,
-                "overridden": sorted(self.overrides), "path": str(self.path)}
+        return {"current": {k: self.get(k) for k in KEYS}, "defaults": DEFAULTS, "overrides": dict(self.overrides),
+                "overridden": sorted(self.overrides)}
 
     def set(self, values: dict) -> dict:
         """Store the given pieces; a value equal to the default (or empty) removes the override."""
@@ -142,13 +135,11 @@ class PromptStore:
                 self.overrides.pop(k, None)
             else:
                 self.overrides[k] = v
-        self._save()
         return self.snapshot()
 
     def reset(self, keys: list[str] | None = None) -> dict:
         for k in (keys or list(KEYS)):
             self.overrides.pop(k, None)
-        self._save()
         return self.snapshot()
 
     def render(self, env_block: str, tts: bool) -> str:

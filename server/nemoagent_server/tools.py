@@ -308,11 +308,15 @@ async def tool_get_weather(ctx: ToolContext, args: dict) -> dict:
 
 
 async def tool_search_memory(ctx: ToolContext, args: dict) -> dict:
+    """Long-term memory lives on the client: the search runs there (embeddings still go through this server)."""
     query = str(args.get("query", "")).strip()
-    limit = int(args.get("limit") or 5)
-    items = await ctx.session.services.memory.search(query, top_k=max(1, min(limit, 12)), exclude_session=None, min_score=0.3)
-    return {"count": len(items), "results": [{"when": dt.datetime.fromtimestamp(i["ts"]).strftime("%Y-%m-%d %H:%M"),
-                                              "kind": i["kind"], "score": round(i["score"], 3), "text": i["text"][:2500]} for i in items]}
+    if not query:
+        return {"error": "query is empty"}
+    limit = max(1, min(int(args.get("limit") or 5), 12))
+    try:
+        return await ctx.client_call("__search_memory", {"query": query, "limit": limit}, 30.0)
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"memory search failed: {e}"}
 
 
 # ---- seeing things: attachments and the screen go to the model as media parts (`_media`)

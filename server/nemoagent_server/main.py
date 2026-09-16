@@ -1,34 +1,40 @@
-"""NemoAgent server: FastAPI + one WebSocket per client.
+"""NemoAgent server: FastAPI + one WebSocket per client. Stateless between connections.
+
+The server owns nothing persistent: it hides the NIM API and runs the two-agent loop for each connected
+client, keeping only the live conversation of a session in RAM. Everything that must survive — chat
+history, attachments, long-term memory, prompt overrides — lives on the client, which sends what the
+current turn needs (recalled memories, prompt overrides, uploads that expire after UPLOAD_TTL_S).
 
 Protocol (JSON text frames):
   client -> server
-    {"type":"hello", "token": "...", "client": {os, hostname, user, shell, screen, timezone, tools_enabled}}
-    {"type":"user_message", "text": "...", "attachments": ["id", ...], "source": "voice"|"text", "tts": bool, "memory": bool}
-        attachments (images, audio, video, documents) are sent to the omni model inside the message
-        tts=true: the answer is written in TTS form and streamed as speech_delta events
-        memory=true: long-term memory is recalled for this message and the search_memory tool is offered
-    {"type":"tool_result", "call_id": "...", "result": {...}}
-    {"type":"interrupt"}          # stop the current answer (barge-in)
-    {"type":"new_session"}
-    {"type":"client_info", "client": {...}}     # update capabilities/toggles
-    {"type":"get_prompts"} / {"type":"set_prompts","values":{system,voice_prose,voice_text,executor}} / {"type":"reset_prompts","keys":[...]}
-        -> {"type":"prompts","current":{...},"defaults":{...},"overridden":[...]}   (editable system prompt parts)
+    {"type":"hello", "token": "...", "client": {os, hostname, user, shell, screen, timezone, tools_enabled,
+                                                 persona_gender, models: {dialogue, executor, router, media},
+                                                 prompts: {system, voice_prose, voice_text, executor, router}}}
+    {"type":"user_message", "text": "...", "attachments": ["id", ...], "source": "voice"|"text", "tts": bool,
+                            "memory": bool, "memory_context": [{kind, ts, score, text}, ...]}
+        attachments: ids from POST /upload (kept in RAM for a while); tts=true: the answer is written in
+        TTS form and streamed as speech_delta; memory=true: the executor gets the search_memory tool
+        (which asks the client back); memory_context: memories the client recalled for this message
+    {"type":"tool_result", "call_id": "...", "result": {...}}     # answer to client_tool
+    {"type":"interrupt"} · {"type":"new_session"} · {"type":"load_session", "messages":[{role, content}...]}
+    {"type":"client_info", "client": {...}}     # update capabilities / models / prompts / gender
+    {"type":"get_prompts"} / {"type":"set_prompts","values":{...}} / {"type":"reset_prompts","keys":[...]}
+        -> {"type":"prompts","current":{...},"defaults":{...},"overrides":{...},"overridden":[...]}
     {"type":"ping"}
   server -> client
-    {"type":"ready", "session_id": "...", "vision": true, "memory": {...}, "model": "..."}
+    {"type":"ready", "session_id", "model", "models", "media_model", "default_model"}
     {"type":"stage", "name": "answer"|"executor"|"report", "agent": "dialogue"|"executor"}
-    {"type":"delta", "content": "..."}         {"type":"reasoning", "content": "..."}
-    {"type":"task", "task": "..."}             {"type":"executor_delta", "content": "..."}   {"type":"report", "task", "report"}
-    {"type":"tool_call", "id","name","arguments"}            # informational (server tools)
-    {"type":"client_tool", "call_id","name","arguments"}     # execute on the client, reply with tool_result
-    {"type":"tool_result", "id","name","ms","result"}
-    {"type":"speech_delta", "content": "..."}  # TTS-ready text (stream it to the TTS)
-    {"type":"speech_done", "display": str|null, "final": bool}   # display = screen-only part after ===, if any
-    {"type":"trace", "kind":"request", "messages":[...full prompt, media as sizes...], "tools":[...], "params":{...}}
-    {"type":"trace", "kind":"response", "content", "reasoning", "tool_calls", "usage", "ms"}
-    {"type":"memory", "items":[...]}            {"type":"wait", ...}   {"type":"notice", "message"}
-    {"type":"done", "finish_reason", "ms", "first_token_ms"}    {"type":"error", "message"}
-Uploads: POST /upload (multipart 'file', header Authorization: Bearer <AGENT_TOKEN>) -> attachment json.
+    {"type":"delta", "content"} · {"type":"reasoning", "content"} · {"type":"speech_delta", "content"}
+    {"type":"speech_done", "display": str|null, "final": bool}
+    {"type":"task", "task"} · {"type":"executor_delta", "content"} · {"type":"report", "task", "report"}
+    {"type":"tool_call", "id","name","arguments"} · {"type":"tool_result", "id","name","ms","result"}
+    {"type":"client_tool", "call_id","name","arguments"}      # execute on the client (also __screenshot, __search_memory)
+    {"type":"trace", "kind":"request"|"response", ...}         # full prompts for the log tab (media as sizes)
+    {"type":"wait", ...} · {"type":"notice", "message"} · {"type":"error", "message", "detail"}
+    {"type":"done", "finish_reason", "ms", "first_token_ms", "memo": {user, assistant, reports, attachments, source}}
+        memo = what the client may store in its long-term memory for this turn
+HTTP: GET /health · POST /upload (multipart 'file') · POST /embed {"kind":"text"|"vl","input":[...],"input_type"}
+All HTTP calls carry `Authorization: Bearer <AGENT_TOKEN>`.
 """
 from __future__ import annotations
 
@@ -41,14 +47,12 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, File, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 
 from .agent import AgentSession, Services
 from .attachments import AttachmentStore
 from .config import settings
-from .memory import MemoryStore
 from .nim import NIMClient
-from .prompts import PromptStore
 
 logging.basicConfig(level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
                     format="%(asctime)s %(levelname).1s %(name)s: %(message)s", datefmt="%H:%M:%S")
@@ -57,23 +61,34 @@ log = logging.getLogger("server")
 services: Optional[Services] = None
 
 
+async def _sweeper(attachments: AttachmentStore) -> None:
+    while True:
+        await asyncio.sleep(60)
+        try:
+            n = attachments.sweep()
+            if n:
+                log.info("uploads expired: %d (kept %d, %.1f MB)", n, attachments.count(), attachments.total_bytes() / 1048576)
+        except Exception:  # noqa: BLE001
+            log.exception("upload sweep failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global services
     for p in settings.validate():
         log.warning(p)
     nim = NIMClient()
-    memory = MemoryStore(nim)
     attachments = AttachmentStore()
-    prompts = PromptStore()
-    services = Services(nim=nim, memory=memory, attachments=attachments, prompts=prompts)
+    services = Services(nim=nim, attachments=attachments)
     ffmpeg = shutil.which(settings.FFMPEG)
-    log.info("NemoAgent server ready on %s:%s | text model %s | media model %s | ffmpeg %s | memory %s",
-             settings.HOST, settings.PORT, settings.LLM_MODEL, settings.LLM_MEDIA_MODEL,
-             ffmpeg or "not found (only wav/mp3/mp4 attachments pass as they are)", memory.count())
+    log.info("NemoAgent server ready on %s:%s | text model %s | media model %s | router %s | ffmpeg %s | no disk state",
+             settings.HOST, settings.PORT, settings.LLM_MODEL, settings.LLM_MEDIA_MODEL, settings.ROUTER_MODEL,
+             ffmpeg or "not found (only wav/mp3/mp4 attachments pass as they are)")
+    sweeper = asyncio.create_task(_sweeper(attachments))
     try:
         yield
     finally:
+        sweeper.cancel()
         await nim.aclose()
 
 
@@ -90,18 +105,20 @@ def _check_token(authorization: Optional[str]) -> None:
 
 def _ready(session: AgentSession) -> dict:
     return {"type": "ready", "session_id": session.id, "vision": True, "modalities": ["text", "image", "audio", "video"],
-            "memory": services.memory.count(), "model": session.text_model, "models": session.models,
-            "media_model": session.model_for_role("media"), "default_model": settings.LLM_MODEL}
+            "model": session.text_model, "models": session.models, "media_model": session.model_for_role("media"),
+            "default_model": settings.LLM_MODEL}
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "model": settings.LLM_MODEL, "media_model": settings.LLM_MEDIA_MODEL, "vision": True,
-            "ffmpeg": bool(shutil.which(settings.FFMPEG)), "memory": services.memory.count() if services else {}, "time": time.time()}
+    return {"ok": True, "model": settings.LLM_MODEL, "media_model": settings.LLM_MEDIA_MODEL, "router_model": settings.ROUTER_MODEL,
+            "vision": True, "ffmpeg": bool(shutil.which(settings.FFMPEG)),
+            "uploads_in_ram": services.attachments.count() if services else 0, "time": time.time()}
 
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...), authorization: Optional[str] = Header(default=None)):
+    """Keep an attachment in RAM for the next turns; the client keeps the original."""
     _check_token(authorization)
     data = await file.read()
     try:
@@ -111,24 +128,21 @@ async def upload(file: UploadFile = File(...), authorization: Optional[str] = He
     return att.public()
 
 
-@app.get("/memory/recent")
-async def memory_recent(limit: int = 20, authorization: Optional[str] = Header(default=None)):
+@app.post("/embed")
+async def embed(body: dict = Body(...), authorization: Optional[str] = Header(default=None)):
+    """Embeddings for the client's long-term memory: 'text' (nemotron-3-embed-1b) or 'vl' (llama-nemotron-embed-vl-1b-v2,
+    texts and data:image/... URIs in one space). The server only relays; nothing is kept."""
     _check_token(authorization)
-    return services.memory.recent(limit)
-
-
-@app.post("/memory/prune")
-async def memory_prune(authorization: Optional[str] = Header(default=None)):
-    """Drop trivial/duplicate dialog memories (test chatter like 'Проверка.')."""
-    _check_token(authorization)
-    return {"removed": services.memory.prune(), "left": services.memory.count()}
-
-
-@app.post("/memory/clear")
-async def memory_clear(authorization: Optional[str] = Header(default=None)):
-    """Forget everything (irreversible)."""
-    _check_token(authorization)
-    return {"removed": services.memory.clear(), "left": services.memory.count()}
+    kind = str(body.get("kind") or "text")
+    model = settings.EMBED_VL_MODEL if kind == "vl" else settings.EMBED_TEXT_MODEL
+    inputs = [str(x) for x in (body.get("input") or [])][:64]
+    if not inputs:
+        return {"embeddings": [], "model": model}
+    try:
+        vecs = await services.nim.embed(model, inputs, str(body.get("input_type") or "passage"))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"embedding failed: {str(e)[:200]}")
+    return {"embeddings": vecs, "model": model}
 
 
 class ClientLink:
@@ -205,7 +219,7 @@ async def ws_endpoint(ws: WebSocket):
                     link.cancel_pending()
                 turn_task = asyncio.create_task(link.session.handle_user_message(
                     msg.get("text") or "", msg.get("attachments") or [], msg.get("source") or "text",
-                    tts=bool(msg.get("tts")), memory=bool(msg.get("memory"))))
+                    tts=bool(msg.get("tts")), memory=bool(msg.get("memory")), memory_context=msg.get("memory_context") or []))
             elif t == "tool_result":
                 link.resolve(msg.get("call_id", ""), msg.get("result") or {})
             elif t == "interrupt":
@@ -234,6 +248,13 @@ async def ws_endpoint(ws: WebSocket):
                 old_gender = link.client_info.get("persona_gender")
                 link.client_info.update(incoming)
                 link.session.client_info = link.client_info
+                if "prompts" in incoming:
+                    link.session.prompts.reset()
+                    link.session.prompts.set(incoming.get("prompts") or {})
+                if "text_model" in incoming or "models" in incoming:
+                    log.info("session %s: models -> %s", link.session.id, {k: v.split("/")[-1] for k, v in link.session.models.items()})
+                    await link.send({"type": "model", "model": link.session.text_model, "models": link.session.models,
+                                     "media_model": link.session.model_for_role("media")})
                 new_gender = incoming.get("persona_gender")
                 if new_gender and old_gender and new_gender != old_gender and link.session.messages:
                     # the voice changed mid-conversation: the history is full of the old gender, so say it out loud
@@ -241,49 +262,12 @@ async def ws_endpoint(ws: WebSocket):
                         "Голос ассистента переключён на " + ("мужской" if new_gender == "male" else "женский") +
                         ": с этого момента говори о себе в " + ("мужском" if new_gender == "male" else "женском") +
                         " роде, даже если раньше в разговоре было иначе.")})
-                if "text_model" in incoming or "models" in incoming:
-                    log.info("session %s: models -> %s", link.session.id, {k: v.split("/")[-1] for k, v in link.session.models.items()})
-                    await link.send({"type": "model", "model": link.session.text_model, "models": link.session.models,
-                                     "media_model": link.session.model_for_role("media")})
-            elif t == "forget_sessions":      # a chat was deleted on the client: drop what was remembered from it
-                removed = services.memory.delete_sessions(list(msg.get("ids") or []))
-                await link.send({"type": "memory_stats", "memory": services.memory.count(), "removed": removed, "what": "chat"})
-            elif t == "memory_prune":
-                removed = services.memory.prune()
-                await link.send({"type": "memory_stats", "memory": services.memory.count(), "removed": removed, "what": "prune"})
-            elif t == "memory_clear":
-                removed = services.memory.clear()
-                await link.send({"type": "memory_stats", "memory": services.memory.count(), "removed": removed, "what": "clear"})
-            # ---- the client's memory tab: list / semantic search / add / edit / delete single records
-            elif t == "memory_list":
-                await link.send({"type": "memory_items", "items": services.memory.list_items(int(msg.get("limit") or 500), int(msg.get("offset") or 0)),
-                                 "total": sum(services.memory.count().values()), "query": ""})
-            elif t == "memory_search":
-                q = str(msg.get("query") or "").strip()
-                found = await services.memory.search(q, top_k=30, min_score=0.2) if q else []
-                await link.send({"type": "memory_items", "query": q, "total": sum(services.memory.count().values()),
-                                 "items": [{k: it.get(k) for k in ("id", "collection", "session_id", "kind", "text", "ts", "score")} for it in found]})
-            elif t == "memory_add":
-                mid = await services.memory.add_note(str(msg.get("text") or ""))
-                await link.send({"type": "memory_saved", "action": "add", "id": mid, "ok": mid is not None, "memory": services.memory.count()})
-            elif t == "memory_update":
-                try:
-                    ok = await services.memory.update_text(int(msg.get("id")), str(msg.get("text") or ""))
-                except (TypeError, ValueError):
-                    ok = False
-                await link.send({"type": "memory_saved", "action": "update", "id": msg.get("id"), "ok": ok, "memory": services.memory.count()})
-            elif t == "memory_delete":
-                try:
-                    n = services.memory.delete([int(msg.get("id"))])
-                except (TypeError, ValueError):
-                    n = 0
-                await link.send({"type": "memory_saved", "action": "delete", "id": msg.get("id"), "ok": n > 0, "memory": services.memory.count()})
             elif t == "get_prompts":
-                await link.send({"type": "prompts", **services.prompts.snapshot()})
+                await link.send({"type": "prompts", **link.session.prompts.snapshot()})
             elif t == "set_prompts":
-                await link.send({"type": "prompts", "saved": True, **services.prompts.set(msg.get("values") or {})})
+                await link.send({"type": "prompts", "saved": True, **link.session.prompts.set(msg.get("values") or {})})
             elif t == "reset_prompts":
-                await link.send({"type": "prompts", "saved": True, **services.prompts.reset(msg.get("keys"))})
+                await link.send({"type": "prompts", "saved": True, **link.session.prompts.reset(msg.get("keys"))})
             elif t == "ping":
                 await link.send({"type": "pong", "t": msg.get("t")})
     except WebSocketDisconnect:

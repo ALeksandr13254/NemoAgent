@@ -1,38 +1,57 @@
-"""Long-term memory: RAG over past dialogs.
+"""Long-term memory: RAG over past dialogs, stored on the client (client/data/memory.sqlite3).
 
-Two collections, because the two embedding models live in different vector spaces:
-  * "text"  — dialog turns with Nemotron, embedded by nvidia/nemotron-3-embed-1b;
-  * "vl"    — turns in which the user attached images (question + answer + the images as
-              data-URIs), embedded by nvidia/llama-nemotron-embed-vl-1b-v2 (text and images in one space).
+The server keeps nothing: it only turns texts (and data:image/… URIs) into vectors through its /embed
+proxy. Two collections, because the two embedding models live in different vector spaces:
+  * "text" — dialog turns and hand-written notes, embedded by nvidia/nemotron-3-embed-1b;
+  * "vl"   — turns with attached images (question + answer + the images), embedded by
+             nvidia/llama-nemotron-embed-vl-1b-v2 (text and images in one space).
 
-Storage: SQLite (source of truth) + an in-memory normalized numpy matrix per collection for
-cosine search. Thousands of turns search in well under a millisecond; embeddings are the only
-network cost and they are computed server-side through NIM.
+Storage: SQLite (source of truth) + an in-memory normalized numpy matrix per collection for cosine
+search; thousands of records search in well under a millisecond.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Awaitable, Callable, Optional
 
 import numpy as np
 
 from .config import settings
-from .nim import NIMClient
 
 log = logging.getLogger("memory")
 
-COLLECTION_MODEL = {"text": settings.EMBED_TEXT_MODEL, "vl": settings.EMBED_VL_MODEL}
+Embedder = Callable[[str, list[str], str], Awaitable[list[list[float]]]]   # (kind, inputs, input_type) -> vectors
+COLLECTIONS = ("text", "vl")
+
+# closing formulas the model loves to append; they only reinforce themselves once stored
+_FILLER_RE = re.compile(
+    r"(?:^|(?<=[.!?…\n])\s*)(?:(?:чем|как) (?:ещё |еще )?(?:я )?(?:могу|смогу) (?:вам |тебе )?(?:помочь|быть полезен|быть полезна)"
+    r"|(?:если|когда) (?:вам |тебе )?(?:понадобится|нужно|нужна|надо|захотите|хотите)(?: будет)? (?:ещё |еще )?(?:что-то|что-нибудь|помощь)[^.!?\n]{0,40}"
+    r"|обращайтесь,? если[^.!?\n]{0,30}|(?:всегда )?(?:рад|рада|готов|готова) помочь(?: ещё| еще)?(?: чем-нибудь| чем-то)?"
+    r"|how (?:else )?(?:can|may) i (?:help|assist)(?: you)?|is there anything else(?: i can (?:help|do)(?: you)?(?: with)?)?"
+    r"|(?:just |please )?let me know if (?:you need|you have|there(?:'s| is)) [^.!?\n]{0,30})\s*[.!?…]*\s*$", re.I)
+
+
+def strip_filler(text: str) -> str:
+    out = (text or "").rstrip()
+    for _ in range(3):
+        new = _FILLER_RE.sub("", out).rstrip()
+        if new == out:
+            break
+        out = new
+    return out.rstrip(" \n\t,;:—-") or (text or "").strip()
 
 
 class MemoryStore:
-    def __init__(self, nim: NIMClient, db_path: Path = settings.MEMORY_DB):
-        self.nim = nim
+    def __init__(self, embed: Embedder, db_path: Path):
+        self.embed = embed
         self.db_path = db_path
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(db_path), check_same_thread=False)
@@ -66,7 +85,7 @@ class MemoryStore:
 
     # ----------------------------------------------------------- persistence
     def _load(self) -> None:
-        for coll in COLLECTION_MODEL:
+        for coll in COLLECTIONS:
             rows = self._db.execute("SELECT memory_id, dim, vec FROM vectors WHERE collection=?", (coll,)).fetchall()
             ids, vecs = [], []
             for mid, dim, blob in rows:
@@ -77,7 +96,7 @@ class MemoryStore:
                 vecs.append(v)
             self._ids[coll] = ids
             self._mat[coll] = np.vstack(vecs) if vecs else np.zeros((0, 2048), dtype=np.float32)
-            log.info("memory[%s]: %d vectors", coll, len(ids))
+        log.info("memory: %s", self.count())
 
     def count(self) -> dict[str, int]:
         return {c: len(i) for c, i in self._ids.items()}
@@ -104,15 +123,13 @@ class MemoryStore:
         return mid
 
     # ------------------------------------------------------------- writing
-    async def remember_dialog(self, session_id: str, user_text: str, assistant_text: str, meta: Optional[dict] = None) -> Optional[int]:
+    async def remember_dialog(self, session_id: Optional[str], user_text: str, assistant_text: str, meta: Optional[dict] = None) -> Optional[int]:
         """Index one user/assistant exchange in the text collection."""
-        from .speechfmt import strip_filler
         user_text = (user_text or "").strip()
         assistant_text = strip_filler((assistant_text or "").strip())
         if not user_text and not assistant_text:
             return None
-        # Small talk and test chatter ("Проверка." / "Спасибо") are not worth remembering: they only
-        # pollute recall with near-identical junk that the model then parrots.
+        # small talk and test chatter ("Проверка." / "Спасибо") only pollute recall with near-identical junk
         if len(user_text) < 12 and len(assistant_text) < 60:
             return None
         doc = f"User: {user_text[:4000]}\nAssistant: {assistant_text[:6000]}"
@@ -121,35 +138,57 @@ class MemoryStore:
         if dup:
             return int(dup[0])
         try:
-            vec = (await self.nim.embed(COLLECTION_MODEL["text"], [doc], "passage"))[0]
+            vec = (await self.embed("text", [doc], "passage"))[0]
         except Exception as e:  # noqa: BLE001
             log.warning("embedding failed (text): %s", e)
             return None
         return self._insert("text", session_id, "dialog", doc, meta or {}, [self._norm(vec)])
 
-    async def remember_media(self, session_id: str, question: str, answer: str, files: list[dict],
+    async def remember_media(self, session_id: Optional[str], question: str, answer: str, files: list[dict],
                              image_data_uris: Optional[list[str]] = None) -> Optional[int]:
-        """Index a turn with attached images in the VL collection.
-
-        The text (question + file names + answer) and every image (as data-URI) each get their own
-        vector, all pointing at the same memory row, so the memory is reachable by text or by
-        visual similarity.
-        """
-        from .speechfmt import strip_filler
+        """Index a turn with attached images in the VL collection: the text and every image each get their own
+        vector, all pointing at the same record, so it is reachable by text or by visual similarity."""
         names = ", ".join(f.get("name", "?") for f in files) if files else ""
         doc = f"Attachments: {names}\nUser: {question[:2000]}\nAssistant: {strip_filler(answer)[:6000]}"
         inputs = [doc] + list(image_data_uris or [])[:8]
         try:
-            vecs = await self.nim.embed(COLLECTION_MODEL["vl"], inputs, "passage")
+            vecs = await self.embed("vl", inputs, "passage")
         except Exception as e:  # noqa: BLE001
             log.warning("embedding failed (vl): %s", e)
             try:  # images may be rejected (too big etc.) — fall back to text only
-                vecs = await self.nim.embed(COLLECTION_MODEL["vl"], [doc], "passage")
+                vecs = await self.embed("vl", [doc], "passage")
             except Exception as e2:  # noqa: BLE001
                 log.warning("embedding failed (vl, text only): %s", e2)
                 return None
         meta = {"files": [{"name": f.get("name"), "mime": f.get("mime")} for f in files]}
         return self._insert("vl", session_id, "media", doc, meta, [self._norm(v) for v in vecs])
+
+    async def add_note(self, text: str) -> Optional[int]:
+        """A memory written by hand: a fact, a preference, an agreement."""
+        text = (text or "").strip()
+        if not text:
+            return None
+        vec = (await self.embed("text", [text[:6000]], "passage"))[0]
+        return self._insert("text", None, "note", text, {"manual": True}, [self._norm(vec)])
+
+    async def update_text(self, mid: int, text: str) -> bool:
+        """Replace a record's text and its text vector (a media record keeps its image vectors)."""
+        text = (text or "").strip()
+        row = self._db.execute("SELECT collection FROM memories WHERE id=?", (mid,)).fetchone()
+        if not row or not text:
+            return False
+        coll = row[0]
+        vec = self._norm((await self.embed(coll, [text[:6000]], "passage"))[0]).astype(np.float32)
+        with self._lock:
+            self._db.execute("UPDATE memories SET text=? WHERE id=?", (text, mid))
+            first = self._db.execute("SELECT id FROM vectors WHERE memory_id=? ORDER BY id LIMIT 1", (mid,)).fetchone()
+            if first:   # the first vector of a record is always the text one
+                self._db.execute("UPDATE vectors SET dim=?, vec=? WHERE id=?", (int(vec.size), vec.tobytes(), first[0]))
+            else:
+                self._db.execute("INSERT INTO vectors(memory_id, collection, dim, vec) VALUES(?,?,?,?)", (mid, coll, int(vec.size), vec.tobytes()))
+            self._db.commit()
+        self._load()
+        return True
 
     # ------------------------------------------------------------- search
     def _search_vec(self, coll: str, q: np.ndarray, top_k: int, exclude_session: Optional[str], min_score: float) -> list[dict]:
@@ -187,8 +226,8 @@ class MemoryStore:
         return out[:top_k]
 
     async def search(self, query: str, *, top_k: Optional[int] = None, exclude_session: Optional[str] = None,
-                     collections: tuple[str, ...] = ("text", "vl"), min_score: Optional[float] = None) -> list[dict]:
-        """Semantic search across past dialogs. Runs both query embeddings concurrently."""
+                     collections: tuple[str, ...] = COLLECTIONS, min_score: Optional[float] = None) -> list[dict]:
+        """Semantic search across past dialogs; both query embeddings run concurrently."""
         top_k = top_k or settings.MEMORY_TOP_K
         min_score = settings.MEMORY_MIN_SCORE if min_score is None else min_score
         query = (query or "").strip()
@@ -200,7 +239,7 @@ class MemoryStore:
 
         async def one(coll: str) -> list[dict]:
             try:
-                vec = (await self.nim.embed(COLLECTION_MODEL[coll], [query[:6000]], "query"))[0]
+                vec = (await self.embed(coll, [query[:6000]], "query"))[0]
             except Exception as e:  # noqa: BLE001
                 log.warning("query embedding failed (%s): %s", coll, e)
                 return []
@@ -210,6 +249,12 @@ class MemoryStore:
         merged = [r for rs in results for r in rs]
         merged.sort(key=lambda r: -r["score"])
         return merged[:top_k]
+
+    # ------------------------------------------------------------- maintenance
+    def list_items(self, limit: int = 500, offset: int = 0) -> list[dict]:
+        rows = self._db.execute("SELECT id, collection, session_id, kind, text, ts FROM memories ORDER BY id DESC LIMIT ? OFFSET ?",
+                                (max(1, min(limit, 2000)), max(0, offset))).fetchall()
+        return [dict(zip(("id", "collection", "session_id", "kind", "text", "ts"), r)) for r in rows]
 
     def delete(self, ids: list[int]) -> int:
         if not ids:
@@ -222,10 +267,19 @@ class MemoryStore:
         self._load()
         return cur.rowcount
 
+    def delete_sessions(self, session_ids: list[str]) -> int:
+        """Forget everything remembered from the given server sessions (a chat deleted in the sidebar)."""
+        ids = [str(s) for s in session_ids if s]
+        if not ids:
+            return 0
+        with self._lock:
+            ph = ",".join("?" * len(ids))
+            rows = [r[0] for r in self._db.execute(f"SELECT id FROM memories WHERE session_id IN ({ph})", ids).fetchall()]
+        return self.delete(rows)
+
     def prune(self, min_user_chars: int = 12, min_answer_chars: int = 60) -> int:
-        """Remove trivial dialog memories (short question and short answer) and exact duplicates;
-        also cut the "Чем могу помочь?"-style endings out of stored answers."""
-        from .speechfmt import strip_filler
+        """Remove trivial dialog records (short question and short answer) and exact duplicates; cut the
+        "Чем могу помочь?" endings out of stored answers."""
         rows = self._db.execute("SELECT id, text FROM memories WHERE collection='text' AND kind='dialog' ORDER BY id").fetchall()
         seen: set[str] = set()
         victims: list[int] = []
@@ -244,49 +298,6 @@ class MemoryStore:
             seen.add(text)
         return self.delete(victims)
 
-    # ------------------------------------------------------------- editing (the client's memory tab)
-    def list_items(self, limit: int = 500, offset: int = 0) -> list[dict]:
-        rows = self._db.execute("SELECT id, collection, session_id, kind, text, ts FROM memories ORDER BY id DESC LIMIT ? OFFSET ?",
-                                (max(1, min(limit, 2000)), max(0, offset))).fetchall()
-        return [dict(zip(("id", "collection", "session_id", "kind", "text", "ts"), r)) for r in rows]
-
-    async def add_note(self, text: str) -> Optional[int]:
-        """A memory written by hand: a fact, a preference, an agreement. Searched like any dialog record."""
-        text = (text or "").strip()
-        if not text:
-            return None
-        vec = (await self.nim.embed(COLLECTION_MODEL["text"], [text[:6000]], "passage"))[0]
-        return self._insert("text", None, "note", text, {"manual": True}, [self._norm(vec)])
-
-    async def update_text(self, mid: int, text: str) -> bool:
-        """Replace a record's text and its text vector (a media record keeps its image vectors)."""
-        text = (text or "").strip()
-        row = self._db.execute("SELECT collection FROM memories WHERE id=?", (mid,)).fetchone()
-        if not row or not text:
-            return False
-        coll = row[0]
-        vec = self._norm((await self.nim.embed(COLLECTION_MODEL[coll], [text[:6000]], "passage"))[0]).astype(np.float32)
-        with self._lock:
-            self._db.execute("UPDATE memories SET text=? WHERE id=?", (text, mid))
-            first = self._db.execute("SELECT id FROM vectors WHERE memory_id=? ORDER BY id LIMIT 1", (mid,)).fetchone()
-            if first:   # the first vector of a record is always the text one
-                self._db.execute("UPDATE vectors SET dim=?, vec=? WHERE id=?", (int(vec.size), vec.tobytes(), first[0]))
-            else:
-                self._db.execute("INSERT INTO vectors(memory_id, collection, dim, vec) VALUES(?,?,?,?)", (mid, coll, int(vec.size), vec.tobytes()))
-            self._db.commit()
-        self._load()
-        return True
-
-    def delete_sessions(self, session_ids: list[str]) -> int:
-        """Forget everything remembered from the given server sessions (a chat deleted on the client)."""
-        ids = [str(s) for s in session_ids if s]
-        if not ids:
-            return 0
-        with self._lock:
-            ph = ",".join("?" * len(ids))
-            rows = [r[0] for r in self._db.execute(f"SELECT id FROM memories WHERE session_id IN ({ph})", ids).fetchall()]
-        return self.delete(rows)
-
     def clear(self) -> int:
         with self._lock:
             n = self._db.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
@@ -295,24 +306,3 @@ class MemoryStore:
             self._db.commit()
         self._load()
         return int(n)
-
-    def recent(self, limit: int = 20) -> list[dict]:
-        rows = self._db.execute("SELECT id, collection, session_id, kind, text, ts FROM memories ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-        return [{"id": r[0], "collection": r[1], "session_id": r[2], "kind": r[3], "text": r[4], "ts": r[5]} for r in rows]
-
-    def format_for_prompt(self, items: list[dict], max_chars: int = 6000) -> str:
-        if not items:
-            return ""
-        lines = []
-        used = 0
-        for it in items:
-            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(it["ts"]))
-            body = it["text"].strip()
-            if len(body) > 1500:
-                body = body[:1500] + " …"
-            entry = f"[{when} · {it['kind']} · relevance {it['score']:.2f}]\n{body}"
-            if used + len(entry) > max_chars:
-                break
-            lines.append(entry)
-            used += len(entry)
-        return "\n\n".join(lines)

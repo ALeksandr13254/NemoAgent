@@ -87,6 +87,14 @@ class Settings:
     TTS_STREAM_FRAMES = _int("TTS_STREAM_FRAMES", 8)   # vocoder frames per streamed audio chunk
     SPEAKER_DEVICE = _env("SPEAKER_DEVICE")
 
+    # --- everything persistent (chats, attachments, memory, settings, prompt overrides) lives under DATA_DIR ---
+    DATA_DIR = Path(_env("CLIENT_DATA_DIR", str(CLIENT_DIR / "data")))
+
+    # --- long-term memory (RAG over past dialogs), stored here on the client ---
+    MEMORY_TOP_K = _int("MEMORY_TOP_K", 4)             # memories mixed into a message when 🗂 is on
+    MEMORY_MIN_SCORE = _float("MEMORY_MIN_SCORE", 0.5)  # cosine threshold for that
+    ATTACHMENT_KEEP_HOURS = _int("ATTACHMENT_KEEP_HOURS", 1)   # uploads that never made it into a chat are dropped after this
+
     # --- computer control ---
     TOOLS_ENABLED = _bool("TOOLS_ENABLED", True)
     TOOL_CONFIRM = _env("TOOL_CONFIRM", "dangerous")   # never | dangerous | always

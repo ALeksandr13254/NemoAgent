@@ -4,6 +4,7 @@
   const chat = $('chat'), input = $('input'), attBox = $('attachments');
   let ws = null, state = null, pending = [];        // pending attachments [{id,name,is_image,...}]
   let current = null;                                // current assistant bubble
+  const endCurrent = () => { if (current) current.classList.remove('streaming'); current = null; };  // the bubble stops receiving text
   let reasoningCard = null, metrics = {};
   let sttBubble = null;
 
@@ -198,13 +199,13 @@
       }
       case 'prompts': renderPrompts(m); break;
       case 'trace': handleTrace(m); break;
-      case 'stage': current = null; reasoningCard = null; execCard = null; break;
-      case 'task': card('task', `🎯 <b>задача исполнителю</b>`, m.task, true); current = null; break;
+      case 'stage': endCurrent(); reasoningCard = null; execCard = null; break;
+      case 'task': card('task', `🎯 <b>задача исполнителю</b>`, m.task, true); endCurrent(); break;
       case 'executor_delta': {
         if (!execCard) execCard = card('tool exec', '🛠 <b>исполнитель</b>', '', false);
         execCard.querySelector('pre').textContent += m.content; break;
       }
-      case 'report': card('report', `📋 <b>отчёт исполнителя</b> · ${(m.report || '').length} симв.`, m.report, true); current = null; break;
+      case 'report': card('report', `📋 <b>отчёт исполнителя</b> · ${(m.report || '').length} симв.`, m.report, true); endCurrent(); break;
       case 'user_message': {
         const d = div('msg user'); d._text = m.text || '';
         const src = m.source === 'voice' ? '🎙 голос' : '⌨ текст';
@@ -215,7 +216,7 @@
         waitingSince(Date.now());   // "думаю… N с" until the first token: the free pool can take 20 s
         break;
       }
-      case 'round': if (m.round > 1) { current = null; } break;
+      case 'round': if (m.round > 1) endCurrent(); break;
       case 'delta': {
         if (waitTimer) { waitingSince(null); $('stt-state').textContent = ''; }
         if (!current) { current = add(div('msg assistant streaming')); current._text = ''; }
@@ -249,7 +250,7 @@
         const pre = reasoningCard.querySelector('pre'); pre.textContent += m.content; break;
       }
       case 'tool_call':
-        card('tool', `🔧 <b>${esc(m.name)}</b>`, JSON.stringify(m.arguments ?? m.raw, null, 1), false); current = null;
+        card('tool', `🔧 <b>${esc(m.name)}</b>`, JSON.stringify(m.arguments ?? m.raw, null, 1), false); endCurrent();
         logEntry('tool', `⚙ <b>вызов ${esc(m.name)}</b> ${new Date().toLocaleTimeString()}`, `<pre>${esc(JSON.stringify(m.arguments ?? m.raw, null, 1))}</pre>`, false);
         break;
       case 'tool_result': {
@@ -535,7 +536,7 @@
   $('hist-new').onclick = () => send({ type: 'new_session' });
   $('hist-clear').onclick = () => { if (confirm('Очистить текущий чат? Он исчезнет из списка, а его записи будут стёрты из долговременной памяти.')) send({ type: 'clear_chat' }); };
   $('mem-prune').onclick = () => { $('mem-status').textContent = 'прибираюсь…'; send({ type: 'memory_prune' }); };
-  $('mem-clear').onclick = () => { if (confirm('Стереть ВСЮ долговременную память сервера? Это необратимо.')) { $('mem-status').textContent = 'очищаю…'; send({ type: 'memory_clear' }); } };
+  $('mem-clear').onclick = () => { if (confirm('Стереть ВСЮ долговременную память на этом компьютере? Это необратимо.')) { $('mem-status').textContent = 'очищаю…'; send({ type: 'memory_clear' }); } };
   function fmtDate(ts) {
     const d = new Date(ts * 1000), now = new Date();
     const sameDay = d.toDateString() === now.toDateString();

@@ -1,15 +1,18 @@
-"""Uploaded files registry (images, audio, video, documents, screenshots) living in UPLOAD_DIR."""
+"""Uploaded files (images, audio, video, documents, screenshots) kept in memory only.
+
+The server writes nothing to disk. An upload lives in RAM for UPLOAD_TTL_S seconds — long enough for the
+conversation turns that use it (each use refreshes the timer) — and is dropped afterwards. The client
+keeps the originals in its own chat history.
+"""
 from __future__ import annotations
 
 import base64
-import dataclasses
 import io
-import json
 import mimetypes
+import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
-from pathlib import Path
+from dataclasses import dataclass, field
 from typing import Optional
 
 from .config import settings
@@ -28,11 +31,12 @@ OFFICE_EXTS = {"docx", "pptx", "xlsx"}
 class Attachment:
     id: str
     name: str
-    path: str
-    size: int
-    mime: str
-    is_image: bool
-    uploaded_at: float
+    data: bytes = field(repr=False)
+    size: int = 0
+    mime: str = "application/octet-stream"
+    is_image: bool = False
+    uploaded_at: float = 0.0
+    last_used: float = 0.0
     meta: dict = field(default_factory=dict)
 
     @property
@@ -58,43 +62,18 @@ class Attachment:
         return "other"
 
     def public(self) -> dict:
-        d = asdict(self)
-        d.pop("path", None)
-        d["kind"] = self.kind
-        return d
+        return {"id": self.id, "name": self.name, "size": self.size, "mime": self.mime, "is_image": self.is_image,
+                "uploaded_at": self.uploaded_at, "meta": self.meta, "kind": self.kind}
 
     def read(self) -> bytes:
-        return Path(self.path).read_bytes()
-
-
-_FIELDS = {f.name for f in dataclasses.fields(Attachment)}
+        return self.data
 
 
 class AttachmentStore:
-    def __init__(self, root: Path = settings.UPLOAD_DIR):
-        self.root = root
-        self.root.mkdir(parents=True, exist_ok=True)
+    def __init__(self, ttl_s: float = settings.UPLOAD_TTL_S):
+        self.ttl = ttl_s
         self._items: dict[str, Attachment] = {}
-        self._load_index()
-
-    def _index_path(self) -> Path:
-        return self.root / "index.json"
-
-    def _load_index(self) -> None:
-        try:
-            data = json.loads(self._index_path().read_text("utf-8"))
-            for d in data:
-                a = Attachment(**{k: v for k, v in d.items() if k in _FIELDS})  # tolerate fields of older versions
-                if Path(a.path).exists():
-                    self._items[a.id] = a
-        except Exception:
-            pass
-
-    def _save_index(self) -> None:
-        try:
-            self._index_path().write_text(json.dumps([asdict(a) for a in self._items.values()], ensure_ascii=False), "utf-8")
-        except Exception:
-            pass
+        self._lock = threading.Lock()
 
     @staticmethod
     def guess_mime(name: str, fallback: str = "application/octet-stream") -> str:
@@ -106,24 +85,45 @@ class AttachmentStore:
             raise ValueError(f"file too large: {len(data)/1048576:.1f} MB > {settings.UPLOAD_MAX_MB} MB")
         safe = "".join(ch for ch in (name or "file") if ch not in '\\/:*?"<>|').strip() or "file"
         ext = safe.rsplit(".", 1)[-1].lower() if "." in safe else ""
-        aid = uuid.uuid4().hex[:12]
-        path = self.root / f"{aid}_{safe}"
-        path.write_bytes(data)
         mime = mime or self.guess_mime(safe)
         if mime == "application/octet-stream":
             mime = self.guess_mime(safe)
-        att = Attachment(id=aid, name=safe, path=str(path), size=len(data), mime=mime,
-                         is_image=ext in IMAGE_EXTS or mime.startswith("image/"),
-                         uploaded_at=time.time(), meta=meta or {})
-        self._items[aid] = att
-        self._save_index()
+        now = time.time()
+        att = Attachment(id=uuid.uuid4().hex[:12], name=safe, data=data, size=len(data), mime=mime,
+                         is_image=ext in IMAGE_EXTS or mime.startswith("image/"), uploaded_at=now, last_used=now, meta=meta or {})
+        with self._lock:
+            self._items[att.id] = att
+        self.sweep()
         return att
 
     def get(self, aid: str) -> Optional[Attachment]:
-        return self._items.get(aid)
+        with self._lock:
+            att = self._items.get(aid)
+            if att:
+                att.last_used = time.time()
+            return att
+
+    def sweep(self) -> int:
+        """Drop uploads nobody touched for UPLOAD_TTL_S seconds."""
+        cutoff = time.time() - self.ttl
+        with self._lock:
+            dead = [k for k, a in self._items.items() if a.last_used < cutoff]
+            for k in dead:
+                del self._items[k]
+        if dead:
+            from . import media
+            media.forget(dead)
+        return len(dead)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def total_bytes(self) -> int:
+        with self._lock:
+            return sum(a.size for a in self._items.values())
 
     def image_data_uri(self, att: Attachment, max_side: int = 768, fmt: str = "JPEG", quality: int = 82) -> Optional[str]:
-        """Downscaled data-URI for the vision-language embedding model (~780 tokens per image)."""
+        """Downscaled data-URI (used by the client's memory for image similarity)."""
         if not att.is_image:
             return None
         try:

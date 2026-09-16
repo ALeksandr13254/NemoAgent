@@ -9,7 +9,9 @@ that one attachment never blows up the request or the context:
   * video   -> mp4 re-encoded by ffmpeg (<= MEDIA_VIDEO_MAX_HEIGHT p, 4 fps, mono audio), cut to MEDIA_VIDEO_MAX_S;
   * pdf     -> text per page (PyMuPDF); pages without a text layer are rendered as images;
   * docx / pptx / xlsx -> text pulled out of the XML;  plain text and code -> text.
-Built parts are cached per attachment id, so an attachment repeated in later turns costs nothing.
+Built parts are cached per attachment id (in memory, dropped with the upload), so an attachment repeated
+in later turns costs nothing. Conversions run in a temporary directory that is deleted right away — the
+server keeps no files.
 """
 from __future__ import annotations
 
@@ -22,6 +24,7 @@ import logging
 import re
 import shutil
 import subprocess
+import tempfile
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -122,12 +125,14 @@ def _build_audio(att: Attachment) -> Built:
     ext = att.ext
     ff = _ffmpeg()
     if ff:
-        out = Path(att.path + ".omni.mp3")
-        if not out.exists():
-            _run_ffmpeg(["-i", att.path, "-t", str(settings.MEDIA_AUDIO_MAX_S), "-vn", "-ac", "1", "-ar", "16000",
-                         "-codec:a", "libmp3lame", "-b:a", "64k"], out)
-        data, mime = out.read_bytes(), "audio/mpeg"
-        seconds = _ffprobe_seconds(str(out)) or len(data) / 8000
+        with tempfile.TemporaryDirectory(prefix="nemo-media-") as td:   # nothing stays on disk
+            src = Path(td) / f"in.{ext or 'bin'}"
+            src.write_bytes(data)
+            out = Path(td) / "out.mp3"
+            data = _run_ffmpeg(["-i", str(src), "-t", str(settings.MEDIA_AUDIO_MAX_S), "-vn", "-ac", "1", "-ar", "16000",
+                                "-codec:a", "libmp3lame", "-b:a", "64k"], out)
+            seconds = _ffprobe_seconds(str(out)) or len(data) / 8000
+        mime = "audio/mpeg"
     elif ext in ("wav", "mp3"):
         mime = "audio/wav" if ext == "wav" else "audio/mpeg"
         seconds = len(data) / (32000 if ext == "wav" else 16000)
@@ -142,14 +147,15 @@ def _build_audio(att: Attachment) -> Built:
 def _build_video(att: Attachment) -> Built:
     ff = _ffmpeg()
     if ff:
-        out = Path(att.path + ".omni.mp4")
-        if not out.exists():
-            _run_ffmpeg(["-i", att.path, "-t", str(settings.MEDIA_VIDEO_MAX_S),
-                         "-vf", f"scale=-2:'min({settings.MEDIA_VIDEO_MAX_HEIGHT},ih)'", "-r", "4",
-                         "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p",
-                         "-c:a", "aac", "-b:a", "48k", "-ac", "1", "-movflags", "+faststart"], out, timeout=600)
-        data = out.read_bytes()
-        seconds = _ffprobe_seconds(str(out)) or settings.MEDIA_VIDEO_MAX_S
+        with tempfile.TemporaryDirectory(prefix="nemo-media-") as td:
+            src = Path(td) / f"in.{att.ext or 'bin'}"
+            src.write_bytes(att.read())
+            out = Path(td) / "out.mp4"
+            data = _run_ffmpeg(["-i", str(src), "-t", str(settings.MEDIA_VIDEO_MAX_S),
+                                "-vf", f"scale=-2:'min({settings.MEDIA_VIDEO_MAX_HEIGHT},ih)'", "-r", "4",
+                                "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p",
+                                "-c:a", "aac", "-b:a", "48k", "-ac", "1", "-movflags", "+faststart"], out, timeout=600)
+            seconds = _ffprobe_seconds(str(out)) or settings.MEDIA_VIDEO_MAX_S
     elif att.ext in ("mp4", "m4v"):
         data = att.read()
         seconds = settings.MEDIA_VIDEO_MAX_S
@@ -165,7 +171,7 @@ def _build_video(att: Attachment) -> Built:
 def _build_pdf(att: Attachment) -> Built:
     import fitz  # PyMuPDF
 
-    doc = fitz.open(att.path)
+    doc = fitz.open(stream=att.read(), filetype="pdf")
     parts: list[dict] = []
     texts: list[str] = []
     images = 0
@@ -206,7 +212,7 @@ def _xml_text(xml: str, para_tags: tuple[str, ...] = ("</w:p>", "</a:p>")) -> st
 
 def _build_office(att: Attachment) -> Built:
     ext = att.ext
-    with zipfile.ZipFile(att.path) as z:
+    with zipfile.ZipFile(io.BytesIO(att.read())) as z:
         names = z.namelist()
         if ext == "docx":
             text = _xml_text(z.read("word/document.xml").decode("utf-8", "replace"))
@@ -278,6 +284,12 @@ def build(att: Attachment) -> Built:
         _cache.pop(next(iter(_cache)))
     _cache[att.id] = b
     return b
+
+
+def forget(ids: list[str]) -> None:
+    """Drop cached parts of uploads the attachment store has expired."""
+    for i in ids:
+        _cache.pop(i, None)
 
 
 async def build_parts(atts: list[Attachment]) -> tuple[list[dict], list[str], int]:

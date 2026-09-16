@@ -27,7 +27,6 @@ from typing import Any, Awaitable, Callable, Optional
 from . import media
 from .attachments import AttachmentStore
 from .config import settings
-from .memory import MemoryStore
 from .nim import Completion, NIMClient
 from .prompts import PromptStore
 from .speechfmt import ProseSpeechRouter, looks_like_promise, strip_filler
@@ -50,14 +49,14 @@ def _norm_args(raw: str) -> str:
 @dataclass
 class Services:
     nim: NIMClient
-    memory: MemoryStore
-    attachments: AttachmentStore
-    prompts: PromptStore
+    attachments: AttachmentStore      # uploads in RAM; the server keeps nothing on disk
 
 
 class AgentSession:
     def __init__(self, services: Services, send: SendFn, client_call: ClientCallFn, client_info: Optional[dict] = None):
         self.id = uuid.uuid4().hex[:12]
+        # prompt overrides come from the client (hello.client.prompts) and live with this session only
+        self.prompts = PromptStore((client_info or {}).get("prompts"))
         self.services = services
         self.send = send
         self.client_call = client_call
@@ -112,7 +111,7 @@ class AgentSession:
 
     def _system_message(self, tts: bool) -> dict:
         # template + style blocks live in prompts.py and can be edited from the client's prompt tab
-        return {"role": "system", "content": self.services.prompts.render(
+        return {"role": "system", "content": self.prompts.render(
             self._env_description() + "\n" + self._now_line(), tts)}
 
     def note_screenshot(self, attachment_id: str) -> None:
@@ -174,30 +173,42 @@ class AgentSession:
 
     # ------------------------------------------------------------- main turn
     async def handle_user_message(self, text: str, attachment_ids: list[str], source: str = "text",
-                                  tts: bool = False, memory: bool = False) -> None:
+                                  tts: bool = False, memory: bool = False, memory_context: Optional[list] = None) -> None:
         if self.busy():
             await self.interrupt()
-        self._task = asyncio.create_task(self._run_turn(text, attachment_ids, source, tts, memory))
+        self._task = asyncio.create_task(self._run_turn(text, attachment_ids, source, tts, memory, memory_context or []))
         try:
             await self._task
         except asyncio.CancelledError:
             pass
 
-    async def _recall(self, text: str) -> None:
-        """Memory recall for the dialogue agent (it has no tools): injected as a system note."""
-        try:
-            recalled = await asyncio.wait_for(self.services.memory.search(text, exclude_session=self.id), timeout=6.0)
-        except Exception as e:  # noqa: BLE001
-            log.warning("memory recall failed: %s", e)
+    def _inject_memories(self, items: list, max_chars: int = 6000) -> None:
+        """Memories the client recalled for this message (it owns the long-term memory): a system note for the
+        dialogue agent, which has no tools."""
+        lines, used = [], 0
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            body = str(it.get("text") or "").strip()
+            if not body:
+                continue
+            if len(body) > 1500:
+                body = body[:1500] + " …"
+            try:
+                when = dt.datetime.fromtimestamp(float(it.get("ts") or 0)).strftime("%Y-%m-%d %H:%M")
+            except (TypeError, ValueError, OSError):
+                when = "?"
+            score = it.get("score")
+            entry = f"[{when} · {it.get('kind') or 'dialog'}" + (f" · relevance {float(score):.2f}" if isinstance(score, (int, float)) else "") + f"]\n{body}"
+            if used + len(entry) > max_chars:
+                break
+            lines.append(entry)
+            used += len(entry)
+        if not lines:
             return
-        if not recalled:
-            return
-        block = self.services.memory.format_for_prompt(recalled)
         self.messages.append({"role": "system", "content": (
             "Воспоминания из прошлых разговоров (фон из ПРОШЛОГО, не текущий запрос; отвечай на последнее "
-            "сообщение по существу):\n" + block)})
-        await self.send({"type": "memory", "items": [{"kind": r["kind"], "score": round(r["score"], 2),
-                                                      "text": r["text"][:300], "ts": r["ts"]} for r in recalled]})
+            "сообщение по существу):\n" + "\n\n".join(lines))})
 
     def _context_for_executor(self, limit: int = 10) -> list[dict]:
         """Recent user/assistant turns as plain text so the executor understands what the task is about."""
@@ -305,7 +316,7 @@ class AgentSession:
         """The router: a fast parallel call that decides whether the user's request needs the executor and
         drafts the task. Runs while the dialogue agent is answering; its verdict is used only when the
         dialogue agent produced no `>>>` line. Returns {"needs_executor": bool, "task": str} or None."""
-        system = {"role": "system", "content": self.services.prompts.render_router(
+        system = {"role": "system", "content": self.prompts.render_router(
             self._env_description() + "\n" + self._now_line())}
         context = self._context_for_executor(limit=4)[:-1]   # the exchange before this message, text only
         # the message goes in quoted as data, otherwise a small model happily answers it instead of classifying
@@ -346,7 +357,7 @@ class AgentSession:
         """
         await self.send({"type": "stage", "name": "executor", "agent": "executor"})
         schemas = all_schemas(tools_enabled, memory_enabled=use_memory)
-        system = {"role": "system", "content": self.services.prompts.render_executor(
+        system = {"role": "system", "content": self.prompts.render_executor(
             self._env_description() + "\n" + self._now_line())}
         task_text = f"Задача от диалогового агента: {task}"
         task_msg: dict = {"role": "user", "content": task_text}
@@ -433,7 +444,8 @@ class AgentSession:
         tail = "\n(достигнут лимит раундов инструментов, задача могла остаться незавершённой; последние результаты инструментов:)\n" + "\n".join(recent_results)
         return (narration.strip() + tail).strip(), settings.MAX_TOOL_ROUNDS
 
-    async def _run_turn(self, text: str, attachment_ids: list[str], source: str, tts: bool, memory: bool = False) -> None:
+    async def _run_turn(self, text: str, attachment_ids: list[str], source: str, tts: bool, memory: bool = False,
+                        memory_context: Optional[list] = None) -> None:
         t_start = time.time()
         text = (text or "").strip()
         atts = [self.services.attachments.get(a) for a in attachment_ids or []]
@@ -452,9 +464,9 @@ class AgentSession:
             log.info("session %s: %d attachment(s) -> %d parts, ~%d tokens", self.id, len(atts), len(parts), media_tokens)
         content: Any = [{"type": "text", "text": user_text}, *parts] if parts else user_text
         self.messages.append({"role": "user", "content": content})
-        use_memory = memory or settings.MEMORY_AUTO_RECALL
-        if use_memory and text:
-            await self._recall(text)
+        use_memory = bool(memory)
+        if memory_context:
+            self._inject_memories(memory_context)
         self.turns += 1
         self._trim_context()
 
@@ -529,8 +541,11 @@ class AgentSession:
                     assistant_text = (assistant_text + "\n" + said).strip()
             if tts:
                 await self.send({"type": "speech_done", "display": display, "final": True})
+            # what the client may keep in its long-term memory for this turn (the server remembers nothing)
+            memo = {"user": text, "assistant": assistant_text, "reports": [r[:600] for r in reports], "source": source,
+                    "attachments": [a.public() for a in atts]} if assistant_text.strip() else None
             await self.send({"type": "done", "finish_reason": "speak" if tts else "stop",
-                             "ms": int((time.time() - t_start) * 1000), "first_token_ms": first_token_ms})
+                             "ms": int((time.time() - t_start) * 1000), "first_token_ms": first_token_ms, "memo": memo})
         except asyncio.CancelledError:
             if assistant_text:
                 self.messages.append({"role": "assistant", "content": assistant_text + " [interrupted by user]"})
@@ -550,20 +565,6 @@ class AgentSession:
             await self.send({"type": "error", "message": message, "detail": detail[:600]})
             await self.send({"type": "done", "finish_reason": "error", "ms": int((time.time() - t_start) * 1000)})
             return
-
-        if assistant_text.strip():
-            memo = assistant_text
-            if reports:
-                memo += "\n[исполнитель] " + " | ".join(r[:600] for r in reports)
-            meta = {"source": source, "attachments": [a.name for a in atts]}
-            images = [a for a in atts if a.is_image]
-            if images:
-                # turns with pictures go to the VL collection: reachable later by text or by a similar image
-                uris = [u for u in (self.services.attachments.image_data_uri(a) for a in images) if u]
-                asyncio.create_task(self.services.memory.remember_media(
-                    self.id, text or "(вложения)", memo, [a.public() for a in atts], uris))
-            else:
-                asyncio.create_task(self.services.memory.remember_dialog(self.id, text, memo, meta))
 
     async def _execute_call(self, ctx: ToolContext, call: dict) -> Any:
         name = call["function"]["name"]

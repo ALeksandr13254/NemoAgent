@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 import logging
 import re
@@ -18,6 +20,7 @@ from . import executor
 from pathlib import Path
 
 from .config import settings
+from .memory import MemoryStore
 
 log = logging.getLogger("core")
 
@@ -59,7 +62,8 @@ class ClientCore:
             "memory_recall": False,     # 🗂 button: recall long-term memory for the messages while it is on
         }
         # what the user picks in the settings panel survives a restart (client/data/settings.json)
-        self._settings_path = Path(__file__).resolve().parent.parent / "data" / "settings.json"
+        self.CHATS_DIR = settings.DATA_DIR / "chats"
+        self._settings_path = settings.DATA_DIR / "settings.json"
         self._load_state()
         self._sync_runtime_settings()
         self.current_source = "text"
@@ -69,6 +73,11 @@ class ClientCore:
         self.chat: Optional[dict] = None       # current chat record (client/data/chats), created by the first message
         self._asst_spoken = ""                  # spoken text of the dialogue agent's current stage
         self._asst_display = ""                 # its screen-only part
+        # everything persistent lives here on the client: the server keeps no files at all
+        self.data_dir = settings.DATA_DIR
+        self.attachments_dir = self.data_dir / "attachments"
+        self.memory = MemoryStore(self._embed, self.data_dir / "memory.sqlite3")
+        self.prompt_overrides: dict = self._load_prompt_overrides()
         self.speech_mode = False        # the model answered through the `speak` tool this turn
         self.dictation = False          # read-aloud tab: recognised speech goes into its text, not to the agent
         self._dictate_once = False      # one push-to-talk phrase for the read-aloud tab
@@ -123,8 +132,159 @@ class ClientCore:
         settings.SPEAKER_DEVICE = str(self.state.get("speaker_device") or "") or None
         settings.MIC_DEVICE = str(self.state.get("mic_device") or "") or None
 
+    # ============================================================== long-term memory, prompts, attachments (all local)
+    async def _embed(self, kind: str, inputs: list[str], input_type: str) -> list[list[float]]:
+        """Vectors through the server's /embed proxy (the only thing the server does for the memory)."""
+        r = await self._http.post(settings.http_url() + "/embed", json={"kind": kind, "input": inputs, "input_type": input_type},
+                                  headers={"Authorization": f"Bearer {settings.AGENT_TOKEN}"}, timeout=120)
+        if r.status_code != 200:
+            raise RuntimeError(f"embed {r.status_code}: {r.text[:200]}")
+        return r.json().get("embeddings") or []
+
+    async def _remember(self, memo: dict) -> None:
+        """One finished turn -> one memory record (dialog, or media when pictures were attached)."""
+        try:
+            user = str(memo.get("user") or "")
+            text = str(memo.get("assistant") or "")
+            reports = [str(r) for r in (memo.get("reports") or []) if r]
+            if reports:
+                text += "\n[исполнитель] " + " | ".join(reports)
+            atts = [a for a in (memo.get("attachments") or []) if isinstance(a, dict)]
+            images = [a for a in atts if a.get("is_image")]
+            if images:
+                uris = [u for u in (self._image_data_uri(a.get("id")) for a in images) if u]
+                await self.memory.remember_media(self.session_id, user or "(вложения)", text, atts, uris)
+            else:
+                await self.memory.remember_dialog(self.session_id, user, text,
+                                                  {"source": memo.get("source"), "attachments": [a.get("name") for a in atts]})
+        except Exception as e:  # noqa: BLE001
+            log.warning("memory write failed: %s", e)
+        await self.broadcast_status()
+
+    async def _search_memory_tool(self, args: dict) -> dict:
+        query = str(args.get("query") or "").strip()
+        limit = max(1, min(int(args.get("limit") or 5), 12))
+        items = await self.memory.search(query, top_k=limit, exclude_session=None, min_score=0.3)
+        return {"count": len(items), "results": [{"when": time.strftime("%Y-%m-%d %H:%M", time.localtime(i["ts"])),
+                                                  "kind": i["kind"], "score": round(i["score"], 3), "text": i["text"][:2500]} for i in items]}
+
+    async def _memory_ui(self, msg: dict) -> None:
+        """The memory tab and its sidebar buttons, served from the local store."""
+        t = msg.get("type")
+        count = self.memory.count
+        if t == "memory_list":
+            await self.broadcast({"type": "memory_items", "query": "", "total": sum(count().values()),
+                                  "items": self.memory.list_items(int(msg.get("limit") or 500), int(msg.get("offset") or 0))})
+            return
+        if t == "memory_search":
+            q = str(msg.get("query") or "").strip()
+            found = await self.memory.search(q, top_k=30, min_score=0.2) if q else []
+            await self.broadcast({"type": "memory_items", "query": q, "total": sum(count().values()),
+                                  "items": [{k: it.get(k) for k in ("id", "collection", "session_id", "kind", "text", "ts", "score")} for it in found]})
+            return
+        if t == "memory_add":
+            mid = await self.memory.add_note(str(msg.get("text") or ""))
+            await self.broadcast({"type": "memory_saved", "action": "add", "id": mid, "ok": mid is not None, "memory": count()})
+        elif t == "memory_update":
+            try:
+                ok = await self.memory.update_text(int(msg.get("id")), str(msg.get("text") or ""))
+            except (TypeError, ValueError):
+                ok = False
+            await self.broadcast({"type": "memory_saved", "action": "update", "id": msg.get("id"), "ok": ok, "memory": count()})
+        elif t == "memory_delete":
+            try:
+                n = self.memory.delete([int(msg.get("id"))])
+            except (TypeError, ValueError):
+                n = 0
+            await self.broadcast({"type": "memory_saved", "action": "delete", "id": msg.get("id"), "ok": n > 0, "memory": count()})
+        elif t == "memory_prune":
+            await self.broadcast({"type": "memory_stats", "memory": None, "removed": self.memory.prune(), "what": "prune"})
+        elif t == "memory_clear":
+            await self.broadcast({"type": "memory_stats", "memory": None, "removed": self.memory.clear(), "what": "clear"})
+        await self.broadcast_status()
+
+    def _load_prompt_overrides(self) -> dict:
+        try:
+            p = self.data_dir / "prompts.json"
+            if p.exists():
+                data = json.loads(p.read_text("utf-8"))
+                return {k: v for k, v in data.items() if isinstance(v, str) and v.strip()}
+        except Exception as e:  # noqa: BLE001
+            log.warning("cannot read prompt overrides: %s", e)
+        return {}
+
+    def _save_prompt_overrides(self, overrides: dict) -> None:
+        self.prompt_overrides = {k: v for k, v in overrides.items() if isinstance(v, str) and v.strip()}
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            (self.data_dir / "prompts.json").write_text(json.dumps(self.prompt_overrides, ensure_ascii=False, indent=1), "utf-8")
+        except Exception as e:  # noqa: BLE001
+            log.warning("cannot save prompt overrides: %s", e)
+
+    # attachments: the original of every upload stays here, next to the chat that used it
+    def _attachment_save(self, aid: str, name: str, data: bytes) -> None:
+        try:
+            self.attachments_dir.mkdir(parents=True, exist_ok=True)
+            safe = "".join(ch for ch in (name or "file") if ch not in '\\/:*?"<>|').strip() or "file"
+            (self.attachments_dir / f"{aid}_{safe}").write_bytes(data)
+        except Exception as e:  # noqa: BLE001
+            log.warning("cannot save attachment %s: %s", name, e)
+
+    def _attachment_file(self, aid: str) -> Optional[Path]:
+        if not aid or not self.attachments_dir.exists():
+            return None
+        return next(self.attachments_dir.glob(f"{aid}_*"), None)
+
+    def _attachments_delete(self, ids: list[str]) -> None:
+        for aid in ids:
+            f = self._attachment_file(aid)
+            if f:
+                try:
+                    f.unlink()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _attachments_sweep(self) -> int:
+        """Uploads that never made it into a saved chat (cancelled, or the chat was deleted) are dropped after
+        ATTACHMENT_KEEP_HOURS; everything referenced by a chat stays until that chat is deleted."""
+        if not self.attachments_dir.exists():
+            return 0
+        referenced: set[str] = set()
+        for p in self.CHATS_DIR.glob("*.json") if self.CHATS_DIR.exists() else []:
+            try:
+                for m in json.loads(p.read_text("utf-8")).get("messages", []):
+                    referenced.update(m.get("attachment_ids") or [])
+            except Exception:  # noqa: BLE001
+                continue
+        cutoff = time.time() - settings.ATTACHMENT_KEEP_HOURS * 3600
+        removed = 0
+        for f in self.attachments_dir.iterdir():
+            aid = f.name.split("_", 1)[0]
+            if aid not in referenced and f.stat().st_mtime < cutoff:
+                try:
+                    f.unlink()
+                    removed += 1
+                except Exception:  # noqa: BLE001
+                    pass
+        if removed:
+            log.info("attachments: %d unreferenced file(s) removed", removed)
+        return removed
+
+    def _image_data_uri(self, aid: str, max_side: int = 768) -> Optional[str]:
+        f = self._attachment_file(aid)
+        if not f:
+            return None
+        try:
+            from PIL import Image
+            im = Image.open(f).convert("RGB")
+            im.thumbnail((max_side, max_side))
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=82)
+            return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+        except Exception:  # noqa: BLE001
+            return None
+
     # ============================================================== chat history (client/data/chats/*.json)
-    CHATS_DIR = Path(__file__).resolve().parent.parent / "data" / "chats"
 
     def _chat_start_new(self) -> None:
         self.chat = None            # created lazily by the first message, so empty chats leave no files
@@ -209,9 +369,12 @@ class ClientCore:
             self._chat_start_new()
             await self.send_server({"type": "new_session"})
             await self.broadcast({"type": "cleared"})
+        att_ids = [i for m in (chat or {}).get("messages", []) for i in (m.get("attachment_ids") or [])]
         self.chat_delete(cid)
-        if sessions:
-            await self.send_server({"type": "forget_sessions", "ids": sessions})
+        self._attachments_delete(att_ids)
+        removed = self.memory.delete_sessions(sessions) if sessions else 0
+        await self.broadcast({"type": "memory_stats", "memory": self.memory.count(), "removed": removed, "what": "chat"})
+        await self.broadcast_status()
         await self._chat_broadcast_list()
 
     async def _chat_broadcast_list(self) -> None:
@@ -243,6 +406,7 @@ class ClientCore:
     # ============================================================== lifecycle
     async def run(self) -> None:
         self.loop = asyncio.get_running_loop()
+        self._attachments_sweep()
         from .local_ui import make_app
         import uvicorn
         config = uvicorn.Config(make_app(self), host=settings.UI_HOST, port=settings.UI_PORT, log_level="warning",
@@ -349,6 +513,7 @@ class ClientCore:
         info["tools_enabled"] = self.state["tools_enabled"]
         info["persona_gender"] = self._persona_gender()
         info["models"] = self._models()
+        info["prompts"] = dict(self.prompt_overrides)   # the server holds them for this session only
         return info
 
     async def send_server(self, msg: dict) -> bool:
@@ -380,6 +545,11 @@ class ClientCore:
             self.server_info["model"] = msg.get("model")
             self.server_info["models"] = msg.get("models") or self.server_info.get("models")
             await self.broadcast_status()
+            return
+        if t == "prompts":   # the session's prompt overrides, as the server now holds them: persist them here
+            if isinstance(msg.get("overrides"), dict):
+                self._save_prompt_overrides(msg["overrides"])
+            await self.broadcast(msg)
             return
         if t == "delta":
             content = msg.get("content") or ""
@@ -421,6 +591,8 @@ class ClientCore:
             self._chat_flush_assistant()
             if msg.get("finish_reason") == "interrupted":
                 self._chat_record({"role": "notice", "text": "прервано"})
+            if msg.get("memo"):
+                asyncio.ensure_future(self._remember(msg["memo"]))   # long-term memory is written here, on the client
             return
         if t == "client_tool":
             asyncio.ensure_future(self._handle_client_tool(msg.get("call_id"), msg.get("name"), msg.get("arguments") or {}))
@@ -446,6 +618,8 @@ class ClientCore:
         t0 = time.time()
         if name == "__screenshot":
             result = await asyncio.to_thread(executor.execute, name, args)
+        elif name == "__search_memory":       # the executor's search_memory tool: the memory lives here
+            result = await self._search_memory_tool(args)
         elif not self.state["tools_enabled"]:
             result = {"error": "computer-control tools are disabled in the client settings"}
         else:
@@ -496,9 +670,21 @@ class ClientCore:
         memory = bool(self.state.get("memory_recall"))
         await self.broadcast({"type": "user_message", "text": text, "attachments": attachments, "source": source, "memory": memory})
         self._asst_spoken = self._asst_display = ""
-        self._chat_record({"role": "user", "text": text, "source": source, "attachments": len(attachments)})
+        self._chat_record({"role": "user", "text": text, "source": source, "attachments": len(attachments), "attachment_ids": list(attachments)})
+        # recall happens here: the server has no memory of its own and gets the matches with the message
+        memory_context: list = []
+        if memory and text:
+            try:
+                recalled = await asyncio.wait_for(self.memory.search(text, exclude_session=self.session_id), timeout=6.0)
+            except Exception as e:  # noqa: BLE001
+                log.warning("memory recall failed: %s", e)
+                recalled = []
+            if recalled:
+                memory_context = [{"kind": r["kind"], "ts": r["ts"], "score": round(r["score"], 3), "text": r["text"]} for r in recalled]
+                await self.broadcast({"type": "memory", "items": [{"kind": r["kind"], "score": round(r["score"], 2),
+                                                                    "text": r["text"][:300], "ts": r["ts"]} for r in recalled]})
         ok = await self.send_server({"type": "user_message", "text": text, "attachments": attachments,
-                                     "source": source, "tts": tts, "memory": memory})
+                                     "source": source, "tts": tts, "memory": memory, "memory_context": memory_context})
         if not ok:
             self.turn_active = False
             await self.broadcast({"type": "done", "finish_reason": "error"})
@@ -517,7 +703,10 @@ class ClientCore:
                                       headers={"Authorization": f"Bearer {settings.AGENT_TOKEN}"})
             if r.status_code != 200:
                 return {"error": f"upload failed: {r.status_code} {r.text[:200]}"}
-            return r.json()
+            att = r.json()
+            if att.get("id"):
+                self._attachment_save(att["id"], filename, data)   # the server drops its copy after a while
+            return att
         except Exception as e:  # noqa: BLE001
             return {"error": f"upload failed: {e}"}
 
@@ -671,7 +860,8 @@ class ClientCore:
             inputs = list_input_devices()
         except Exception:  # noqa: BLE001
             pass
-        return {"type": "status", "server": self.connected, "session_id": self.session_id, "server_info": self.server_info,
+        return {"type": "status", "server": self.connected, "session_id": self.session_id,
+                "server_info": {**self.server_info, "memory": self.memory.count()},
                 "stt": self.status["stt"], "tts": self.status["tts"], "mic": self.status["mic"],
                 "speaker": getattr(self.player, "device_name", None), "output_devices": devices,
                 "microphone": getattr(self.mic, "device_name", None), "input_devices": inputs,
@@ -709,10 +899,8 @@ class ClientCore:
                 await self.broadcast({"type": "cleared"})
             else:
                 await self._forget_chat(cid)
-        elif t in ("memory_clear", "memory_prune"):
-            await self.send_server({"type": t})
-        elif t in ("memory_list", "memory_search", "memory_add", "memory_update", "memory_delete"):
-            await self.send_server(msg)      # the server answers with memory_items / memory_saved, relayed to the UI
+        elif t in ("memory_clear", "memory_prune", "memory_list", "memory_search", "memory_add", "memory_update", "memory_delete"):
+            await self._memory_ui(msg)       # the memory tab works on the local store
         elif t == "screenshot":
             res = await self.take_screenshot_attachment(msg.get("monitor"))
             await ws.send_text(json.dumps({"type": "attachment", "request_id": msg.get("request_id"), **res}, ensure_ascii=False))
