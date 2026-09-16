@@ -251,12 +251,14 @@ def expand_ru_dates_times(text: str) -> str:
     return _TIME_RE.sub(clock, text)
 
 
-# "24,9." — a decimal right before the full stop: the runtime's number regex refuses it and reads
-# "двадцать четыре,9". Decimals are expanded here (num2words: "двадцать четыре целых девять десятых").
+# The runtime's own number regex refuses a number that touches punctuation ("24,9.", "пункт 1.", "в 15."),
+# and the vocoder then hums on the raw digit. All numbers in Russian text are expanded here instead:
+# decimals ("двадцать четыре целых девять десятых"), then the remaining integers.
 _DECIMAL_RE = re.compile(r"(?<![\w.,])(-?\d+)[.,](\d+)(?![\w])")
+_INTEGER_RE = re.compile(r"(?<![\w.,])(-?\d+)(?![\w])")
 
 
-def expand_ru_decimals(text: str) -> str:
+def expand_ru_numbers(text: str) -> str:
     from num2words import num2words
 
     def dec(m: re.Match) -> str:
@@ -265,11 +267,30 @@ def expand_ru_decimals(text: str) -> str:
         except Exception:  # noqa: BLE001
             return m.group(0)
 
-    return _DECIMAL_RE.sub(dec, text)
+    def integer(m: re.Match) -> str:
+        try:
+            return num2words(int(m.group(1)), lang="ru")
+        except Exception:  # noqa: BLE001
+            return m.group(0)
+
+    return _INTEGER_RE.sub(integer, _DECIMAL_RE.sub(dec, text))
 
 
 # ----------------------------------------------------------------- sentence splitting
 _SENT_END = re.compile(r"(?<=[.!?…])\s+|(?<=[.!?…])$|\n+")
+_LIST_MARKER_RE = re.compile(r"(?:^|(?<=\n))[ \t]*(\d{1,3})[.)][ \t]+")
+
+
+def _list_marker_word(m: re.Match) -> str:
+    """'3. ' at a line start -> 'третье, ' (or 'third, ' in an English answer)."""
+    n = int(m.group(1))
+    try:
+        if is_russian_context(m.string) or not _LAT.search(m.string):
+            return _ru_ordinal(n, "n") + ", "
+        from num2words import num2words
+        return num2words(n, lang="en", to="ordinal") + ", "
+    except Exception:  # noqa: BLE001
+        return ""
 _BREAKS = (", ", "; ", ": ", " — ", " - ", " ")
 
 
@@ -309,6 +330,9 @@ class SentenceSplitter:
 
     def feed(self, delta: str) -> list[str]:
         self.buf += delta
+        # "1. Браузер…" at a line start: the sentence regex would cut "1." off as its own sentence and
+        # the voice hums on the bare digit; say the item number as a word instead ("первое, Браузер…")
+        self.buf = _LIST_MARKER_RE.sub(_list_marker_word, self.buf)
         out: list[str] = []
         while True:
             m = _SENT_END.search(self.buf)
@@ -409,7 +433,7 @@ class TeraTTS:
         russian = force == "ru" or (force is None and (is_russian_context(text) or not _LAT.search(text)))
         if russian:
             # before the vocabulary pass: it would put a space after the ':' of "15:02" and hide the time
-            text = expand_ru_decimals(expand_ru_dates_times(text))
+            text = expand_ru_numbers(expand_ru_dates_times(text))
         text = sanitize_vocab(text)
         # Latin words inside Russian speech are read as noise by the Russian voice: say them in Cyrillic
         text = transliterate_latin(text, force=(force == "ru"))
