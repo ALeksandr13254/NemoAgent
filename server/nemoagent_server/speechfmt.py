@@ -66,12 +66,18 @@ HOLD_CHARS = 70
 # Only first-person future forms count ("проверю", "посмотрим"), so a recap of past actions
 # ("я проверил и сказал…") is not mistaken for a promise.
 _PROMISE_RE = re.compile(
-    r"(?:\b(?:сейчас|секунд\w*|минут\w*|давай\w*|попробую)\b[^.!?\n]{0,40}?"
+    r"(?:\b(?:сейчас|секунд\w*|минут\w*|давай\w*|попробую|ладно|хорошо|окей)\b[^.!?\n]{0,40}?"
     r"\b(?:провер|посмотр|глян|сдела|запущ|запуст|найд|поищ|откро|узна|выполн|измер|прочита|прочт|скача|установ|"
-    r"зайд|переключ|закро|включ|выключ|удал|созда|сохран|отправ|скопир|перемещ|напиш|собер|посчита|подключ|запомн)"
-    r"\w{0,2}(?:ю|у|им|ем|ем)\b"
-    r"|\b(?:let me|i(?:'ll| will)|going to)\s+(?:check|look|see|run|open|find|search|read|try|do|execute|take a look))",
+    r"зайд|переключ|закро|включ|выключ|удал|созда|сохран|отправ|скопир|перемещ|напиш|собер|посчита|подключ|запомн|"
+    r"введ|напечата|набер|нажм|кликн|перейд|покаж|обнов|очист|очищ|перезагруз|перезагруж|перезапущ|перезапуст|выдел|"
+    r"вставл|прокруч|свер|смен|помен|переимен|распаку|запиш|отмен|останов|верн|постав|убер|перенес|загруж|выгруж|"
+    r"переда|скач|пересчита|перечита|разбер|отправл|отвеч|позвон|запрош|попрош|подожд|подготов|настро|отключ|активир)"
+    r"\w{0,3}(?:ю|у|им|ем|ём)\b"
+    r"|\b(?:let me|i(?:'ll| will)|going to)\s+(?:check|look|see|run|open|find|search|read|try|do|execute|take a look|"
+    r"type|enter|click|press|write|install|launch|start|close|switch|create|delete|save|send|set|turn))",
     re.I)
+# A whole short answer that just starts with "Сейчас …" / "Секунду …" is an announcement whatever the verb
+_PROMISE_OPENER_RE = re.compile(r"^\s*(?:сейчас|секунду|секундочку|минуту|минутку|один момент|момент)\b", re.I)
 
 
 def looks_like_promise(text: str) -> bool:
@@ -80,7 +86,9 @@ def looks_like_promise(text: str) -> bool:
     if not text or len(text) > 220:
         return False
     first = re.split(r"(?<=[.!?…])\s+", text, maxsplit=1)[0]
-    return bool(_PROMISE_RE.search(first))
+    if _PROMISE_RE.search(first):
+        return True
+    return bool(_PROMISE_OPENER_RE.match(first)) and len(first) <= 90 and not first.rstrip().endswith("?")
 
 
 class ProseSpeechRouter:
