@@ -86,9 +86,11 @@ def looks_like_promise(text: str) -> bool:
     if not text or len(text) > 220:
         return False
     first = re.split(r"(?<=[.!?…])\s+", text, maxsplit=1)[0]
+    if first.rstrip().endswith("?"):
+        return False   # "Сейчас перезагружу компьютер?" asks for confirmation, it is not an announcement
     if _PROMISE_RE.search(first):
         return True
-    return bool(_PROMISE_OPENER_RE.match(first)) and len(first) <= 90 and not first.rstrip().endswith("?")
+    return bool(_PROMISE_OPENER_RE.match(first)) and len(first) <= 90
 
 
 class ProseSpeechRouter:
