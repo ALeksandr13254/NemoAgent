@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import threading
 import time
 import uuid
@@ -205,9 +206,17 @@ class ClientCore:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 1.7, 15.0)
 
+    def _persona_gender(self) -> str:
+        """The agent speaks about itself in the gender of the voice that reads its answers:
+        ru_f1 / eng_f5 -> female, ru_m5 / eng_m3 -> male."""
+        voice = str(self.state.get("voice_en" if settings.TTS_LANGUAGE == "en" else "voice_ru") or "")
+        m = re.search(r"_([fm])\d", voice)
+        return "male" if m and m.group(1) == "m" else "female"
+
     def _client_info(self) -> dict:
         info = executor.client_description()
         info["tools_enabled"] = self.state["tools_enabled"]
+        info["persona_gender"] = self._persona_gender()
         if self.state.get("text_model"):
             info["text_model"] = self.state["text_model"]
         return info
@@ -567,6 +576,9 @@ class ClientCore:
                 self.state[key] = s[key]
         if "text_model" in s and self.server_ws:
             await self.send_server({"type": "client_info", "client": {"text_model": str(s["text_model"] or "")}})
+        if any(k in s for k in ("voice_ru", "voice_en", "tts_language")) and self.server_ws:
+            self._sync_runtime_settings()
+            await self.send_server({"type": "client_info", "client": {"persona_gender": self._persona_gender()}})
         for key in ("speaker_device", "mic_device"):   # unchanged: don't reopen the stream
             if key in s and self.state.get(key, "") == str(s[key] or ""):
                 s = {k: v for k, v in s.items() if k != key}

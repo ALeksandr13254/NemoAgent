@@ -91,7 +91,16 @@ class AgentSession:
         if not ci.get("tools_enabled", True):
             parts.append("computer-control tools are DISABLED by the user")
         parts.append(f"server: {platform.system()}")
-        return "; ".join(parts) if parts else "unknown"
+        env = "; ".join(parts) if parts else "unknown"
+        # the voice that reads the answers decides the grammatical gender the assistant uses for itself
+        gender = ci.get("persona_gender")
+        if gender == "male":
+            env += ("\nYour voice is MALE: speak about yourself in the masculine gender in Russian and other gendered "
+                    "languages (я готов, я проверил, я понял, я рад).")
+        elif gender == "female":
+            env += ("\nYour voice is FEMALE: speak about yourself in the feminine gender in Russian and other gendered "
+                    "languages (я готова, я проверила, я поняла, я рада).")
+        return env
 
     def _now_line(self) -> str:
         """Current date/time on the user's machine — injected every turn so the model never guesses."""

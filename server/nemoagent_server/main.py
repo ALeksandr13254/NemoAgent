@@ -218,8 +218,17 @@ async def ws_endpoint(ws: WebSocket):
                 link.session.reset()
                 await link.send(_ready(link.session))
             elif t == "client_info":
-                link.client_info.update(msg.get("client") or {})
+                incoming = msg.get("client") or {}
+                old_gender = link.client_info.get("persona_gender")
+                link.client_info.update(incoming)
                 link.session.client_info = link.client_info
+                new_gender = incoming.get("persona_gender")
+                if new_gender and old_gender and new_gender != old_gender and link.session.messages:
+                    # the voice changed mid-conversation: the history is full of the old gender, so say it out loud
+                    link.session.messages.append({"role": "system", "content": (
+                        "Голос ассистента переключён на " + ("мужской" if new_gender == "male" else "женский") +
+                        ": с этого момента говори о себе в " + ("мужском" if new_gender == "male" else "женском") +
+                        " роде, даже если раньше в разговоре было иначе.")})
                 if "text_model" in (msg.get("client") or {}):
                     log.info("session %s: text model -> %s", link.session.id, link.session.text_model)
                     await link.send({"type": "model", "model": link.session.text_model, "media_model": settings.LLM_MEDIA_MODEL})
