@@ -177,7 +177,11 @@
       }
       case 'speech_done': {
         if (current && current._speech) {
-          if (m.display) { current._text = m.display; current.innerHTML = spkBtn(true, 'озвучено (на экране — версия для чтения) · нажмите, чтобы повторить') + fmt(m.display); }
+          if (m.display) {
+            // the screen-only part (code, paths, exact figures after ===) is shown UNDER the spoken text, not instead of it
+            current._display = m.display; current._text = current._spoken + '\n' + m.display;
+            current.innerHTML = spkBtn(true) + fmt(current._spoken) + `<div class="display">${fmt(m.display)}</div>`;
+          }
           current.classList.remove('streaming');
           if (!m.final) current = null;
         }

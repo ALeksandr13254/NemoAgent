@@ -77,15 +77,24 @@ class SpeechToText:
         except Exception as e:  # noqa: BLE001
             log.warning("STT warmup failed: %s", e)
 
+    ALLOWED_AUTO = ("ru", "en")   # "auto" chooses between these two; anything else is noise heard as Japanese etc.
+
     def transcribe(self, audio16k: np.ndarray) -> str:
         lang = None if settings.STT_LANGUAGE in ("auto", "", None) else settings.STT_LANGUAGE
+        kw = dict(beam_size=max(1, settings.STT_BEAM), vad_filter=False, condition_on_previous_text=False,
+                  temperature=0.0, without_timestamps=True)
         with self._lock:
-            segments, info = self.model.transcribe(
-                audio16k, language=lang, beam_size=max(1, settings.STT_BEAM), vad_filter=False,
-                condition_on_previous_text=False, temperature=0.0, without_timestamps=True,
-            )
+            segments, info = self.model.transcribe(audio16k, language=lang, **kw)
             text = " ".join(s.text.strip() for s in segments).strip()
+            if lang is None and getattr(info, "language", None) not in self.ALLOWED_AUTO:
+                # whisper "detected" Japanese/Korean/… on breathing or keyboard noise: redo as Russian and
+                # let the hallucination filter decide
+                log.info("STT auto picked %s (p=%.2f) — redoing as Russian", info.language, info.language_probability or 0)
+                segments, info = self.model.transcribe(audio16k, language="ru", **kw)
+                text = " ".join(s.text.strip() for s in segments).strip()
         text = _collapse_repeats(text)
         if text.strip(" .!?…").lower() in _HALLUCINATIONS:
+            return ""
+        if not re.search(r"[A-Za-zА-Яа-яЁё]", text):   # no Latin or Cyrillic letters at all: not speech we want
             return ""
         return text
