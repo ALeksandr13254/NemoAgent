@@ -368,7 +368,7 @@
     $('btn-memory').classList.toggle('active', !!(state.settings && state.settings.memory_recall));
     $('pill-stt').title = state.mic ? 'микрофон: ' + state.mic : '';
     const s = state.settings || {};
-    for (const k of ['tts_mode', 'confirm', 'stt_language', 'tts_language']) $('s-' + k).value = s[k] || (k === 'tts_language' ? 'auto' : s[k]);
+    for (const k of ['tts_mode', 'confirm', 'stt_language', 'tts_language']) $('s-' + k).value = s[k] || (k === 'tts_language' ? 'ru' : s[k]);
     const models = si.models || {};
     for (const role of ['dialogue', 'executor', 'router', 'media']) $('s-model_' + role).value = s['model_' + role] || models[role] || '';
     $('model').title = Object.entries(models).map(([r, m]) => `${r}: ${m}`).join('\n');
@@ -420,7 +420,7 @@
   const SETTINGS_KEY = 'nemoagent-settings-open';
   let settingsHidden = false;
   try { settingsHidden = localStorage.getItem(SETTINGS_KEY) === '0'; } catch (e) { /* ignore */ }
-  function updateSettingsPane() { $('settings').classList.toggle('hidden', settingsHidden); $('btn-settings').classList.toggle('active', !settingsHidden); }
+  function updateSettingsPane() { $('settings').classList.toggle('collapsed', settingsHidden); $('btn-settings').classList.toggle('active', !settingsHidden); }
   $('btn-settings').onclick = () => {
     settingsHidden = !settingsHidden;
     try { localStorage.setItem(SETTINGS_KEY, settingsHidden ? '0' : '1'); } catch (e) { /* ignore */ }
@@ -570,7 +570,7 @@
   function updateSidebar() {
     const tab = activeTab();
     const wants = tab === 'chat' || tab === 'memory';
-    histPane.classList.toggle('hidden', !wants || sideUserHidden);
+    histPane.classList.toggle('collapsed', !wants || sideUserHidden);   // collapsed keeps its column: the middle never jumps
     $('side-chats').classList.toggle('hidden', tab !== 'chat');
     $('side-mem').classList.toggle('hidden', tab !== 'memory');
     $('btn-history').classList.toggle('hidden', !wants);
