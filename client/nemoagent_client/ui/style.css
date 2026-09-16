@@ -151,3 +151,9 @@ aside#history .side { display: flex; flex-direction: column; flex: 1; min-height
 #mem-editor textarea.dirty { border-color: var(--warn); }
 #mem-empty { padding: 14px 10px; }
 .hist-foot.col { display: flex; flex-direction: column; gap: 6px; }
+
+/* ---- SVG icons in buttons */
+button.icon svg { width: 20px; height: 20px; display: block; margin: 0 auto; }
+button svg { width: 16px; height: 16px; vertical-align: -3px; }
+.spk-btn svg { width: 14px; height: 14px; vertical-align: -2px; }
+#reader-play svg, #reader-stop svg { margin-right: 4px; }

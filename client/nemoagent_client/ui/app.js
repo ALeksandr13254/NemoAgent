@@ -29,9 +29,41 @@
     if (msg.type === 'send' || msg.type === 'say') add(div('errline', '⚠ нет связи с клиентом NemoAgent (окно run_client.bat) — страница переподключается, обновите её (Ctrl+F5), если это не проходит'));
   }
   function setPill(id, cls, text) { const p = $(id); p.className = 'pill ' + cls; if (text) p.textContent = text; }
-  /* 🔊 on every bubble: click = read this message aloud (again) with the local TTS */
+  /* ---------------------------------------------------------------- icons (inline SVG: crisp and readable, unlike the OS emoji font) */
+  const SVG = (inner, fill) => `<svg viewBox="0 0 24 24" fill="${fill || 'none'}" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${inner}</svg>`;
+  const ICONS = {
+    paperclip: SVG('<path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/>'),
+    screenshot: SVG('<rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/><circle cx="12" cy="10" r="3"/>'),
+    memory: SVG('<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/>'),
+    mic: SVG('<path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v3M8 22h8"/>'),
+    listen: SVG('<path d="M4 10v4M8 6v12M12 3v18M16 7v10M20 10v4"/>'),
+    stop: SVG('<rect x="5" y="5" width="14" height="14" rx="2"/>', 'currentColor'),
+    send: SVG('<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>'),
+    speaker: SVG('<path d="M11 5 6 9H2v6h4l5 4V5Z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a10 10 0 0 1 0 14"/>'),
+    gear: SVG('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>'),
+    menu: SVG('<path d="M4 6h16M4 12h16M4 18h16"/>'),
+    record: SVG('<circle cx="12" cy="12" r="7"/>', 'currentColor'),
+    play: SVG('<path d="M6 4v16l14-8Z"/>', 'currentColor'),
+  };
+  const ICON_BUTTONS = {
+    'btn-attach': ['paperclip', 'Прикрепить файлы: картинки, аудио, видео, документы'],
+    'btn-shot': ['screenshot', 'Снять скриншот экрана и прикрепить к сообщению'],
+    'btn-memory': ['memory', 'Память (RAG): пока включено, к сообщениям подмешиваются воспоминания из прошлых разговоров'],
+    'btn-ptt': ['mic', 'Говорить: удерживайте кнопку или пробел (push-to-talk)'],
+    'btn-listen': ['listen', 'Слушать автоматически: голосовая активность (VAD) сама находит фразу'],
+    'btn-stop': ['stop', 'Остановить ответ и озвучку'],
+    'btn-send': ['send', 'Отправить (Enter)'],
+    'btn-settings': ['gear', 'Настройки'],
+    'btn-history': ['menu', 'Показать или спрятать левую панель'],
+    'reader-dictate': ['mic', 'Диктовка: включает прослушивание, распознанная речь добавляется в текст, а не отправляется агенту'],
+    'reader-ptt': ['record', 'Удерживайте, чтобы надиктовать одну фразу в текст'],
+  };
+  for (const [id, [name, title]] of Object.entries(ICON_BUTTONS)) { const b = $(id); if (b) { b.innerHTML = ICONS[name]; b.title = title; } }
+  $('reader-play').innerHTML = ICONS.play + ' Озвучить'; $('reader-stop').innerHTML = ICONS.stop + ' Стоп';
+
+  /* speaker button on every bubble: click = read this message aloud (again) with the local TTS */
   function spkBtn(spoken, title) {
-    return `<button class="spk-btn${spoken ? ' spoken' : ''}" title="${title || (spoken ? 'озвучено · нажмите, чтобы повторить' : 'озвучить')}">🔊</button>`;
+    return `<button class="spk-btn${spoken ? ' spoken' : ''}" title="${title || (spoken ? 'озвучено · нажмите, чтобы повторить' : 'озвучить')}">${ICONS.speaker}</button>`;
   }
   chat.addEventListener('click', (e) => {
     const b = e.target.closest('.spk-btn'); if (!b) return;
