@@ -181,7 +181,7 @@
       case 'chat_loaded': renderHistory(m.chat); break;
       case 'memory_stats': {
         const total = m.memory ? Object.values(m.memory).reduce((a, b) => a + b, 0) : 0;
-        const what = m.what === 'clear' ? 'память очищена' : m.what === 'prune' ? 'прибрано' : 'записи чата забыты';
+        const what = m.what === 'clear' ? 'память очищена' : m.what === 'prune' ? 'прибрано' : m.what === 'chats' ? 'история чатов очищена' : 'записи чата забыты';
         $('mem-status').textContent = `${what}: удалено ${m.removed}, осталось ${total}`;
         if (!$('memory').classList.contains('hidden')) memRefresh();
         break;
@@ -582,7 +582,7 @@
   };
   updateSidebar();
   $('hist-new').onclick = () => send({ type: 'new_session' });
-  $('hist-clear').onclick = () => { if (confirm('Очистить текущий чат? Он исчезнет из списка, а его записи будут стёрты из долговременной памяти.')) send({ type: 'clear_chat' }); };
+  $('hist-clear').onclick = () => { if (confirm('Удалить все чаты? Будут стёрты их сообщения, вложения и связанные записи долговременной памяти. Заметки, добавленные вручную, останутся.')) send({ type: 'clear_chats' }); };
   $('mem-prune').onclick = () => { $('mem-status').textContent = 'прибираюсь…'; send({ type: 'memory_prune' }); };
   $('mem-clear').onclick = () => { if (confirm('Стереть ВСЮ долговременную память на этом компьютере? Это необратимо.')) { $('mem-status').textContent = 'очищаю…'; send({ type: 'memory_clear' }); } };
   function fmtDate(ts) {

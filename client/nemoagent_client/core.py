@@ -379,6 +379,27 @@ class ClientCore:
         await self.broadcast_status()
         await self._chat_broadcast_list()
 
+    async def _forget_all_chats(self) -> None:
+        """«Очистить историю чатов»: every chat goes, with its attachments and what its sessions left in memory."""
+        sessions: list[str] = []
+        att_ids: list[str] = []
+        chats = [c for c in (self.chat_load(item["id"]) for item in self.chat_list()) if c]
+        if self.chat and not any(c["id"] == self.chat["id"] for c in chats):
+            chats.append(self.chat)        # the current chat is not saved until its first message
+        for chat in chats:
+            sessions.extend(chat.get("sessions") or [])
+            att_ids.extend(i for m in chat.get("messages", []) for i in (m.get("attachment_ids") or []))
+            self.chat_delete(chat["id"])
+        self._chat_start_new()
+        await self.send_server({"type": "new_session"})
+        await self.broadcast({"type": "cleared"})
+        self._attachments_delete(att_ids)
+        removed = self.memory.delete_sessions(sorted(set(sessions))) if sessions else 0
+        log.info("chat history cleared: %d chat(s), %d attachment(s), %d memory record(s)", len(chats), len(att_ids), removed)
+        await self.broadcast({"type": "memory_stats", "memory": self.memory.count(), "removed": removed, "what": "chats"})
+        await self.broadcast_status()
+        await self._chat_broadcast_list()
+
     async def _chat_broadcast_list(self) -> None:
         await self.broadcast({"type": "chats", "items": self.chat_list(), "current": self.chat["id"] if self.chat else None})
 
@@ -908,13 +929,10 @@ class ClientCore:
             await self._chat_broadcast_list()
         elif t == "open_chat":
             await self.open_chat(ws, str(msg.get("id") or ""))
-        elif t in ("delete_chat", "clear_chat"):
-            cid = str(msg.get("id") or "") if t == "delete_chat" else (self.chat["id"] if self.chat else "")
-            if t == "clear_chat" and not self.chat:
-                await self.send_server({"type": "new_session"})
-                await self.broadcast({"type": "cleared"})
-            else:
-                await self._forget_chat(cid)
+        elif t == "delete_chat":
+            await self._forget_chat(str(msg.get("id") or ""))
+        elif t in ("clear_chats", "clear_chat"):   # clear_chat: an older page still open in a browser tab
+            await self._forget_all_chats()
         elif t in ("memory_clear", "memory_prune", "memory_list", "memory_search", "memory_add", "memory_update", "memory_delete"):
             await self._memory_ui(msg)       # the memory tab works on the local store
         elif t == "screenshot":
