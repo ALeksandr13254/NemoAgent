@@ -171,6 +171,44 @@ class AgentSession:
         self.id = uuid.uuid4().hex[:12]
         self.created_at = time.time()
 
+    async def restore(self, history: list) -> None:
+        """Rebuild the live context from the client's chat record: a chat reopened from the history, or a message
+        edited or deleted in it. Every turn comes back as text; the attachments of the last MEDIA_KEEP_TURNS user
+        turns come back as media while this server still holds them."""
+        turns = []
+        for m in history or []:
+            if not isinstance(m, dict) or m.get("role") not in ("user", "assistant"):
+                continue
+            content = str(m.get("content") or "")
+            ids = [str(i) for i in (m.get("attachment_ids") or [])] if m["role"] == "user" else []
+            if content.strip() or ids:
+                turns.append((m["role"], content, ids))
+        turns = turns[-200:]
+        users = [i for i, t in enumerate(turns) if t[0] == "user"]
+        keep = set(users[-settings.MEDIA_KEEP_TURNS:]) if settings.MEDIA_KEEP_TURNS > 0 else set()
+        messages: list[dict] = []
+        held: list[str] = []
+        last_ids: list[str] = []
+        for i, (role, content, ids) in enumerate(turns):
+            atts = [a for a in (self.services.attachments.get(x) for x in ids) if a]
+            held.extend(a.id for a in atts)
+            if role == "user":
+                last_ids = [a.id for a in atts]
+            if atts and i in keep:
+                parts, notes, _ = await media.build_parts(atts)
+                text = (content or "(see attachments)") + "\n\n[attachments: " + "; ".join(notes) + "]"
+                messages.append({"role": role, "content": [{"type": "text", "text": text}, *parts] if parts else text})
+            elif ids:
+                messages.append({"role": role, "content": content + f"\n[медиа этого сообщения ({len(ids)} шт.) уже были "
+                                                                    "показаны и убраны из контекста]"})
+            else:
+                messages.append({"role": role, "content": content})
+        self.messages = messages
+        self.turns = len(users)
+        self.session_attachment_ids = held
+        self.last_attachment_ids = last_ids
+        self._trim_context()
+
     # ------------------------------------------------------------- main turn
     async def handle_user_message(self, text: str, attachment_ids: list[str], source: str = "text",
                                   tts: bool = False, memory: bool = False, memory_context: Optional[list] = None) -> None:

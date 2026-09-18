@@ -74,6 +74,7 @@ class ClientCore:
         self.chat: Optional[dict] = None       # current chat record (client/data/chats), created by the first message
         self._asst_spoken = ""                  # spoken text of the dialogue agent's current stage
         self._asst_display = ""                 # its screen-only part
+        self._turn_link: Optional[tuple] = None  # (chat id, message id) of the turn in progress: its memory record links here
         # everything persistent lives here on the client: the server keeps no files at all
         self.data_dir = settings.DATA_DIR
         self.attachments_dir = self.data_dir / "attachments"
@@ -143,22 +144,28 @@ class ClientCore:
             raise RuntimeError(f"embed {r.status_code}: {r.text[:200]}")
         return r.json().get("embeddings") or []
 
-    async def _remember(self, memo: dict) -> None:
-        """One finished turn -> one memory record (dialog, or media when pictures were attached)."""
+    async def _memory_write(self, user: str, answer: str, reports: list, atts: list, source: Optional[str]) -> Optional[int]:
+        """One exchange -> one memory record (dialog, or media when pictures were attached); returns its id."""
+        text = answer
+        reports = [str(r) for r in reports if r]
+        if reports:
+            text += "\n[исполнитель] " + " | ".join(reports)
+        images = [a for a in atts if a.get("is_image")]
+        if images:
+            uris = [u for u in (self._image_data_uri(a.get("id")) for a in images) if u]
+            return await self.memory.remember_media(self.session_id, user or "(вложения)", text, atts, uris)
+        return await self.memory.remember_dialog(self.session_id, user, text,
+                                                 {"source": source, "attachments": [a.get("name") for a in atts]})
+
+    async def _remember(self, memo: dict, link: Optional[tuple] = None) -> None:
+        """One finished turn -> one memory record, linked to the turn's user message (chat id, message id) so that
+        editing or deleting that message later updates the record too."""
         try:
-            user = str(memo.get("user") or "")
-            text = str(memo.get("assistant") or "")
-            reports = [str(r) for r in (memo.get("reports") or []) if r]
-            if reports:
-                text += "\n[исполнитель] " + " | ".join(reports)
             atts = [a for a in (memo.get("attachments") or []) if isinstance(a, dict)]
-            images = [a for a in atts if a.get("is_image")]
-            if images:
-                uris = [u for u in (self._image_data_uri(a.get("id")) for a in images) if u]
-                await self.memory.remember_media(self.session_id, user or "(вложения)", text, atts, uris)
-            else:
-                await self.memory.remember_dialog(self.session_id, user, text,
-                                                  {"source": memo.get("source"), "attachments": [a.get("name") for a in atts]})
+            mem_id = await self._memory_write(str(memo.get("user") or ""), str(memo.get("assistant") or ""),
+                                              list(memo.get("reports") or []), atts, memo.get("source"))
+            if mem_id and link and not self._chat_set_field(link[0], link[1], "memory_id", mem_id):
+                self.memory.delete([mem_id])    # the message was deleted while the answer was still coming
         except Exception as e:  # noqa: BLE001
             log.warning("memory write failed: %s", e)
         await self.broadcast_status()
@@ -297,6 +304,7 @@ class ClientCore:
             self.chat = {"id": time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4], "title": "",
                          "created": time.time(), "updated": time.time(), "messages": []}
         entry["ts"] = time.time()
+        entry.setdefault("mid", uuid.uuid4().hex[:10])     # stable id: the UI edits and deletes a message by it
         self.chat["messages"].append(entry)
         if self.session_id and self.session_id not in self.chat.setdefault("sessions", []):
             self.chat["sessions"].append(self.session_id)   # server sessions this chat lived in (for forgetting it)
@@ -305,6 +313,9 @@ class ClientCore:
         self.chat["updated"] = time.time()
         self._chat_save()
         if self.loop:
+            if entry.get("role") == "assistant":   # the finished live bubble learns its id (the user one gets it at once)
+                asyncio.ensure_future(self.broadcast({"type": "chat_entry", "role": "assistant", "mid": entry["mid"],
+                                                      "text": entry.get("text") or "", "display": entry.get("display") or ""}))
             asyncio.ensure_future(self._chat_broadcast_list())
 
     def _chat_flush_assistant(self) -> None:
@@ -328,6 +339,136 @@ class ClientCore:
             (self.CHATS_DIR / f"{self.chat['id']}.json").write_text(json.dumps(self.chat, ensure_ascii=False, indent=1), "utf-8")
         except Exception as e:  # noqa: BLE001
             log.warning("cannot save chat: %s", e)
+
+    def _chat_write(self, chat: dict) -> None:
+        """Write any chat record (the open one or another from the history)."""
+        try:
+            self.CHATS_DIR.mkdir(parents=True, exist_ok=True)
+            (self.CHATS_DIR / f"{chat['id']}.json").write_text(json.dumps(chat, ensure_ascii=False, indent=1), "utf-8")
+        except Exception as e:  # noqa: BLE001
+            log.warning("cannot save chat: %s", e)
+
+    def _chat_set_field(self, cid: str, mid: str, key: str, value) -> bool:
+        """Set one field of one message, in the open chat or in a chat file; False if the message is gone."""
+        chat = self.chat if self.chat and self.chat.get("id") == cid else self.chat_load(cid)
+        entry = next((m for m in (chat or {}).get("messages", []) if m.get("mid") == mid), None)
+        if entry is None:
+            return False
+        entry[key] = value
+        self._chat_write(chat)
+        return True
+
+    @staticmethod
+    def _history_for_model(chat: dict) -> list[dict]:
+        """The chat as the model gets it back: user and assistant turns as text, with the ids of the user's
+        attachments (the server returns the media of the last turns to the context while it still holds them)."""
+        history = []
+        for m in (chat or {}).get("messages", []):
+            if m.get("role") == "user":
+                ids = list(m.get("attachment_ids") or [])
+                if (m.get("text") or "").strip() or ids:
+                    history.append({"role": "user", "content": m.get("text") or "", "attachment_ids": ids})
+            elif m.get("role") == "assistant":
+                content = (m.get("text") or "") + (("\n" + m["display"]) if m.get("display") else "")
+                if content.strip():
+                    history.append({"role": "assistant", "content": content})
+        return history
+
+    @staticmethod
+    def _turn_of(msgs: list, start: Optional[int]) -> Optional[dict]:
+        """The turn that starts with the user message msgs[start]: its question, answers and executor reports."""
+        if start is None or start >= len(msgs) or msgs[start].get("role") != "user":
+            return None
+        answers, reports = [], []
+        for m in msgs[start + 1:]:
+            if m.get("role") == "user":
+                break
+            if m.get("role") == "assistant":
+                answers.append((m.get("text") or "") + (("\n" + m["display"]) if m.get("display") else ""))
+            elif m.get("role") == "report":
+                reports.append((m.get("text") or "")[:600])
+        user = msgs[start]
+        return {"entry": user, "user": (user.get("text") or "").strip(), "assistant": "\n".join(a for a in answers if a.strip()).strip(),
+                "reports": reports, "attachment_ids": list(user.get("attachment_ids") or []), "source": user.get("source")}
+
+    def _local_attachment(self, aid: str) -> Optional[dict]:
+        f = self._attachment_file(aid)
+        if not f:
+            return None
+        import mimetypes
+        mime = mimetypes.guess_type(f.name)[0] or ""
+        return {"id": aid, "name": f.name.split("_", 1)[-1], "mime": mime, "is_image": mime.startswith("image/")}
+
+    async def _resync_turn_memory(self, chat: dict, old: dict, new: Optional[dict]) -> None:
+        """Keep the long-term memory in step with an edited turn: its record is dropped and, if the turn still has a
+        question and an answer, written again from the corrected text. Turns that were never remembered stay out."""
+        linked = old["entry"].get("memory_id")
+        ids = [int(linked)] if linked else self.memory.find_turn(chat.get("sessions") or [], old["user"])
+        if not ids:
+            return
+        removed = self.memory.delete(ids)
+        new_id = None
+        if new and new["user"] and new["assistant"]:
+            if self.session_id and self.session_id not in chat.setdefault("sessions", []):
+                chat["sessions"].append(self.session_id)    # so that deleting the chat later forgets this record too
+            atts = [a for a in (self._local_attachment(i) for i in new["attachment_ids"]) if a]
+            try:
+                new_id = await self._memory_write(new["user"], new["assistant"], new["reports"], atts, new["source"])
+            except Exception as e:  # noqa: BLE001
+                log.warning("memory rewrite failed: %s", e)
+        if new is not None:
+            if new_id:
+                new["entry"]["memory_id"] = new_id
+            else:
+                new["entry"].pop("memory_id", None)
+        self._chat_write(chat)
+        await self.broadcast({"type": "memory_stats", "memory": self.memory.count(), "removed": removed, "what": "edit"})
+        await self.broadcast_status()
+
+    async def _change_chat_message(self, mid: str, text: Optional[str]) -> None:
+        """Edit (text) or delete (text is None) one user or assistant message of the open chat. The record is saved,
+        the model's context is rebuilt from it (the next message already goes out with the change) and the turn's
+        long-term memory record is rewritten."""
+        chat = self.chat
+        msgs = (chat or {}).get("messages") or []
+        idx = next((i for i, m in enumerate(msgs) if m.get("mid") == mid and m.get("role") in ("user", "assistant")), None)
+        if idx is None:
+            await self.broadcast({"type": "error", "message": "Сообщение не найдено в открытом чате: откройте чат заново."})
+            return
+        if text is not None and not text.strip():
+            await self.broadcast({"type": "error", "message": "Пустой текст не сохранён: чтобы убрать сообщение, удалите его."})
+            return
+        if self.turn_active:            # the answer being generated rests on the old history: stop it first
+            await self.interrupt("edit")
+            self._chat_flush_assistant()
+        start = next((i for i in range(idx, -1, -1) if msgs[i].get("role") == "user"), None)
+        old_turn = self._turn_of(msgs, start)
+        entry = msgs[idx]
+        if text is None:
+            msgs.pop(idx)
+        else:
+            entry["text"] = text.strip()
+            if entry.get("role") == "assistant":
+                entry["display"] = ""    # one editable text: exactly what the model sees from now on
+            entry["edited"] = time.time()
+        if not any(m.get("role") in ("user", "assistant") for m in msgs):
+            await self._forget_chat(chat["id"])      # nothing left: the chat goes, as if deleted in the sidebar
+            return
+        firsts = [m for m in msgs if m.get("role") == "user"]
+        if firsts:
+            chat["title"] = (firsts[0].get("text") or "(вложение)").strip().replace("\n", " ")[:60]
+        chat["updated"] = time.time()
+        self._chat_write(chat)
+        await self.send_server({"type": "sync_history", "messages": self._history_for_model(chat)})
+        if text is None:
+            await self.broadcast({"type": "message_deleted", "mid": mid})
+        else:
+            await self.broadcast({"type": "message_edited", "mid": mid, "entry": entry})
+        await self._chat_broadcast_list()
+        if old_turn:
+            new_turn = None if (text is None and idx == start) else self._turn_of(msgs, start)
+            await self._resync_turn_memory(chat, old_turn, new_turn)
+        log.info("chat %s: message %s %s", chat["id"], mid, "deleted" if text is None else "edited")
 
     @staticmethod
     def _chat_path_ok(cid: str) -> bool:
@@ -410,19 +551,15 @@ class ClientCore:
             return
         await self.interrupt("open chat")
         self._chat_flush_assistant()
+        if any(not m.get("mid") for m in chat.get("messages", [])):   # chats saved before messages had ids
+            for m in chat["messages"]:
+                m.setdefault("mid", uuid.uuid4().hex[:10])
+            self._chat_write(chat)
         self.chat = chat
         self.assistant_buffer = ""
         self._asst_spoken = self._asst_display = ""
-        # the model gets the user/assistant turns back (text only; media of old turns is gone anyway)
-        history = []
-        for m in chat.get("messages", []):
-            if m.get("role") == "user" and (m.get("text") or "").strip():
-                history.append({"role": "user", "content": m["text"]})
-            elif m.get("role") == "assistant":
-                content = (m.get("text") or "") + (("\n" + m["display"]) if m.get("display") else "")
-                if content.strip():
-                    history.append({"role": "assistant", "content": content})
-        await self.send_server({"type": "load_session", "messages": history})
+        # the model gets the user/assistant turns back (media of the last turns too, while the server holds it)
+        await self.send_server({"type": "load_session", "messages": self._history_for_model(chat)})
         await self.broadcast({"type": "chat_loaded", "chat": chat})
         await self._chat_broadcast_list()
 
@@ -615,7 +752,7 @@ class ClientCore:
             if msg.get("finish_reason") == "interrupted":
                 self._chat_record({"role": "notice", "text": "прервано"})
             if msg.get("memo"):
-                asyncio.ensure_future(self._remember(msg["memo"]))   # long-term memory is written here, on the client
+                asyncio.ensure_future(self._remember(msg["memo"], self._turn_link))   # long-term memory lives on the client
             return
         if t == "client_tool":
             asyncio.ensure_future(self._handle_client_tool(msg.get("call_id"), msg.get("name"), msg.get("arguments") or {}))
@@ -691,9 +828,12 @@ class ClientCore:
             self.speaker.cancel()
         tts = self._speak_enabled()
         memory = bool(self.state.get("memory_recall"))
-        await self.broadcast({"type": "user_message", "text": text, "attachments": attachments, "source": source, "memory": memory})
         self._asst_spoken = self._asst_display = ""
-        self._chat_record({"role": "user", "text": text, "source": source, "attachments": len(attachments), "attachment_ids": list(attachments)})
+        entry = {"role": "user", "text": text, "source": source, "attachments": len(attachments), "attachment_ids": list(attachments)}
+        self._chat_record(entry)
+        self._turn_link = (self.chat["id"], entry["mid"])
+        await self.broadcast({"type": "user_message", "text": text, "attachments": attachments, "source": source, "memory": memory,
+                              "mid": entry["mid"]})
         # recall happens here: the server has no memory of its own and gets the matches with the message
         memory_context: list = []
         if memory and text:
@@ -931,6 +1071,10 @@ class ClientCore:
             await self.open_chat(ws, str(msg.get("id") or ""))
         elif t == "delete_chat":
             await self._forget_chat(str(msg.get("id") or ""))
+        elif t == "edit_message":
+            await self._change_chat_message(str(msg.get("mid") or ""), str(msg.get("text") or ""))
+        elif t == "delete_message":
+            await self._change_chat_message(str(msg.get("mid") or ""), None)
         elif t in ("clear_chats", "clear_chat"):   # clear_chat: an older page still open in a browser tab
             await self._forget_all_chats()
         elif t in ("memory_clear", "memory_prune", "memory_list", "memory_search", "memory_add", "memory_update", "memory_delete"):

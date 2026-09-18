@@ -16,7 +16,8 @@ Protocol (JSON text frames):
         TTS form and streamed as speech_delta; memory=true: the executor gets the search_memory tool
         (which asks the client back); memory_context: memories the client recalled for this message
     {"type":"tool_result", "call_id": "...", "result": {...}}     # answer to client_tool
-    {"type":"interrupt"} · {"type":"new_session"} · {"type":"load_session", "messages":[{role, content}...]}
+    {"type":"interrupt"} · {"type":"new_session"} · {"type":"load_session", "messages":[{role, content, attachment_ids?}...]}
+    {"type":"sync_history", "messages":[...]}   # a message of the open chat was edited/deleted: same session, new context
     {"type":"client_info", "client": {...}}     # update capabilities / models / prompts / gender
     {"type":"get_prompts"} / {"type":"set_prompts","values":{...}} / {"type":"reset_prompts","keys":[...]}
         -> {"type":"prompts","current":{...},"defaults":{...},"overrides":{...},"overridden":[...]}
@@ -231,18 +232,18 @@ async def ws_endpoint(ws: WebSocket):
                 link.cancel_pending()
                 link.session.reset()
                 await link.send(_ready(link.session))
-            elif t == "load_session":
-                # the client reopens a chat from its history: the model gets the user/assistant turns back
+            elif t in ("load_session", "sync_history"):
+                # load_session: the client reopens a chat from its history (a fresh session for it);
+                # sync_history: a message of the open chat was edited or deleted (same session, context rebuilt)
                 await link.session.interrupt()
                 link.cancel_pending()
-                link.session.reset()
-                history = [{"role": m["role"], "content": str(m.get("content") or "")}
-                           for m in (msg.get("messages") or []) if isinstance(m, dict) and m.get("role") in ("user", "assistant")
-                           and str(m.get("content") or "").strip()]
-                link.session.messages = history[-200:]
-                link.session.turns = sum(1 for m in link.session.messages if m["role"] == "user")
-                log.info("session %s: chat restored, %d messages", link.session.id, len(link.session.messages))
-                await link.send(_ready(link.session))
+                if t == "load_session":
+                    link.session.reset()
+                await link.session.restore(msg.get("messages") or [])
+                log.info("session %s: %s, %d messages", link.session.id,
+                         "chat restored" if t == "load_session" else "history synced after an edit", len(link.session.messages))
+                if t == "load_session":
+                    await link.send(_ready(link.session))
             elif t == "client_info":
                 incoming = msg.get("client") or {}
                 old_gender = link.client_info.get("persona_gender")

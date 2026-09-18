@@ -45,6 +45,8 @@
     menu: SVG('<path d="M4 6h16M4 12h16M4 18h16"/>'),
     record: SVG('<circle cx="12" cy="12" r="7"/>', 'currentColor'),
     play: SVG('<path d="M6 4v16l14-8Z"/>', 'currentColor'),
+    edit: SVG('<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>'),
+    trash: SVG('<path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="m19 6-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/>'),
   };
   const ICON_BUTTONS = {
     'btn-attach': ['paperclip', 'Прикрепить файлы: картинки, аудио, видео, документы'],
@@ -65,6 +67,70 @@
   function spkBtn(spoken, title) {
     return `<button class="spk-btn${spoken ? ' spoken' : ''}" title="${title || (spoken ? 'озвучено · нажмите, чтобы повторить' : 'озвучить')}">${ICONS.speaker}</button>`;
   }
+  /* every user/assistant bubble: speak again, edit, delete (the last two need the record id, data-mid) */
+  function msgTools(spoken, title) {
+    return `<span class="msg-tools">${spkBtn(spoken, title)}`
+      + `<button class="msg-edit" title="Изменить сообщение: модель увидит исправленный текст">${ICONS.edit}</button>`
+      + `<button class="msg-del" title="Удалить сообщение из чата и из контекста модели">${ICONS.trash}</button></span>`;
+  }
+  const editedMark = (e) => (e.edited ? '<span class="edited-mark" title="Сообщение изменено вручную">изменено</span>' : '');
+  function msgNode(e) {
+    let d;
+    if (e.role === 'user') {
+      d = div('msg user'); d._text = e.text || ''; d._edit = e.text || '';
+      d.innerHTML = `<div class="src">${e.source === 'voice' ? '🎙 голос' : '⌨ текст'}${editedMark(e)}${msgTools(false, 'озвучить это сообщение')}</div>${fmt(e.text || '')}`
+        + (e.attachments ? `<div class="src">📎 ${e.attachments} влож.</div>` : '');
+    } else {
+      d = div('msg assistant'); d._text = e.text || ''; d._spoken = e.spoken ? (e.text || '') : '';
+      d._edit = (e.text || '') + (e.display ? '\n\n' + e.display : '');
+      d.innerHTML = msgTools(!!e.spoken) + editedMark(e) + fmt(e.text || '') + (e.display ? `<div class="display">${fmt(e.display)}</div>` : '');
+    }
+    if (e.mid) d.dataset.mid = e.mid;
+    return d;
+  }
+  function flash(text) {
+    const el = $('stt-state'); el.textContent = text;
+    setTimeout(() => { if (el.textContent === text) el.textContent = ''; }, 4000);
+  }
+  function startEdit(d) {
+    if (d.classList.contains('editing')) return;
+    const saved = d.innerHTML;
+    d.classList.add('editing');
+    d.innerHTML = '<div class="msg-editor"><textarea></textarea><div class="row"><span class="muted small">Ctrl+Enter: сохранить, '
+      + 'Esc: отмена</span><span class="spacer"></span><button class="ed-cancel">Отмена</button>'
+      + '<button class="ed-save primary">Сохранить</button></div></div>';
+    const ta = d.querySelector('textarea');
+    ta.value = d._edit ?? d._text ?? '';
+    const fit = () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight + 2, window.innerHeight * 0.6) + 'px'; };
+    const close = () => { d.innerHTML = saved; d.classList.remove('editing'); };
+    const save = () => {
+      const v = ta.value.trim();
+      if (!v) { flash('Пустой текст не сохранить: чтобы убрать сообщение, удалите его'); return; }
+      if (v === (d._edit || '').trim()) { close(); return; }
+      d.querySelector('.ed-save').disabled = true; d.querySelector('.ed-save').textContent = 'Сохраняю…';
+      send({ type: 'edit_message', mid: d.dataset.mid, text: v });
+    };
+    ta.addEventListener('input', fit);
+    ta.addEventListener('keydown', (ev) => {
+      ev.stopPropagation();
+      if (ev.key === 'Escape') { ev.preventDefault(); close(); } else if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); save(); }
+    });
+    d.querySelector('.ed-cancel').onclick = close;
+    d.querySelector('.ed-save').onclick = save;
+    fit(); ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length);
+  }
+  chat.addEventListener('click', (e) => {
+    const del = e.target.closest('.msg-del');
+    if (del) {
+      const d = del.closest('.msg');
+      if (d && d.dataset.mid && confirm('Удалить это сообщение? Оно исчезнет из чата, и модель больше не будет его учитывать.')) {
+        send({ type: 'delete_message', mid: d.dataset.mid });
+      }
+      return;
+    }
+    const ed = e.target.closest('.msg-edit');
+    if (ed) { const d = ed.closest('.msg'); if (d && d.dataset.mid) startEdit(d); }
+  });
   chat.addEventListener('click', (e) => {
     const b = e.target.closest('.spk-btn'); if (!b) return;
     const msg = b.closest('.msg'); if (!msg) return;
@@ -179,9 +245,27 @@
       }
       case 'chats': renderChats(m); break;
       case 'chat_loaded': renderHistory(m.chat); break;
+      case 'chat_entry': {   // a finished assistant bubble learns the id of its record (needed for edit and delete)
+        const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+        const d = [...chat.querySelectorAll('.msg.assistant:not([data-mid])')].find((x) => norm(x._spoken || x._text) === norm(m.text));
+        if (d) { d.dataset.mid = m.mid; d._edit = (m.text || '') + (m.display ? '\n\n' + m.display : ''); }
+        break;
+      }
+      case 'message_edited': {
+        const old = chat.querySelector(`.msg[data-mid="${CSS.escape(m.mid)}"]`);
+        if (old) old.replaceWith(msgNode(m.entry));
+        flash('Сообщение изменено: следующий запрос уйдёт с исправленной историей');
+        break;
+      }
+      case 'message_deleted': {
+        const old = chat.querySelector(`.msg[data-mid="${CSS.escape(m.mid)}"]`);
+        if (old) old.remove();
+        flash('Сообщение удалено: модель больше его не учитывает');
+        break;
+      }
       case 'memory_stats': {
         const total = m.memory ? Object.values(m.memory).reduce((a, b) => a + b, 0) : 0;
-        const what = m.what === 'clear' ? 'память очищена' : m.what === 'prune' ? 'прибрано' : m.what === 'chats' ? 'история чатов очищена' : 'записи чата забыты';
+        const what = m.what === 'clear' ? 'память очищена' : m.what === 'prune' ? 'прибрано' : m.what === 'chats' ? 'история чатов очищена' : m.what === 'edit' ? 'память обновлена после правки' : 'записи чата забыты';
         $('mem-status').textContent = `${what}: удалено ${m.removed}, осталось ${total}`;
         if (!$('memory').classList.contains('hidden')) memRefresh();
         break;
@@ -207,9 +291,10 @@
       }
       case 'report': card('report', `📋 <b>отчёт исполнителя</b> · ${(m.report || '').length} симв.`, m.report, true); endCurrent(); break;
       case 'user_message': {
-        const d = div('msg user'); d._text = m.text || '';
+        const d = div('msg user'); d._text = m.text || ''; d._edit = m.text || '';
+        if (m.mid) d.dataset.mid = m.mid;
         const src = m.source === 'voice' ? '🎙 голос' : '⌨ текст';
-        let html = `<div class="src">${src}${m.memory ? ' · 🗂 память' : ''}${spkBtn(false, 'озвучить это сообщение')}</div>${fmt(m.text || '')}`;
+        let html = `<div class="src">${src}${m.memory ? ' · 🗂 память' : ''}${msgTools(false, 'озвучить это сообщение')}</div>${fmt(m.text || '')}`;
         if (m.attachments && m.attachments.length) html += `<div class="src">📎 ${m.attachments.length} влож.</div>`;
         d.innerHTML = html; add(d);
         current = null; reasoningCard = null; metrics = { stt: metrics.stt }; updateMetrics();
@@ -221,7 +306,7 @@
         if (waitTimer) { waitingSince(null); $('stt-state').textContent = ''; }
         if (!current) { current = add(div('msg assistant streaming')); current._text = ''; }
         current._text += m.content;
-        current.innerHTML = spkBtn(current._speech) + fmt(current._text); scroll();
+        current.innerHTML = msgTools(current._speech) + fmt(current._text); scroll();
         break;
       }
       case 'speech_delta': {
@@ -230,7 +315,7 @@
         // the spoken version is kept for the 🔊 button
         if (!current || !current._speech) { current = add(div('msg assistant streaming speech')); current._text = ''; current._spoken = ''; current._speech = true; }
         current._text += m.content; current._spoken += m.content;
-        current.innerHTML = spkBtn(true) + fmt(current._text); scroll();
+        current.innerHTML = msgTools(true) + fmt(current._text); scroll();
         break;
       }
       case 'speech_done': {
@@ -238,7 +323,7 @@
           if (m.display) {
             // the screen-only part (code, paths, exact figures after ===) is shown UNDER the spoken text, not instead of it
             current._display = m.display; current._text = current._spoken + '\n' + m.display;
-            current.innerHTML = spkBtn(true) + fmt(current._spoken) + `<div class="display">${fmt(m.display)}</div>`;
+            current.innerHTML = msgTools(true) + fmt(current._spoken) + `<div class="display">${fmt(m.display)}</div>`;
           }
           current.classList.remove('streaming');
           if (!m.final) current = null;
@@ -610,15 +695,8 @@
   function renderHistory(c) {
     chat.innerHTML = ''; current = null; reasoningCard = null; execCard = null; waitingSince(null); $('stt-state').textContent = '';
     for (const e of c.messages || []) {
-      if (e.role === 'user') {
-        const d = div('msg user'); d._text = e.text || '';
-        d.innerHTML = `<div class="src">${e.source === 'voice' ? '🎙 голос' : '⌨ текст'}${spkBtn(false, 'озвучить это сообщение')}</div>${fmt(e.text || '')}` + (e.attachments ? `<div class="src">📎 ${e.attachments} влож.</div>` : '');
-        add(d);
-      } else if (e.role === 'assistant') {
-        const d = div('msg assistant'); d._text = e.text || ''; d._spoken = e.spoken ? (e.text || '') : '';
-        d.innerHTML = spkBtn(!!e.spoken) + fmt(e.text || '') + (e.display ? `<div class="display">${fmt(e.display)}</div>` : '');
-        add(d);
-      } else if (e.role === 'task') card('task', '🎯 <b>задача исполнителю</b>', e.text || '', false);
+      if (e.role === 'user' || e.role === 'assistant') add(msgNode(e));
+      else if (e.role === 'task') card('task', '🎯 <b>задача исполнителю</b>', e.text || '', false);
       else if (e.role === 'report') card('report', '📋 <b>отчёт исполнителя</b>', e.text || '', false);
       else if (e.role === 'notice') add(div('notice', esc(e.text || '')));
     }

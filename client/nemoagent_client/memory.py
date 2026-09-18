@@ -267,6 +267,24 @@ class MemoryStore:
         self._load()
         return cur.rowcount
 
+    def find_turn(self, session_ids: list[str], user_text: str) -> list[int]:
+        """Records of one exchange (dialog or media) from the given sessions, found by the question they store.
+        Used for turns remembered before chat messages were linked to their memory records."""
+        question = (user_text or "").strip()
+        ids = [str(s) for s in session_ids if s]
+        if not question or not ids:
+            return []
+        with self._lock:
+            ph = ",".join("?" * len(ids))
+            rows = self._db.execute(f"SELECT id, kind, text FROM memories WHERE session_id IN ({ph})", ids).fetchall()
+        out = []
+        for mid, kind, text in rows:
+            if kind == "dialog" and text.startswith(f"User: {question[:4000]}\nAssistant:"):
+                out.append(int(mid))
+            elif kind == "media" and f"\nUser: {question[:2000]}\nAssistant:" in text:
+                out.append(int(mid))
+        return out
+
     def delete_sessions(self, session_ids: list[str]) -> int:
         """Forget everything remembered from the given server sessions (a chat deleted in the sidebar)."""
         ids = [str(s) for s in session_ids if s]
