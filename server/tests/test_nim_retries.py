@@ -1,10 +1,11 @@
-"""Requests to NIM with retries: NIMClient._race against a fake NIM (httpx.MockTransport with timed SSE streams).
+"""Retries of NIM requests: NIMClient against a fake NIM (httpx.MockTransport with timed SSE streams).
 
-The first group checks the default mode (one request at a time, a failed one retried at once); the second group
-checks the optional parallel mode (NIM_PARALLEL > 1). No network access and no API key are needed; each scenario
+Covers the immediate retry after 503, an empty stream and an error returned as text; the wait after a 429
+(Retry-After, growing pauses, shared by every call, outside the retry budget); an unreachable host; fatal errors;
+errors after text reached the client; interruption. No network access and no API key are needed; each scenario
 prints PASS or FAIL.
 
-Run from the server directory:  .venv\\Scripts\\python.exe tests\\test_nim_race.py
+Run from the server directory:  .venv\Scripts\python.exe tests\test_nim_retries.py
 """
 import asyncio, json, pathlib, sys, time
 
@@ -94,13 +95,10 @@ def tool_call(first=0.1):
     return lambda log, name: httpx.Response(200, stream=Timed(log, name, chunks, first))
 
 
-def configure(parallel=1, max_parallel=3, hedge=0.0, budget=30.0, delays=(0.0,), rate_limit=(5.0, 10.0, 20.0, 30.0),
-              rate_limit_max=120.0, connect=0.5, rpm=30):
-    settings.NIM_PARALLEL, settings.NIM_MAX_PARALLEL, settings.NIM_HEDGE_AFTER_S = parallel, max_parallel, hedge
+def configure(budget=30.0, delays=(0.0,), rate_limit=(5.0, 10.0, 20.0, 30.0), rate_limit_max=120.0, connect=0.5):
     settings.NIM_RETRY_BUDGET_S, settings.NIM_RETRY_DELAYS = budget, delays
     settings.NIM_RATE_LIMIT_DELAYS, settings.NIM_RATE_LIMIT_MAX_WAIT_S = rate_limit, rate_limit_max
     settings.NIM_CONNECT_RETRY_DELAY_S = connect
-    settings.NIM_RPM_BUDGET, settings.NIM_RATE_LIMIT_COOLDOWN_S = rpm, 60.0
 
 
 async def run(plan, **cfg):
@@ -148,14 +146,9 @@ def text_is(r, text):
 
 async def main():
     results = []
-    defaults = (nim.settings.NIM_PARALLEL, nim.settings.NIM_HEDGE_AFTER_S, nim.settings.NIM_RETRY_DELAYS,
-                nim.settings.NIM_RATE_LIMIT_DELAYS)
-    results.append(check("production defaults: one request at a time, retry at once, 429 waits 5/10/20/30 s",
-                         defaults == (1, 0.0, (0.0,), (5.0, 10.0, 20.0, 30.0)), defaults))
-
-    print("-- default mode: sequential requests, immediate retry")
-    r = await run([ok("Один", first=0.5), ok("лишний")])
-    results.append(check("a single request while the first one is still waiting", text_is(r, "Один") and r["calls"] == 1, r))
+    defaults = (nim.settings.NIM_RETRY_DELAYS, nim.settings.NIM_RATE_LIMIT_DELAYS)
+    results.append(check("production defaults: retry at once, a 429 waits 5/10/20/30 s",
+                         defaults == ((0.0,), (5.0, 10.0, 20.0, 30.0)), defaults))
     r = await run([status(503), empty(0.05), ok("Третий")])
     results.append(check("503, then an empty stream, then the answer: retried at once", text_is(r, "Третий")
                          and r["calls"] == 3 and r["t"] < 0.35, r))
@@ -208,38 +201,6 @@ async def main():
                          and 0.9 <= r["t"] < 1.3 and r["calls"] == 3, r))
     log = await interrupted([ok("a", first=5.0)])
     results.append(check("an interrupt closes the stream", log == [("r1", "closed")], log))
-
-    print("-- optional parallel mode (NIM_PARALLEL=2)")
-    par = {"parallel": 2, "hedge": 6.0, "delays": SCHEDULE}
-    r = await run([ok("Мед|ленный", first=2.0), ok("Быст|рый", first=0.2)], **par)
-    results.append(check("the faster of two wins, the loser is closed, no leaked text", text_is(r, "Быстрый")
-                         and r["deltas"] == "Быстрый" and r["t"] < 0.8 and ("r1", "closed") in r["log"], r))
-    r = await run([status(503), ok("Ответ", first=0.3)], **par)
-    results.append(check("503 on one, the other answers, no wait event", text_is(r, "Ответ")
-                         and not any(k == "wait" for k, _ in r["events"]) and r["t"] < 0.8, r))
-    r = await run([empty(), empty(), ok("Третий", first=0.1), ok("Четвёртый", first=0.5)], **par)
-    results.append(check("both empty: replaced, answer within ~1 s", text_is(r, "Третий") and r["t"] < 1.2 and r["calls"] >= 3, r))
-    r = await run([ok("Первый", first=5.0), ok("Второй", first=5.0), ok("Третий", first=0.1)], **dict(par, hedge=0.5))
-    results.append(check("a third request joins after 0.5 s of silence and wins", text_is(r, "Третий") and 0.5 < r["t"] < 1.2
-                         and ("r1", "closed") in r["log"] and ("r2", "closed") in r["log"], r))
-    r = await run([ok("[ERROR: Agent failed (timed out after 90.0 seconds)]", first=0.05), ok("Нормально", first=0.4)], **par)
-    results.append(check("error as text on one stream, the good stream wins", text_is(r, "Нормально") and r["deltas"] == "Нормально", r))
-    log = await interrupted([ok("a", first=5.0), ok("b", first=5.0)], **par)
-    results.append(check("an interrupt closes every stream", sorted(log) == [("r1", "closed"), ("r2", "closed")], log))
-    configure(**par)
-    c, log, calls = make_client([status(429, '{"detail": "Too Many Requests"}', {"retry-after": "0.2"}), ok("Первый", first=0.4),
-                                 ok("Второй", first=0.1), ok("лишний", first=0.1)])
-    r1 = await c.chat_stream([{"role": "user", "content": "hi"}], None, model="m")
-    n_first = len(calls)
-    r2 = await c.chat_stream([{"role": "user", "content": "hi"}], None, model="m")
-    results.append(check("after a 429 the next call sends a single request", r1.content == "Первый" and r2.content == "Второй"
-                         and len(calls) == n_first + 1, (n_first, len(calls))))
-    r = await run([ok("Один", first=0.2), ok("лишний", first=0.1)], **dict(par, rpm=1))
-    results.append(check("with the minute budget spent no extra request goes out", text_is(r, "Один") and r["calls"] == 1, r))
-    r = await run([empty(0.05), ok("Медленный", first=5.0), ok("Замена", first=5.0), ok("Запасной", first=0.1),
-                   ok("лишний", first=0.1)], **dict(par, hedge=0.6))
-    results.append(check("one extra request, timed from the oldest live one", text_is(r, "Запасной")
-                         and r["calls"] == 4 and 0.55 < r["t"] < 1.2, r))
 
     print(f"\n{sum(results)}/{len(results)} passed")
     if sum(results) != len(results):
