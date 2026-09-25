@@ -138,11 +138,15 @@
     if (text) send({ type: 'say', text });
   });
   /* waiting indicator: seconds since the message went out, until the model's first token */
-  let waitTimer = null;
+  let waitTimer = null, rateLimitUntil = 0;
+  function rateLimitText() { return `лимит запросов NVIDIA исчерпан, жду ${Math.max(1, Math.ceil((rateLimitUntil - Date.now()) / 1000))} с…`; }
   function waitingSince(t0) {
     clearInterval(waitTimer);
-    if (!t0) { waitTimer = null; return; }
-    const tick = () => { const s = Math.round((Date.now() - t0) / 1000); if (s >= 2) $('stt-state').textContent = `модель думает… ${s} с`; };
+    if (!t0) { waitTimer = null; rateLimitUntil = 0; return; }
+    const tick = () => {
+      if (Date.now() < rateLimitUntil) { $('stt-state').textContent = rateLimitText(); return; }
+      const s = Math.round((Date.now() - t0) / 1000); if (s >= 2) $('stt-state').textContent = `модель думает… ${s} с`;
+    };
     waitTimer = setInterval(tick, 1000);
   }
   function updateMetrics() {
@@ -347,7 +351,10 @@
       case 'client_tool_start': $('stt-state').textContent = `выполняю: ${m.summary.slice(0, 80)}`; break;
       case 'client_tool_done': $('stt-state').textContent = m.ok ? '' : `⚠ ${m.name} завершился с ошибкой`; break;
       case 'memory': card('memory', `🗂 память: ${m.items.length} совпад.`, m.items.map((i) => `[${i.kind} ${i.score}] ${i.text}`).join('\n\n'), false); break;
-      case 'wait': $('stt-state').textContent = m.stage === 'retry' ? `сервер NVIDIA перегружен, повтор ${m.attempt}…` : 'жду модель…'; break;
+      case 'wait':
+        if (m.reason === 'rate_limit') { rateLimitUntil = Date.now() + (m.delay || 0) * 1000; $('stt-state').textContent = rateLimitText(); }
+        else $('stt-state').textContent = m.stage === 'retry' ? `сервер NVIDIA перегружен, повтор ${m.attempt}…` : 'жду модель…';
+        break;
       case 'notice': add(div('notice', esc(m.message))); break;
       case 'error': {
         const text = (m.message || '').trim() || (m.detail || '').trim() || 'ошибка без описания (см. окно сервера)';

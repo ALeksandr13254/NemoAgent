@@ -21,10 +21,9 @@ from .config import settings
 log = logging.getLogger("nim")
 
 OPTIONAL_PARAMS = ("chat_template_kwargs", "reasoning_effort", "stream_options")
-# The free pool fails in three ways: a fast 503 (all worker slots taken), a request accepted but left in a queue for
-# tens of seconds, and a stream closed with nothing in it. Parallel requests (see NIMClient._race) cover the last
-# two; a failed request is replaced after these pauses (the last one repeats until NIM_RETRY_BUDGET_S runs out).
-RETRY_DELAYS = (0.3, 0.6, 1.0, 1.5, 2.0, 2.5, 3.0)
+# The free pool fails in three ways: a fast 503 (all worker slots taken), a stream closed with nothing in it, and a
+# request accepted but left in a queue for tens of seconds. A failed request is retried at once by default
+# (settings.NIM_RETRY_DELAYS); a 429 (the key's rate limit) makes every request wait (NIMClient._rate_limited).
 _IMMUTABLE_RE = re.compile(r"`?([a-z_]+)`? is immutable for this model and must be ([-\d.]+)", re.I)
 # A repetition loop ("ellsellsellsells…" until max_tokens): a short piece repeated ten or more times at the end
 _DEGENERATE_RE = re.compile(r"(.{2,16}?)\1{9,}\s*$", re.S)
@@ -90,6 +89,25 @@ class NIMClient:
         self._fixed_params: dict[str, dict] = {}
         self._sent: collections.deque = collections.deque()   # send times of the last minute (the key's rate budget)
         self._calm_until = 0.0                                 # after a 429: no extra parallel requests until then
+        self._blocked_until = 0.0     # after a 429: no request of this server goes out before then
+        self._rl_streak = 0           # 429s in a row (reset after a minute without one)
+        self._rl_last = 0.0
+
+    def _rate_limited(self, err: "UpstreamError") -> float:
+        """The key's per-minute limit is spent: block every request of this server for a while and return how long
+        from now. Retry-After when the gateway sends it, otherwise NIM_RATE_LIMIT_DELAYS in turn."""
+        now = time.time()
+        if now - self._rl_last > 60.0:
+            self._rl_streak = 0
+        self._rl_last = now
+        if err.retry_after is not None:
+            wait = min(max(err.retry_after, 0.5), 120.0)
+        else:
+            delays = settings.NIM_RATE_LIMIT_DELAYS
+            wait = delays[min(self._rl_streak, len(delays) - 1)]
+        self._rl_streak += 1
+        self._blocked_until = max(self._blocked_until, now + wait)
+        return self._blocked_until - now
 
     def _note_sent(self) -> None:
         now = time.time()
@@ -150,15 +168,20 @@ class NIMClient:
 
     @staticmethod
     def _retry_delay(err: Exception, failures: int) -> float:
-        if isinstance(err, UpstreamError) and err.status == 429:     # the key's rate limit: back off properly
-            return min(30.0, err.retry_after) if err.retry_after else 5.0
-        return RETRY_DELAYS[min(failures, len(RETRY_DELAYS) - 1)]
+        """Pause before retrying any error except a 429 (see _rate_limited): none by default; a host that cannot be
+        reached at all gets NIM_CONNECT_RETRY_DELAY_S."""
+        delays = settings.NIM_RETRY_DELAYS
+        delay = delays[min(failures, len(delays) - 1)]
+        if isinstance(err, (httpx.ConnectError, httpx.ConnectTimeout)):
+            delay = max(delay, settings.NIM_CONNECT_RETRY_DELAY_S)
+        return delay
 
     async def _race(self, payload: dict, on_event, model: str) -> Completion:
-        """Run identical streams side by side and keep the first that produces real output (a checked text token,
-        reasoning or a tool call); the others are closed at once. Nothing reaches on_event before a stream wins, so
-        the client never sees a losing or failed attempt. A stream that fails is replaced after RETRY_DELAYS; if none
-        has produced anything after NIM_HEDGE_AFTER_S one more joins (up to NIM_MAX_PARALLEL in flight)."""
+        """One call to the pool, with retries. By default a single request is in flight and a failed one is replaced
+        at once (see _retry_delay). With NIM_PARALLEL > 1 identical streams run side by side and the first that
+        produces real output (a checked text token, reasoning or a tool call) wins, the others are closed at once;
+        with NIM_HEDGE_AFTER_S > 0 one more joins when the oldest live stream stays silent that long. Nothing reaches
+        on_event before a stream wins, so the client never sees a failed attempt."""
         start = time.time()
         budget_end = start + settings.NIM_RETRY_BUDGET_S
         calm = start < self._calm_until            # a recent 429: one request at a time
@@ -167,10 +190,14 @@ class NIMClient:
         hedge_after = 0.0 if calm else max(0.0, settings.NIM_HEDGE_AFTER_S)
         tasks: dict[asyncio.Task, int] = {}
         born: dict[asyncio.Task, float] = {}
-        spawn_at: list[float] = [start] * n0      # due times of streams still to start
+        first_at = max(start, self._blocked_until)   # another call hit the rate limit: wait with it
+        spawn_at: list[float] = [first_at] * n0      # due times of streams still to start
         winner: Optional[int] = None
         hedges = failures = 0
+        rl_waited = first_at - start                 # rate-limit waiting: not part of the retry budget
         last_err: Optional[Exception] = None
+        if rl_waited > 0 and on_event:
+            await on_event("wait", {"stage": "retry", "reason": "rate_limit", "attempt": 0, "delay": rl_waited})
 
         def claim(i: int) -> None:
             nonlocal winner
@@ -207,6 +234,9 @@ class NIMClient:
             while True:
                 now = time.time()
                 while winner is None and spawn_at and spawn_at[0] <= now:
+                    if now < self._blocked_until:    # a 429 elsewhere meanwhile: every request waits it out
+                        spawn_at[:] = sorted(max(x, self._blocked_until) for x in spawn_at)
+                        break
                     spawn_at.pop(0)
                     spawn()
                 live = [t for t in tasks if not t.done()]
@@ -256,15 +286,29 @@ class NIMClient:
                         continue
                     if kind not in ("overloaded", "dropped"):
                         raise err
+                    in_flight = sum(1 for x in tasks if not x.done())
                     if isinstance(err, UpstreamError) and err.status == 429:
-                        if time.time() >= self._calm_until:
-                            log.warning("NIM rate limit (429): parallel requests off for %.0fs",
-                                        settings.NIM_RATE_LIMIT_COOLDOWN_S)
+                        # the key's per-minute limit: every request of the server waits, however long it takes
                         self._calm_until = time.time() + settings.NIM_RATE_LIMIT_COOLDOWN_S
                         n0 = n_max = 1
                         hedge_after = 0.0
-                    in_flight = sum(1 for x in tasks if not x.done())
-                    if time.time() >= budget_end or in_flight + len(spawn_at) >= n0:
+                        wait = self._rate_limited(err)
+                        spawn_at[:] = sorted(max(x, self._blocked_until) for x in spawn_at)
+                        if in_flight + len(spawn_at) >= n0:
+                            continue      # another request is still trying, or one is already waiting its turn
+                        if rl_waited + wait > settings.NIM_RATE_LIMIT_MAX_WAIT_S:
+                            log.warning("NIM rate limit (429): gave up after waiting %.0fs", rl_waited)
+                            continue
+                        rl_waited += wait
+                        failures += 1
+                        log.warning("NIM rate limit (429%s): every request waits %.1fs",
+                                    ", Retry-After" if err.retry_after is not None else "", wait)
+                        if on_event:
+                            await on_event("wait", {"stage": "retry", "reason": "rate_limit", "attempt": failures, "delay": wait})
+                        spawn_at.append(self._blocked_until)
+                        spawn_at.sort()
+                        continue
+                    if time.time() >= budget_end + rl_waited or in_flight + len(spawn_at) >= n0:
                         continue      # out of time, or enough requests are still trying
                     delay = self._retry_delay(err, failures)
                     failures += 1
@@ -272,7 +316,7 @@ class NIMClient:
                                 delay, in_flight)
                     if on_event and in_flight == 0:
                         await on_event("wait", {"stage": "retry", "reason": kind, "attempt": failures, "delay": delay})
-                    spawn_at.append(time.time() + delay)
+                    spawn_at.append(max(time.time() + delay, self._blocked_until))
                     spawn_at.sort()
         finally:
             for t in tasks:
@@ -429,7 +473,8 @@ class NIMClient:
                     break
                 except Exception as err:  # noqa: BLE001
                     if _classify(err) in ("overloaded", "dropped") and attempt < 3:
-                        await asyncio.sleep(RETRY_DELAYS[attempt])
+                        rate_limited = isinstance(err, UpstreamError) and err.status == 429
+                        await asyncio.sleep(self._rate_limited(err) if rate_limited else self._retry_delay(err, attempt))
                         continue
                     raise
         return out

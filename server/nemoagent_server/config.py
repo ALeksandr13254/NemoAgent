@@ -17,6 +17,14 @@ def _env(name: str, default: str | None = None) -> str | None:
     return value.strip().strip('"').strip("'")
 
 
+def _floats(name: str, default: str) -> tuple:
+    try:
+        vals = tuple(float(x) for x in (_env(name, default) or default).split(",") if x.strip())
+    except ValueError:
+        vals = tuple(float(x) for x in default.split(","))
+    return vals or (0.0,)
+
+
 def _bool(name: str, default: bool) -> bool:
     v = _env(name)
     if v is None:
@@ -69,19 +77,29 @@ class Settings:
     DIALOGUE_MAX_TOKENS = _int("DIALOGUE_MAX_TOKENS", 1200)   # spoken answer + screen part; bounds a runaway to ~30 s
     LLM_TOP_P = _env("LLM_TOP_P")                   # unset = model default
     UPSTREAM_TIMEOUT = _int("UPSTREAM_TIMEOUT", 600)  # seconds of NIM silence we tolerate
-    # Parallel ("hedged") requests to the free pool. NIM_PARALLEL identical requests start together; the first stream
-    # with real output wins and the others are closed at once, which frees their slots. A failed request is replaced
-    # after a short pause; if the oldest live request has produced nothing for NIM_HEDGE_AFTER_S seconds one more
-    # joins (once per call, up to NIM_MAX_PARALLEL in flight). The key has a per-minute request limit shared by all
-    # sessions of this server: extra requests are sent only while fewer than NIM_RPM_BUDGET went out in the last
-    # minute, and a 429 turns them off for NIM_RATE_LIMIT_COOLDOWN_S. NIM_PARALLEL=1 with NIM_HEDGE_AFTER_S=0 gives
-    # one request at a time.
-    NIM_PARALLEL = _int("NIM_PARALLEL", 2)
+    # Requests to the free pool go one at a time. A request that fails (503, a stream closed with nothing in it, an
+    # error returned as text, a dropped connection) is retried at once, until NIM_RETRY_BUDGET_S runs out.
+    # NIM_RETRY_DELAYS: pauses before the 1st, 2nd, ... retry, in seconds (the last one repeats); "0" = at once.
+    NIM_RETRY_DELAYS = _floats("NIM_RETRY_DELAYS", "0")
+    NIM_RETRY_BUDGET_S = _float("NIM_RETRY_BUDGET_S", 30.0)   # how long one call keeps retrying before it gives up
+    # A 429 means the key's per-minute limit is spent: an immediate retry would only earn another 429. Then every
+    # request of this server waits: for Retry-After when the gateway sends it, otherwise NIM_RATE_LIMIT_DELAYS in turn
+    # (5, 10, 20, 30 s for successive 429s; the streak resets after a minute without one). This wait does not count
+    # against NIM_RETRY_BUDGET_S; one call gives up after NIM_RATE_LIMIT_MAX_WAIT_S of it.
+    NIM_RATE_LIMIT_DELAYS = _floats("NIM_RATE_LIMIT_DELAYS", "5,10,20,30")
+    NIM_RATE_LIMIT_MAX_WAIT_S = _float("NIM_RATE_LIMIT_MAX_WAIT_S", 120.0)
+    # The NIM host cannot be reached at all (network down, VPN switching): retry every this many seconds instead of
+    # spinning thousands of attempts a second. 0 = at once as well.
+    NIM_CONNECT_RETRY_DELAY_S = _float("NIM_CONNECT_RETRY_DELAY_S", 0.5)
+    # Optional parallel ("hedged") requests, off by default: NIM_PARALLEL identical requests start together and the
+    # first stream with real output wins, the rest are closed at once; with NIM_HEDGE_AFTER_S > 0 one more joins when
+    # the oldest live request stays silent that long (up to NIM_MAX_PARALLEL in flight). Extra requests are sent only
+    # while fewer than NIM_RPM_BUDGET went out in the last minute and stop for NIM_RATE_LIMIT_COOLDOWN_S after a 429.
+    NIM_PARALLEL = _int("NIM_PARALLEL", 1)
     NIM_MAX_PARALLEL = _int("NIM_MAX_PARALLEL", 3)
-    NIM_HEDGE_AFTER_S = _float("NIM_HEDGE_AFTER_S", 6.0)
+    NIM_HEDGE_AFTER_S = _float("NIM_HEDGE_AFTER_S", 0.0)
     NIM_RPM_BUDGET = _int("NIM_RPM_BUDGET", 30)
     NIM_RATE_LIMIT_COOLDOWN_S = _float("NIM_RATE_LIMIT_COOLDOWN_S", 60.0)
-    NIM_RETRY_BUDGET_S = _float("NIM_RETRY_BUDGET_S", 30.0)   # how long one call keeps retrying before it gives up
     MAX_TOOL_ROUNDS = _int("MAX_TOOL_ROUNDS", 12)
 
     EMBED_TEXT_MODEL = _env("EMBED_TEXT_MODEL", "nvidia/nemotron-3-embed-1b")
