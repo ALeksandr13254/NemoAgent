@@ -109,8 +109,24 @@ class ClientCore:
                 if saved.get("text_model") and "model_dialogue" not in saved:   # settings written by an older client
                     self.state["model_dialogue"] = self.state["model_executor"] = saved["text_model"]
                 log.info("settings restored from %s", self._settings_path)
+                if self._sanitize_models():
+                    self._save_state()
         except Exception as e:  # noqa: BLE001
             log.warning("cannot read %s: %s", self._settings_path, e)
+
+    def _model_options(self, key: str) -> tuple:
+        return settings.MEDIA_MODELS if key == "model_media" else settings.TEXT_MODELS
+
+    def _sanitize_models(self) -> list[str]:
+        """Replace models that are no longer offered (the retired Super 120B in old settings) with the default."""
+        fixed = []
+        for key in self.MODEL_KEYS:
+            options = self._model_options(key)
+            if self.state.get(key) not in options:
+                log.info("settings: %s %s is no longer offered, using %s", key, self.state.get(key), options[0])
+                self.state[key] = options[0]
+                fixed.append(key)
+        return fixed
 
     def _save_state(self) -> None:
         try:
@@ -1114,7 +1130,7 @@ class ClientCore:
             s["screenshot_monitors"] = [int(i) for i in (s["screenshot_monitors"] or []) if str(i).isdigit()]
         for key in ("tts_mode", "auto_listen", "barge_in", "tools_enabled", "confirm", "voice_ru", "voice_en", "tts_speed",
                     "stt_language", "tts_language", "memory_recall", "screenshot_monitors", *self.MODEL_KEYS):
-            if key in s:
+            if key in s and not (key in self.MODEL_KEYS and s[key] not in self._model_options(key)):
                 self.state[key] = s[key]
         if any(k in s for k in self.MODEL_KEYS) and self.server_ws:
             await self.send_server({"type": "client_info", "client": {"models": self._models()}})

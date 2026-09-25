@@ -54,19 +54,34 @@ class Settings:
     # (attachments, screenshots) — its free pool is small and often overloaded (503 "16/16").
     # Server-side defaults per role; the client can override every role from its settings panel
     # (client_info["models"] = {dialogue, executor, router, media}).
-    LLM_MODEL = _env("LLM_MODEL", "nvidia/nemotron-3-super-120b-a12b")          # dialogue + executor (text)
+    LLM_MODEL = _env("LLM_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning")          # dialogue + executor
     LLM_MEDIA_MODEL = _env("LLM_MEDIA_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning")
     LLM_THINKING = _bool("LLM_THINKING", False)     # the model reasons by default; off saves seconds per answer
     LLM_TEMPERATURE = _float("LLM_TEMPERATURE", 0.3)  # model card: 0.2 without reasoning, 0.6 with it
     # Router: a fast parallel call that classifies the user's request (needs the executor or not) and drafts
     # the task, so an action is carried out even when the dialogue agent forgets its `>>>` line.
     ROUTER_ENABLED = _bool("ROUTER_ENABLED", True)
-    ROUTER_MODEL = _env("ROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b")
+    ROUTER_MODEL = _env("ROUTER_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning")
+    # Models no longer served: a client with old settings that still asks for one gets the role's default.
+    RETIRED_MODELS = {m.strip() for m in (_env("RETIRED_MODELS", "nvidia/nemotron-3-super-120b-a12b") or "").split(",") if m.strip()}
     ROUTER_TIMEOUT = _float("ROUTER_TIMEOUT", 4.0)             # seconds to wait for its verdict after the answer
     LLM_MAX_TOKENS = _int("LLM_MAX_TOKENS", 4096)            # executor rounds (write_file content can be long)
     DIALOGUE_MAX_TOKENS = _int("DIALOGUE_MAX_TOKENS", 1200)   # spoken answer + screen part; bounds a runaway to ~30 s
     LLM_TOP_P = _env("LLM_TOP_P")                   # unset = model default
     UPSTREAM_TIMEOUT = _int("UPSTREAM_TIMEOUT", 600)  # seconds of NIM silence we tolerate
+    # Parallel ("hedged") requests to the free pool. NIM_PARALLEL identical requests start together; the first stream
+    # with real output wins and the others are closed at once, which frees their slots. A failed request is replaced
+    # after a short pause; if the oldest live request has produced nothing for NIM_HEDGE_AFTER_S seconds one more
+    # joins (once per call, up to NIM_MAX_PARALLEL in flight). The key has a per-minute request limit shared by all
+    # sessions of this server: extra requests are sent only while fewer than NIM_RPM_BUDGET went out in the last
+    # minute, and a 429 turns them off for NIM_RATE_LIMIT_COOLDOWN_S. NIM_PARALLEL=1 with NIM_HEDGE_AFTER_S=0 gives
+    # one request at a time.
+    NIM_PARALLEL = _int("NIM_PARALLEL", 2)
+    NIM_MAX_PARALLEL = _int("NIM_MAX_PARALLEL", 3)
+    NIM_HEDGE_AFTER_S = _float("NIM_HEDGE_AFTER_S", 6.0)
+    NIM_RPM_BUDGET = _int("NIM_RPM_BUDGET", 30)
+    NIM_RATE_LIMIT_COOLDOWN_S = _float("NIM_RATE_LIMIT_COOLDOWN_S", 60.0)
+    NIM_RETRY_BUDGET_S = _float("NIM_RETRY_BUDGET_S", 30.0)   # how long one call keeps retrying before it gives up
     MAX_TOOL_ROUNDS = _int("MAX_TOOL_ROUNDS", 12)
 
     EMBED_TEXT_MODEL = _env("EMBED_TEXT_MODEL", "nvidia/nemotron-3-embed-1b")

@@ -38,6 +38,10 @@ def _float(name: str, default: float) -> float:
         return default
 
 
+def _allowed(value: str | None, options: tuple) -> str:
+    return value if value in options else options[0]
+
+
 class Settings:
     # --- connection to the agent server ---
     SERVER_URL = _env("SERVER_URL", "http://127.0.0.1:8700")
@@ -73,12 +77,16 @@ class Settings:
     TTS_PROVIDER = _env("TTS_PROVIDER", "auto")        # auto | cuda | cpu
     TTS_THREADS = _int("TTS_THREADS", 0)               # 0 = automatic
     TTS_LANGUAGE = _env("TTS_LANGUAGE", "ru")        # auto (by script) | ru | en — which voice reads Latin words and numbers
-    # Model per role, asked from the server (switchable in the UI settings). Text roles: Super 120B by default,
-    # Lightning 30B available; the media role (images / audio / video) needs a multimodal model — Nano Omni.
-    MODEL_DIALOGUE = _env("MODEL_DIALOGUE", "nvidia/nemotron-3-super-120b-a12b")
-    MODEL_EXECUTOR = _env("MODEL_EXECUTOR", "nvidia/nemotron-3-super-120b-a12b")
-    MODEL_ROUTER = _env("MODEL_ROUTER", "nvidia/nemotron-3-super-120b-a12b")
-    MODEL_MEDIA = _env("MODEL_MEDIA", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning")
+    # Model per role, asked from the server (shown in the UI settings). Every role runs on Nano Omni by default;
+    # the text roles can be switched to Nemotron 3.5 Lightning. The media role (images / audio / video) needs a
+    # multimodal model. A value outside these lists (for example the retired Nemotron 3 Super 120B left in an
+    # old .env) falls back to the first entry.
+    TEXT_MODELS = ("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", "nvidia/nemotron-3.5-lightning-30b-a3b")
+    MEDIA_MODELS = ("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",)
+    MODEL_DIALOGUE = _allowed(_env("MODEL_DIALOGUE"), TEXT_MODELS)
+    MODEL_EXECUTOR = _allowed(_env("MODEL_EXECUTOR"), TEXT_MODELS)
+    MODEL_ROUTER = _allowed(_env("MODEL_ROUTER"), TEXT_MODELS)
+    MODEL_MEDIA = _allowed(_env("MODEL_MEDIA"), MEDIA_MODELS)
     TTS_VOICE_RU = _env("TTS_VOICE_RU", "ru_f1")
     TTS_VOICE_EN = _env("TTS_VOICE_EN", "eng_f5")
     TTS_SPEED = _float("TTS_SPEED", 1.0)               # duration_scale: <1 faster, >1 slower

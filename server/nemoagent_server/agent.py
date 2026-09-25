@@ -271,7 +271,7 @@ class AgentSession:
         chosen = str(models.get(role) or "").strip()
         if not chosen and role in ("dialogue", "executor"):
             chosen = str(self.client_info.get("text_model") or "").strip()   # older clients: one text model
-        if chosen:
+        if chosen and chosen not in settings.RETIRED_MODELS:
             return chosen
         if role == "media":
             return settings.LLM_MEDIA_MODEL
