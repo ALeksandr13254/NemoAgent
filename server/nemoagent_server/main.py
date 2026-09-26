@@ -8,7 +8,7 @@ current turn needs (recalled memories, prompt overrides, uploads that expire aft
 Protocol (JSON text frames):
   client -> server
     {"type":"hello", "token": "...", "client": {os, hostname, user, shell, screen, timezone, tools_enabled,
-                                                 persona_gender, models: {dialogue, executor, router, media},
+                                                 persona_gender, models: {dialogue, executor, router},
                                                  prompts: {system, voice_prose, voice_text, executor, router}}}
     {"type":"user_message", "text": "...", "attachments": ["id", ...], "source": "voice"|"text", "tts": bool,
                             "memory": bool, "memory_context": [{kind, ts, score, text}, ...]}
@@ -21,6 +21,11 @@ Protocol (JSON text frames):
     {"type":"client_info", "client": {...}}     # update capabilities / models / prompts / gender
     {"type":"get_prompts"} / {"type":"set_prompts","values":{...}} / {"type":"reset_prompts","keys":[...]}
         -> {"type":"prompts","current":{...},"defaults":{...},"overrides":{...},"overridden":[...]}
+    {"type":"count_tokens", "id", "text", "attachments": [...], "tts": bool}
+        -> {"type":"token_count", "id", "ok", "total", "limit", "max_prompt", "over", "room", "system", "history",
+            "message", "attachments", "trimmed", "fix", "measuring", ...}: the exact size of the request this draft
+            would make (AgentSession.count_request); sent twice when a video clip has to be measured first
+    {"type":"count_text", "id", "texts": {key: text}} -> {"type":"text_tokens", "id", "counts": {key: tokens}}
     {"type":"ping"}
   server -> client
     {"type":"ready", "session_id", "model", "models", "vision", "default_model"}
@@ -54,6 +59,7 @@ from .agent import AgentSession, Services
 from .attachments import AttachmentStore
 from .config import settings
 from .nim import NIMClient
+from .tokencount import COUNTER
 
 logging.basicConfig(level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
                     format="%(asctime)s %(levelname).1s %(name)s: %(message)s", datefmt="%H:%M:%S")
@@ -86,10 +92,13 @@ async def lifespan(app: FastAPI):
              settings.HOST, settings.PORT, settings.LLM_MODEL, settings.ROUTER_MODEL,
              ffmpeg or "not found (only wav/mp3/mp4 attachments pass as they are)")
     sweeper = asyncio.create_task(_sweeper(attachments))
+    # the token counter's files (fetched once, about 17 MB) load in the background: the server answers meanwhile
+    counter = asyncio.create_task(asyncio.to_thread(lambda: COUNTER.ready))
     try:
         yield
     finally:
         sweeper.cancel()
+        counter.cancel()
         await nim.aclose()
 
 
@@ -115,6 +124,7 @@ def _ready(session: AgentSession) -> dict:
 async def health():
     return {"ok": True, "model": settings.LLM_MODEL, "router_model": settings.ROUTER_MODEL,
             "vision": settings.LLM_MODEL not in settings.TEXT_ONLY_MODELS, "ffmpeg": bool(shutil.which(settings.FFMPEG)),
+            "token_counter": COUNTER._tok is not None or (COUNTER.error or "loading"),
             "uploads_in_ram": services.attachments.count() if services else 0, "time": time.time()}
 
 
@@ -156,6 +166,26 @@ class ClientLink:
         self._pending: dict[str, asyncio.Future] = {}
         self.session: Optional[AgentSession] = None
         self.client_info: dict = {}
+        self._count_next: Optional[dict] = None
+        self._count_task: Optional[asyncio.Task] = None
+
+    def request_count(self, msg: dict) -> None:
+        """Count requests come with every pause in typing: one runs at a time and only the latest waiting one follows
+        (a count of a huge prompt takes a second or two, and a stale one is of no use)."""
+        self._count_next = msg
+        if self._count_task is None or self._count_task.done():
+            self._count_task = asyncio.create_task(self._count_loop())
+
+    async def _count_loop(self) -> None:
+        while self._count_next is not None and self.session is not None:
+            msg, self._count_next = self._count_next, None
+            try:
+                res = await self.session.count_request(msg.get("text") or "", msg.get("attachments") or [],
+                                                       bool(msg.get("tts")), still_wanted=lambda: self._count_next is None)
+            except Exception as e:  # noqa: BLE001
+                log.warning("token count failed: %s", e)
+                res = {"ok": False, "reason": f"подсчёт не удался: {str(e)[:160]}"}
+            await self.send({"type": "token_count", "id": msg.get("id"), **res})
 
     async def send(self, msg: dict) -> None:
         async with self._send_lock:
@@ -270,6 +300,15 @@ async def ws_endpoint(ws: WebSocket):
                 await link.send({"type": "prompts", "saved": True, **link.session.prompts.set(msg.get("values") or {})})
             elif t == "reset_prompts":
                 await link.send({"type": "prompts", "saved": True, **link.session.prompts.reset(msg.get("keys"))})
+            elif t == "count_tokens":
+                link.request_count(msg)
+            elif t == "count_text":
+                texts = {str(k): str(v or "") for k, v in (msg.get("texts") or {}).items()}
+                try:
+                    counts = await asyncio.to_thread(lambda: {k: COUNTER.count_text(v) for k, v in texts.items()})
+                    await link.send({"type": "text_tokens", "id": msg.get("id"), "counts": counts})
+                except Exception as e:  # noqa: BLE001
+                    await link.send({"type": "text_tokens", "id": msg.get("id"), "error": str(e)[:200]})
             elif t == "ping":
                 await link.send({"type": "pong", "t": msg.get("t")})
     except WebSocketDisconnect:

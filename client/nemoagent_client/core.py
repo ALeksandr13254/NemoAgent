@@ -1127,6 +1127,15 @@ class ClientCore:
             await ws.send_text(json.dumps(self.status_payload(), ensure_ascii=False))
         elif t in ("get_prompts", "set_prompts", "reset_prompts"):
             await self.send_server(msg)      # the server answers with a "prompts" message, relayed to the UI
+        elif t in ("count_tokens", "count_text"):
+            # token counts of the draft / the prompt fields: the server has the tokenizer, answers are relayed to the UI
+            if t == "count_tokens":
+                msg = dict(msg, tts=bool(self.speaker) and self.state["tts_mode"] == "always")   # as a typed message would go
+            if self.server_ws:
+                try:
+                    await self.server_ws.send(json.dumps(msg, ensure_ascii=False))
+                except Exception:  # noqa: BLE001
+                    pass
         elif t == "ping":
             await ws.send_text(json.dumps({"type": "pong", "t": msg.get("t")}))
 

@@ -29,3 +29,6 @@ dist/
 .DS_Store
 Thumbs.db
 .claude/
+
+# tokenizer files of the token counter (fetched from Hugging Face on the first start)
+server/models/

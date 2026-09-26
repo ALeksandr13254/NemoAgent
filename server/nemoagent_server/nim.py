@@ -161,6 +161,15 @@ class NIMClient:
         except _Emitted as e:
             raise e.inner     # tokens already reached the client: no silent retry
 
+    async def prompt_tokens(self, messages: list[dict], model: str) -> int:
+        """Prompt size of a request as the model counts it, from the usage that closes the stream. The hosted model
+        ignores max_tokens, so the messages themselves must ask for a one-word answer to keep the call short. (The
+        first chunk of a stream with continuous_usage_stats is no shortcut: it counts a video as its placeholder.)"""
+        acc = await self.chat_stream(messages, None, model=model, thinking=False, temperature=0, max_tokens=1)
+        if not (acc.usage or {}).get("prompt_tokens"):
+            raise UpstreamError(502, "no usage in the answer")
+        return int(acc.usage["prompt_tokens"])
+
     @staticmethod
     def _retry_delay(err: Exception, failures: int) -> float:
         """Pause before retrying any error except a 429 (see _rate_limited): none by default; a host that cannot be

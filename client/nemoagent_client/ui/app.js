@@ -151,12 +151,56 @@
     };
     waitTimer = setInterval(tick, 1000);
   }
+  /* exact size of the request the draft would make (counted by the server with the model's own tokenizer) */
+  let countSeq = 0, countTimer = null;
+  const nf = (x) => Number(x || 0).toLocaleString('ru-RU');
+  function scheduleCount(delay) {
+    clearTimeout(countTimer);
+    countTimer = setTimeout(() => {
+      if (!state || !state.server) { $('tok-count').textContent = ''; return; }
+      const ids = pending.filter((p) => !p.pending).map((p) => p.id).filter(Boolean);
+      send({ type: 'count_tokens', id: ++countSeq, text: input.value, attachments: ids });
+    }, delay ?? 300);
+  }
+  function renderCount(m) {
+    if (m.id !== countSeq) return;                   // an answer to an older draft
+    const el = $('tok-count');
+    el.className = 'tok';
+    if (!m.ok) { el.textContent = m.reason ? 'токены: ' + m.reason : ''; el.title = m.reason || ''; return; }
+    const lines = ['Точный размер запроса к модели (так же его посчитает NVIDIA):',
+      `системный промпт: ${nf(m.system)}`, `история (${m.history_messages} сообщ.): ${nf(m.history)}`,
+      `это сообщение: ${nf(m.message)}`];
+    for (const a of m.attachments || []) lines.push(`   ${a.detail}: ${a.exact ? nf(a.tokens) : 'измеряется'}`);
+    lines.push(`всего: ${nf(m.total)} из ${nf(m.max_prompt)} возможных (лимит контекста ${nf(m.limit)})`);
+    if (!m.over) lines.push(`на ответ останется: ${nf(m.room)}`);
+    lines.push(`автообрезка: когда запрос больше ${nf(m.budget)}, старые ходы уходят из контекста (последние ${m.keep_turns} остаются)`);
+    if (state && state.settings && state.settings.memory_recall) lines.push('включена память: подобранные воспоминания добавятся при отправке и в это число не входят');
+    lines.push(`посчитано за ${m.ms} мс`);
+    let text = `${nf(m.total)} / ${nf(m.limit)} ток.`;
+    if (m.over) {
+      el.classList.add('over');
+      const f = m.fix || {}, ways = [];
+      if (f.message_chars != null) ways.push(`сократите сообщение до ${nf(f.message_chars)} симв. (сейчас ${nf(f.message_chars_now)})`);
+      if (f.drop_oldest) ways.push(`удалите ${f.drop_oldest.messages} старых сообщ. (−${nf(f.drop_oldest.tokens)})`);
+      text = `превышение лимита на ${nf(m.over)} ток. (${nf(m.total)} из ${nf(m.max_prompt)})` + (ways.length ? ': ' + ways.join(' или ') : '');
+    } else if (m.trimmed) {
+      el.classList.add('trim');
+      text += ` · при отправке из контекста уйдут ${m.trimmed.turns} старых ход. (−${nf(m.trimmed.tokens)})`;
+    }
+    if ((m.measuring || []).length) text += ' · видео: измеряю…';
+    else if (m.exact === false) text += ' · неточно';
+    el.textContent = text;
+    el.title = lines.join('\n');
+  }
+  input.addEventListener('input', () => scheduleCount());
+
   function updateMetrics() {
     const parts = [];
     if (metrics.stt) parts.push(`STT ${metrics.stt} мс`);
     if (metrics.first_token) parts.push(`1-й токен ${metrics.first_token} мс`);
     if (metrics.first_audio) parts.push(`1-й звук ${metrics.first_audio} мс`);
     if (metrics.total) parts.push(`всего ${(metrics.total / 1000).toFixed(1)} с`);
+    if (metrics.prompt) parts.push(`запрос ${nf(metrics.prompt.actual)} ток.${metrics.prompt.match ? ' ✓' : metrics.prompt.match === false ? ` (счётчик: ${nf(metrics.prompt.predicted)})` : ''}`);
     $('metrics').textContent = parts.join(' · ');
   }
 
@@ -217,8 +261,9 @@
       logEntry('req', `→ <b>запрос</b> ${t} · ${who}${m.stage ? ' / ' + esc(m.stage) : ''} · ход ${m.turn} · вызов ${m.round} · ${esc(m.model)} · сообщений: ${m.messages.length} · инструменты: ${esc((m.tools || []).join(', ') || 'нет')} · ${esc(JSON.stringify(m.params))}`, renderMessages(m.messages), false);
     } else if (m.kind === 'response') {
       const who = agentLabel(m.agent);
+      if (m.agent === 'dialogue' && m.prompt_check && !metrics.prompt) { metrics.prompt = m.prompt_check; updateMetrics(); }
       const tc = (m.tool_calls || []).map((c) => `${c.function?.name}(${c.function?.arguments})`).join('\n');
-      const body = `<pre>${m.reasoning ? '🧠 reasoning:\n' + esc(m.reasoning) + '\n\n' : ''}${esc(m.content || '')}${tc ? '\n⚙ tool_calls:\n' + esc(tc) : ''}\n\nfinish_reason: ${esc(String(m.finish_reason))} · usage: ${esc(JSON.stringify(m.usage))} · ${m.ms} мс</pre>`;
+      const body = `<pre>${m.reasoning ? '🧠 reasoning:\n' + esc(m.reasoning) + '\n\n' : ''}${esc(m.content || '')}${tc ? '\n⚙ tool_calls:\n' + esc(tc) : ''}\n\nfinish_reason: ${esc(String(m.finish_reason))} · usage: ${esc(JSON.stringify(m.usage))}${m.prompt_check ? ' · счётчик: ' + (m.prompt_check.match ? 'совпал ✓' : m.prompt_check.match === false ? esc(String(m.prompt_check.predicted)) + ' ✗' : 'видео измерено по ответу') : ''} · ${m.ms} мс</pre>`;
       logEntry('res', `← <b>ответ</b> ${t} · ${who} · ход ${m.turn} · вызов ${m.round} · ${(m.content || '').length} симв. · ${(m.tool_calls || []).length} вызов. · ${m.ms} мс`, body, false);
     }
   }
@@ -235,8 +280,22 @@
       $('ov-' + k).textContent = (p.overridden || []).includes(k) ? '· изменён' : '· по умолчанию';
     }
     $('prompt-status').textContent = p.saved ? 'сохранено ' + new Date().toLocaleTimeString() : '';
+    schedulePromptTokens();
   }
-  for (const k of PROMPT_KEYS) $('ed-' + k).addEventListener('input', (e) => { e.target.classList.toggle('dirty', promptState && e.target.value !== promptState.current[k]); });
+  for (const k of PROMPT_KEYS) $('ed-' + k).addEventListener('input', (e) => { e.target.classList.toggle('dirty', promptState && e.target.value !== promptState.current[k]); schedulePromptTokens(); });
+  /* tokens of each field, exact (the model's tokenizer); the system prompt as sent also gets {env} and the style */
+  let promptTokTimer = null, promptTokSeq = 0;
+  function schedulePromptTokens() {
+    clearTimeout(promptTokTimer);
+    promptTokTimer = setTimeout(() => {
+      const texts = {}; for (const k of PROMPT_KEYS) texts[k] = $('ed-' + k).value;
+      send({ type: 'count_text', id: ++promptTokSeq, texts });
+    }, 300);
+  }
+  function renderPromptTokens(m) {
+    if (m.id !== promptTokSeq) return;
+    for (const k of PROMPT_KEYS) $('tk-' + k).textContent = m.counts && m.counts[k] != null ? `· ${nf(m.counts[k])} ток.` : '';
+  }
   $('prompt-save').onclick = () => { const values = {}; for (const k of PROMPT_KEYS) values[k] = $('ed-' + k).value; send({ type: 'set_prompts', values }); $('prompt-status').textContent = 'сохраняю…'; };
   $('prompt-reset').onclick = () => { if (confirm('Вернуть все три части к встроенным значениям?')) send({ type: 'reset_prompts' }); };
   $('prompt-reload').onclick = () => send({ type: 'get_prompts' });
@@ -244,13 +303,19 @@
   function handle(m) {
     switch (m.type) {
       case 'status': {
-        const wasConnected = state && state.server; state = m; renderStatus();
+        const wasConnected = state && state.server;
+        const sig = (x) => x ? [x.server, x.settings && x.settings.tts_mode, x.settings && x.settings.memory_recall, JSON.stringify((x.server_info || {}).models || {})].join('|') : '';
+        const before = sig(state);
+        state = m; renderStatus();
         if (m.server && (!wasConnected || !promptState)) send({ type: 'get_prompts' });
         if (!wasConnected) send({ type: 'chats' });
+        if (sig(m) !== before) scheduleCount(50);      // connection, speech mode or models changed: another request
         break;
       }
+      case 'token_count': renderCount(m); break;
+      case 'text_tokens': renderPromptTokens(m); break;
       case 'chats': renderChats(m); break;
-      case 'chat_loaded': renderHistory(m.chat); break;
+      case 'chat_loaded': renderHistory(m.chat); scheduleCount(50); break;
       case 'chat_entry': {   // a finished assistant bubble learns the id of its record (needed for edit and delete)
         const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().slice(0, 40);
         const d = [...chat.querySelectorAll('.msg.assistant:not([data-mid])')].find((x) => norm(x._spoken || x._text) === norm(m.text));
@@ -261,12 +326,14 @@
         const old = chat.querySelector(`.msg[data-mid="${CSS.escape(m.mid)}"]`);
         if (old) old.replaceWith(msgNode(m.entry));
         flash('Сообщение изменено: следующий запрос уйдёт с исправленной историей');
+        scheduleCount(200);
         break;
       }
       case 'message_deleted': {
         const old = chat.querySelector(`.msg[data-mid="${CSS.escape(m.mid)}"]`);
         if (old) old.remove();
         flash('Сообщение удалено: модель больше его не учитывает');
+        scheduleCount(200);
         break;
       }
       case 'memory_stats': {
@@ -287,7 +354,7 @@
         memRefresh();
         break;
       }
-      case 'prompts': renderPrompts(m); break;
+      case 'prompts': renderPrompts(m); scheduleCount(100); break;
       case 'trace': handleTrace(m); break;
       case 'stage': endCurrent(); reasoningCard = null; execCard = null; break;
       case 'task': card('task', `🎯 <b>задача исполнителю</b>`, m.task, true); endCurrent(); break;
@@ -303,7 +370,7 @@
         let html = `<div class="src">${src}${m.memory ? ' · 🗂 память' : ''}${msgTools(false, 'озвучить это сообщение')}</div>${fmt(m.text || '')}`;
         if (m.attachments && m.attachments.length) html += `<div class="src">📎 ${m.attachments.length} влож.</div>`;
         d.innerHTML = html; add(d);
-        current = null; reasoningCard = null; metrics = { stt: metrics.stt }; updateMetrics();
+        current = null; reasoningCard = null; metrics = { stt: metrics.stt }; updateMetrics(); scheduleCount(0);
         waitingSince(Date.now());   // "думаю… N с" until the first token: the free pool can take 20 s
         break;
       }
@@ -371,11 +438,11 @@
         if (m.first_token_ms) metrics.first_token = m.first_token_ms;
         if (m.total_ms) metrics.total = m.total_ms; updateMetrics();
         if (m.finish_reason === 'interrupted') add(div('notice', 'прервано'));
-        $('stt-state').textContent = ''; current = null; break;
+        $('stt-state').textContent = ''; current = null; scheduleCount(100); break;
       }
       case 'tts_first_audio': metrics.first_audio = m.ms; updateMetrics(); break;
       case 'interrupted': if (current) current.classList.remove('streaming'); break;
-      case 'cleared': chat.innerHTML = ''; current = null; reasoningCard = null; break;
+      case 'cleared': chat.innerHTML = ''; current = null; reasoningCard = null; scheduleCount(50); break;
       case 'mic': {
         // the same level bar lives under the chat composer and in the read-aloud tab (dictation)
         for (const el of [$('mic-level'), $('reader-mic-level')]) { el.style.width = Math.round(m.level * 100) + '%'; el.classList.toggle('speech', !!m.speech); }
@@ -545,6 +612,7 @@
       c.querySelector('.x').onclick = () => { pending = pending.filter((p) => p !== a); renderAttachments(); };
       attBox.appendChild(c);
     }
+    scheduleCount(100);                                // an attachment came, finished uploading or went away
   }
   async function uploadFiles(files) {
     for (const f of files) {

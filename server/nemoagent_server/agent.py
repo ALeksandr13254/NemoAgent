@@ -24,10 +24,11 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
-from . import media
+from . import media, tokencount
 from .attachments import AttachmentStore
 from .config import settings
 from .nim import Completion, NIMClient, UpstreamError
+from .tokencount import COUNTER, Count
 from .prompts import PromptStore
 from .speechfmt import ProseSpeechRouter, looks_like_promise, strip_filler
 from .tools import CLIENT_TOOL_NAMES, ToolContext, all_schemas, compact_result, run_server_tool
@@ -50,6 +51,20 @@ def _norm_args(raw: str) -> str:
 class Services:
     nim: NIMClient
     attachments: AttachmentStore      # uploads in RAM; the server keeps nothing on disk
+
+
+@dataclass
+class Trim:
+    """The history after the automatic trim, and the exact size of the dialogue request made from it."""
+    messages: list
+    turns: int = 0                    # oldest user turns dropped
+    tokens: int = 0                   # by how much the request shrank
+    count: Optional[Count] = None     # None: the model has no exact counter (then sizes are estimates)
+
+
+ARCHIVE_NOTE = ("Earlier parts of this conversation were archived to long-term memory. "
+                "Use search_memory if you need details from them.")
+_VIDEO_PROBES: dict[str, asyncio.Future] = {}     # clips being measured right now (one request per clip)
 
 
 class AgentSession:
@@ -120,6 +135,7 @@ class AgentSession:
     # ------------------------------------------------------------- context
     @staticmethod
     def _estimate_tokens(messages: list[dict]) -> int:
+        """Rough size, only for a model without an exact counter (see tokencount.supports)."""
         n = 0
         for m in messages:
             n += media.estimate_tokens(m.get("content"))
@@ -127,27 +143,57 @@ class AgentSession:
                 n += len(json.dumps(m["tool_calls"], ensure_ascii=False)) / 3.2
         return int(n)
 
-    def _trim_context(self) -> None:
-        """Drop the oldest turns (they are already in memory) when the live context grows too big."""
-        budget = settings.CONTEXT_BUDGET_TOKENS
-        if self._estimate_tokens(self.messages) <= budget:
-            return
-        while self._estimate_tokens(self.messages) > budget * 0.7:
-            starts = [i for i, m in enumerate(self.messages) if m.get("role") == "user"]
-            if len(starts) < 2 or len(starts) <= settings.CONTEXT_KEEP_TURNS:
-                break
-            del self.messages[:starts[1]]
-        note = {"role": "system", "content": "Earlier parts of this conversation were archived to long-term memory. "
-                                              "Use search_memory if you need details from them."}
-        self.messages = [m for m in self.messages
-                         if not (m.get("role") == "system" and str(m.get("content", "")).startswith("Earlier parts"))]
-        self.messages.insert(0, note)
-        log.info("session %s: context trimmed to ~%d tokens, %d messages", self.id, self._estimate_tokens(self.messages), len(self.messages))
+    def _count(self, model: str, messages: list[dict], tools: Optional[list] = None,
+               thinking: Optional[bool] = None) -> Optional[Count]:
+        """Exact prompt tokens of a request to `model`, or None when there is no counter for it."""
+        if not tokencount.supports(model):
+            return None
+        try:
+            return COUNTER.count(messages, tools, settings.LLM_THINKING if thinking is None else thinking)
+        except Exception as e:  # noqa: BLE001
+            log.warning("session %s: token count failed: %s", self.id, e)
+            return None
 
-    def _for_request(self) -> list[dict]:
-        """History as sent to the model: media only in the last MEDIA_KEEP_TURNS user messages that carry it
-        (older images/audio/video become a text stub — the answer about them is already in the history)."""
-        return media.prune_old_media(self.messages, settings.MEDIA_KEEP_TURNS)
+    def _dialogue_request(self, messages: list[dict], tts: bool) -> tuple[str, list[dict]]:
+        """The dialogue agent's model and request for this history, exactly as _dialogue_call sends it: media only in
+        the last MEDIA_KEEP_TURNS user messages (older images/audio/video become a text stub, the answer about them
+        is already in the history)."""
+        return self._for_model([self._system_message(tts)] + media.prune_old_media(messages, settings.MEDIA_KEEP_TURNS))
+
+    def _trimmed(self, messages: list[dict], tts: bool) -> Trim:
+        """The history after the automatic trim (nothing is changed here): once the dialogue request is bigger than
+        CONTEXT_BUDGET_TOKENS, the oldest turns go (they are already in long-term memory) until it is down to 70 % of
+        it, keeping at least CONTEXT_KEEP_TURNS user turns. Sizes are exact for a model with a counter."""
+        budget = settings.CONTEXT_BUDGET_TOKENS
+        model, req = self._dialogue_request(messages, tts)
+        c = self._count(model, req)
+        size = c.total if c else self._estimate_tokens(req)
+        if size <= budget:
+            return Trim(messages, count=c)
+        per = c.per_message[1:] if c else [self._estimate_tokens([m]) for m in messages]   # [i] -> messages[i]
+        starts = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+        k, dropped = 0, 0
+        while size - dropped > budget * 0.7:
+            left = len(starts) - k
+            if left < 2 or left <= settings.CONTEXT_KEEP_TURNS:
+                break
+            k += 1
+            dropped = sum(per[:starts[k]])
+        out = [m for m in messages[starts[k] if k else 0:]
+               if not (m.get("role") == "system" and str(m.get("content", "")).startswith("Earlier parts"))]
+        out.insert(0, {"role": "system", "content": ARCHIVE_NOTE})
+        model, req = self._dialogue_request(out, tts)
+        c2 = self._count(model, req)
+        return Trim(out, turns=k, tokens=size - (c2.total if c2 else self._estimate_tokens(req)), count=c2)
+
+    async def _trim_context(self, tts: bool = False) -> None:
+        """Apply the automatic trim to the live context (see _trimmed)."""
+        trim = await asyncio.to_thread(self._trimmed, self.messages, tts)
+        if trim.messages is self.messages:
+            return
+        self.messages = trim.messages
+        log.info("session %s: context trimmed: %d oldest turns dropped, request now %s tokens (-%d)", self.id, trim.turns,
+                 trim.count.total if trim.count else "~?", trim.tokens)
 
     # ------------------------------------------------------------- lifecycle
     def busy(self) -> bool:
@@ -207,7 +253,7 @@ class AgentSession:
         self.turns = len(users)
         self.session_attachment_ids = held
         self.last_attachment_ids = last_ids
-        self._trim_context()
+        await self._trim_context()
 
     # ------------------------------------------------------------- main turn
     async def handle_user_message(self, text: str, attachment_ids: list[str], source: str = "text",
@@ -219,6 +265,121 @@ class AgentSession:
             await self._task
         except asyncio.CancelledError:
             pass
+
+    @staticmethod
+    def _user_message(text: str, atts: list, parts: list[dict], notes: list[str]) -> tuple[str, dict]:
+        """The user's message as the model gets it: the text, a note on the attachments, their media parts."""
+        user_text = text or ("(see attachments)" if atts else "")
+        if atts:
+            user_text += "\n\n[attachments: " + "; ".join(notes) + "]"
+        return user_text, {"role": "user", "content": [{"type": "text", "text": user_text}, *parts] if parts else user_text}
+
+    # ------------------------------------------------------------- size of the next request
+    async def count_request(self, text: str, attachment_ids: list[str], tts: bool,
+                            still_wanted: Callable[[], bool] = lambda: True) -> dict:
+        """Exact size of the request the next message would make: the dialogue agent's request with the system
+        prompt, the history after the automatic trim, and this message with its attachments. Recalled memories are
+        not in it (the client picks them when the message is sent). A video clip not measured yet is measured with
+        one short request (NIMClient.prompt_tokens), then everything is counted again."""
+        text = (text or "").strip()
+        atts = [a for a in (self.services.attachments.get(x) for x in attachment_ids or []) if a]
+        parts, notes = [], []
+        if atts:
+            parts, notes, _ = await media.build_parts(atts)
+        make = (lambda t: self._user_message(t, atts, parts, notes)[1]) if (text or atts) else None
+        history = list(self.messages)
+        res, unknown = await asyncio.to_thread(self._preview, history, make, text, tts)
+        if unknown and still_wanted():
+            await self.send({"type": "token_count", **res})
+            for part in unknown:
+                await self._measure_video(part)
+            if still_wanted():
+                res, _ = await asyncio.to_thread(self._preview, history, make, text, tts)
+        return res
+
+    def _preview(self, history: list[dict], make: Optional[Callable[[str], dict]], text: str,
+                 tts: bool) -> tuple[dict, list[dict]]:
+        t0 = time.perf_counter()
+        draft = make(text) if make else None
+        trim = self._trimmed(history + ([draft] if draft else []), tts)
+        model, req = self._dialogue_request(trim.messages, tts)
+        res: dict = {"model": model, "limit": tokencount.CONTEXT_LIMIT, "max_prompt": tokencount.MAX_PROMPT,
+                     "budget": settings.CONTEXT_BUDGET_TOKENS, "keep_turns": settings.CONTEXT_KEEP_TURNS}
+        c = trim.count
+        if c is None:
+            return dict(res, ok=False, reason=(f"точный подсчёт есть только для {tokencount.MODEL.split('/')[-1]}"
+                                               if not tokencount.supports(model) else COUNTER.error or "счётчик недоступен")), []
+        tail = c.total - sum(c.per_message)                 # the generation prompt after the last message
+        system = c.per_message[0]
+        message = (c.per_message[-1] + tail) if draft else 0
+        hist = c.total - system - message
+        last = len(req) - 1
+        over = max(0, c.total - tokencount.MAX_PROMPT)
+        res.update(ok=True, exact=c.exact, total=c.total, fits=over == 0, over=over,
+                   room=max(0, tokencount.CONTEXT_LIMIT - c.total), system=system, history=hist, message=message,
+                   history_messages=sum(1 for m in req[1:last if draft else None] if m.get("role") in ("user", "assistant")),
+                   attachments=[{k: it[k] for k in ("kind", "tokens", "detail", "exact")} for it in c.items
+                                if draft and it["message"] == last],
+                   measuring=[it["detail"] for it in c.items if not it["exact"]],
+                   trimmed={"turns": trim.turns, "tokens": trim.tokens} if trim.turns else None)
+        if over:
+            res["fix"] = self._fit_hints(c, req, bool(draft), over, history, make, text, tts)
+        res["ms"] = round((time.perf_counter() - t0) * 1000)
+        seen, unknown = set(), []
+        for m in req:
+            for p in (m.get("content") if isinstance(m.get("content"), list) else []):
+                if p.get("type") == "video_url":
+                    key = tokencount.media_key(p)
+                    if key not in tokencount.MEASURED_VIDEO and key not in seen:
+                        seen.add(key)
+                        unknown.append(p)
+        return res, unknown
+
+    def _fit_hints(self, c: Count, req: list[dict], has_draft: bool, over: int, history: list[dict],
+                   make: Optional[Callable[[str], dict]], text: str, tts: bool) -> dict:
+        """What would make an oversized request fit: the message cut to N characters (checked by counting the cut
+        request again), or the oldest K history messages removed."""
+        fix: dict = {"tokens": over}
+        if has_draft and text and make:
+            keep = COUNTER.count_text(text) - over
+            for _ in range(4):
+                if keep <= 0:
+                    break
+                chars = COUNTER.prefix_chars(text, keep)
+                total = self._trimmed(history + [make(text[:chars])], tts).count.total
+                if total <= tokencount.MAX_PROMPT:
+                    fix["message_chars"] = chars
+                    fix["message_chars_now"] = len(text)
+                    break
+                keep -= total - tokencount.MAX_PROMPT      # a token merged at the cut: cut that much more
+        end = len(req) - 1 if has_draft else len(req)
+        freed, count = 0, 0
+        for i in range(1, end):
+            freed += c.per_message[i]
+            count += req[i].get("role") in ("user", "assistant")
+            if freed >= over:
+                fix["drop_oldest"] = {"messages": count, "tokens": freed}
+                break
+        return fix
+
+    async def _measure_video(self, part: dict) -> None:
+        """One short request per clip (see NIMClient.prompt_tokens); a clip already being measured is waited for."""
+        key = tokencount.media_key(part)
+        if key in tokencount.MEASURED_VIDEO:
+            return
+        job = _VIDEO_PROBES.get(key)
+        if job is None:
+            async def probe() -> None:
+                t0 = time.time()
+                total = await self.services.nim.prompt_tokens(tokencount.video_probe_messages(part), tokencount.MODEL)
+                n = await asyncio.to_thread(tokencount.remember_video, part, total)
+                log.info("session %s: video measured: %d tokens (one request, %.1fs)", self.id, n, time.time() - t0)
+            job = _VIDEO_PROBES[key] = asyncio.ensure_future(probe())
+            job.add_done_callback(lambda _f: _VIDEO_PROBES.pop(key, None))
+        try:
+            await asyncio.shield(job)
+        except Exception as e:  # noqa: BLE001
+            log.warning("session %s: video measurement failed: %s", self.id, e)
 
     def _inject_memories(self, items: list, max_chars: int = 6000) -> None:
         """Memories the client recalled for this message (it owns the long-term memory): a system note for the
@@ -257,6 +418,46 @@ class AgentSession:
                 if text.strip():
                     out.append({"role": m["role"], "content": text[:2000]})
         return out[-limit:]
+
+    def _check_count(self, agent: str, job: Optional[asyncio.Future], acc: Completion) -> Optional[dict]:
+        """The local count of a request next to NVIDIA's prompt_tokens for it. A request whose only unknown was a video
+        clip teaches the clip's size: every later request with it is counted exactly."""
+        predicted: Optional[Count] = None
+        if job is not None:
+            try:
+                predicted = job.result() if job.done() else None
+            except Exception:  # noqa: BLE001
+                predicted = None
+        actual = (acc.usage or {}).get("prompt_tokens")
+        if predicted is None or not actual:
+            return None
+        actual = int(actual)
+        unknown = [it for it in predicted.items if not it["exact"]]
+        if len(unknown) == 1 and unknown[0]["kind"] == "video" and unknown[0].get("key"):
+            n = tokencount.set_video(unknown[0]["key"], actual - predicted.total)
+            log.info("session %s %s: video measured from the answer: %d tokens", self.id, agent, n)
+            return {"predicted": predicted.total, "actual": actual, "match": None, "video": n}
+        match = predicted.total == actual
+        if match:
+            log.info("session %s %s: prompt %d tokens, as counted", self.id, agent, actual)
+        else:
+            log.warning("session %s %s: prompt %d tokens, counted %d (%+d)%s", self.id, agent, actual, predicted.total,
+                        actual - predicted.total, "" if predicted.exact else ", count not exact")
+        return {"predicted": predicted.total, "actual": actual, "match": match}
+
+    def _count_job(self, model: str, messages: list[dict], tools: Optional[list] = None,
+                   thinking: Optional[bool] = None) -> Optional[asyncio.Future]:
+        """Count a request in a worker thread while it is on its way (the count never delays the call)."""
+        if not tokencount.supports(model):
+            return None
+        return asyncio.ensure_future(asyncio.to_thread(self._count, model, messages, tools, thinking))
+
+    async def _counted(self, job: Optional[asyncio.Future]) -> None:
+        if job is not None:
+            try:
+                await job
+            except Exception:  # noqa: BLE001
+                pass
 
     def _trace_params(self, tts: bool, use_memory: bool, source: str, tools: list, max_tokens: Optional[int] = None) -> dict:
         return {"temperature": settings.LLM_TEMPERATURE, "max_tokens": max_tokens or settings.LLM_MAX_TOKENS,
@@ -300,7 +501,6 @@ class AgentSession:
         Returns (speech, display, task, first_token_ms). Spoken text streams to the client while it
         is generated; the `===` part goes to the screen; a `>>>` task is handed to the executor.
         """
-        messages = [self._system_message(tts)] + self._for_request()
         router = ProseSpeechRouter()
         first_token_ms: Optional[int] = None
         await self.send({"type": "stage", "name": stage, "agent": "dialogue"})
@@ -324,7 +524,8 @@ class AgentSession:
                 await self.send({"type": "wait", **data})
 
         t0 = time.time()
-        model, messages = self._for_model(messages)
+        model, messages = self._dialogue_request(self.messages, tts)
+        counting = self._count_job(model, messages)
         for attempt in range(2):
             router = ProseSpeechRouter()
             await self.send({"type": "trace", "kind": "request", "agent": "dialogue", "stage": stage, "turn": self.turns,
@@ -333,9 +534,11 @@ class AgentSession:
             acc: Completion = await self.services.nim.chat_stream(messages, None, model=model,
                                                                   max_tokens=settings.DIALOGUE_MAX_TOKENS, on_event=on_event)
             await emit(router.finish())
+            await self._counted(counting)
             await self.send({"type": "trace", "kind": "response", "agent": "dialogue", "stage": stage, "turn": self.turns,
                              "round": call_no, "content": acc.content, "reasoning": acc.reasoning, "tool_calls": [],
-                             "finish_reason": acc.finish_reason, "usage": acc.usage, "ms": int((time.time() - t0) * 1000)})
+                             "finish_reason": acc.finish_reason, "usage": acc.usage, "ms": int((time.time() - t0) * 1000),
+                             "prompt_check": self._check_count("dialogue", counting, acc)})
             if acc.finish_reason == "degenerate":
                 if attempt == 0 and not router.speech.strip():
                     # the loop started before anything was said: one more try
@@ -362,6 +565,7 @@ class AgentSession:
             f"Сообщение пользователя (классифицируй, не отвечай на него): «{user_text}»\nВерни только JSON.")}]
         t0 = time.time()
         model = self.model_for_role("router")
+        counting = self._count_job(model, messages, thinking=False)
         await self.send({"type": "trace", "kind": "request", "agent": "router", "stage": "router", "turn": self.turns,
                          "round": 0, "model": model, "messages": messages, "tools": [],
                          "params": dict(self._trace_params(tts, use_memory, source, [], 200), temperature=0.1)})
@@ -371,9 +575,11 @@ class AgentSession:
         except Exception as e:  # noqa: BLE001
             log.warning("session %s: router call failed: %s", self.id, e)
             return None
+        await self._counted(counting)
         await self.send({"type": "trace", "kind": "response", "agent": "router", "stage": "router", "turn": self.turns,
                          "round": 0, "content": acc.content, "reasoning": acc.reasoning, "tool_calls": [],
-                         "finish_reason": acc.finish_reason, "usage": acc.usage, "ms": int((time.time() - t0) * 1000)})
+                         "finish_reason": acc.finish_reason, "usage": acc.usage, "ms": int((time.time() - t0) * 1000),
+                         "prompt_check": self._check_count("router", counting, acc)})
         m = re.search(r"\{.*\}", acc.content or "", re.S)
         if not m:
             return None
@@ -417,6 +623,7 @@ class AgentSession:
             # tool, the round is repeated once with `required`, so the result cannot simply be made up.
             choice = "required" if (tools_used == 0 and schemas and force_tools) else "auto"
             model, messages = self._for_model(messages, "executor")
+            counting = self._count_job(model, messages, schemas)
             await self.send({"type": "trace", "kind": "request", "agent": "executor", "stage": "executor", "turn": self.turns,
                              "round": call_no + round_no - 1, "model": model, "messages": media.redact(messages),
                              "tools": [s["function"]["name"] for s in schemas],
@@ -431,10 +638,11 @@ class AgentSession:
                     await self.send({"type": "wait", **data})
 
             acc: Completion = await self.services.nim.chat_stream(messages, schemas, model=model, tool_choice=choice, on_event=on_event)
+            await self._counted(counting)
             await self.send({"type": "trace", "kind": "response", "agent": "executor", "stage": "executor", "turn": self.turns,
                              "round": call_no + round_no - 1, "content": acc.content, "reasoning": acc.reasoning,
                              "tool_calls": acc.tool_calls, "finish_reason": acc.finish_reason, "usage": acc.usage,
-                             "ms": int((time.time() - t0) * 1000)})
+                             "ms": int((time.time() - t0) * 1000), "prompt_check": self._check_count("executor", counting, acc)})
             log.info("session %s executor round %d (%s): %d chars, %d tool calls, %.1fs", self.id, round_no, choice,
                      len(acc.content), len(acc.tool_calls), time.time() - t0)
             if acc.finish_reason == "degenerate" and not acc.tool_calls and not degenerate_retry:
@@ -495,18 +703,16 @@ class AgentSession:
         self.session_attachment_ids.extend(a.id for a in atts)
 
         # attachments go straight into the message: images/audio/video as media parts, documents as text
-        parts, notes, media_tokens = await media.build_parts(atts)
-        user_text = text or ("(see attachments)" if atts else "")
+        parts, notes, _ = await media.build_parts(atts)
+        user_text, message = self._user_message(text, atts, parts, notes)
         if atts:
-            user_text += "\n\n[attachments: " + "; ".join(notes) + "]"
-            log.info("session %s: %d attachment(s) -> %d parts, ~%d tokens", self.id, len(atts), len(parts), media_tokens)
-        content: Any = [{"type": "text", "text": user_text}, *parts] if parts else user_text
-        self.messages.append({"role": "user", "content": content})
+            log.info("session %s: %d attachment(s) -> %d parts", self.id, len(atts), len(parts))
+        self.messages.append(message)
         use_memory = bool(memory)
         if memory_context:
             self._inject_memories(memory_context)
         self.turns += 1
-        self._trim_context()
+        await self._trim_context(tts)
 
         tools_enabled = bool(self.client_info.get("tools_enabled", True))
         ctx = ToolContext(self, self.client_call)

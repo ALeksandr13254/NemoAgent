@@ -186,3 +186,8 @@ button svg { width: 16px; height: 16px; vertical-align: -3px; }
 .msg-editor textarea:focus { outline: none; }
 .msg-editor .row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
 .msg-editor .spacer { flex: 1; }
+/* token counter under the composer: plain while the request fits, amber when old turns will be trimmed, red over the limit */
+.tok { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 70%; cursor: help; }
+.tok.trim { color: var(--warn); }
+.tok.over { color: var(--err); white-space: normal; }
+.tk { font-variant-numeric: tabular-nums; }
