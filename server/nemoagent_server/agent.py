@@ -263,7 +263,7 @@ class AgentSession:
                 "thinking": settings.LLM_THINKING, "tool_choice": "auto" if tools else None,
                 "tts": tts, "memory": use_memory, "source": source}
 
-    ROLES = ("dialogue", "executor", "router", "media")
+    ROLES = ("dialogue", "executor", "router")
 
     def model_for_role(self, role: str) -> str:
         """The client picks a model per role in its settings (client_info["models"]); otherwise the server defaults."""
@@ -273,8 +273,6 @@ class AgentSession:
             chosen = str(self.client_info.get("text_model") or "").strip()   # older clients: one text model
         if chosen and chosen not in settings.RETIRED_MODELS:
             return chosen
-        if role == "media":
-            return settings.LLM_MEDIA_MODEL
         if role == "router":
             return settings.ROUTER_MODEL
         return settings.LLM_MODEL
@@ -287,11 +285,13 @@ class AgentSession:
     def text_model(self) -> str:
         return self.model_for_role("dialogue")
 
-    def _model_for(self, messages: list[dict], role: str = "dialogue") -> str:
-        """The role's model unless the request carries images / audio / video — then the media (omni) model."""
-        if any(media.has_media(m.get("content")) for m in messages):
-            return self.model_for_role("media")
-        return self.model_for_role(role)
+    def _for_model(self, messages: list[dict], role: str = "dialogue") -> tuple[str, list[dict]]:
+        """The role's model and the messages in a form it takes. Every role is multimodal by default and gets images,
+        audio and video as they are; a text-only model (TEXT_ONLY_MODELS) gets a short text note in their place."""
+        model = self.model_for_role(role)
+        if model in settings.TEXT_ONLY_MODELS and any(media.has_media(m.get("content")) for m in messages):
+            messages = media.prune_old_media(messages, 0)
+        return model, messages
 
     async def _dialogue_call(self, tts: bool, use_memory: bool, source: str, t_start: float, stage: str,
                              call_no: int) -> tuple[str, Optional[str], Optional[str], Optional[int]]:
@@ -324,7 +324,7 @@ class AgentSession:
                 await self.send({"type": "wait", **data})
 
         t0 = time.time()
-        model = self._model_for(messages)
+        model, messages = self._for_model(messages)
         for attempt in range(2):
             router = ProseSpeechRouter()
             await self.send({"type": "trace", "kind": "request", "agent": "dialogue", "stage": stage, "turn": self.turns,
@@ -416,7 +416,7 @@ class AgentSession:
             # behind `required` stalled for 90 s twice on the free pool); if it answers without calling any
             # tool, the round is repeated once with `required`, so the result cannot simply be made up.
             choice = "required" if (tools_used == 0 and schemas and force_tools) else "auto"
-            model = self._model_for(messages, "executor")   # switches to the media model once a screenshot / attachment is in the loop
+            model, messages = self._for_model(messages, "executor")
             await self.send({"type": "trace", "kind": "request", "agent": "executor", "stage": "executor", "turn": self.turns,
                              "round": call_no + round_no - 1, "model": model, "messages": media.redact(messages),
                              "tools": [s["function"]["name"] for s in schemas],
@@ -526,7 +526,13 @@ class AgentSession:
             if said.strip():
                 self.messages.append({"role": "assistant", "content": said})
                 assistant_text = said
-            if not task and router_job is not None:
+            if (not task and router_job is not None and atts and (speech or display or "").strip()
+                    and not looks_like_promise(speech)):
+                # the dialogue agent saw the attachments itself and answered; the router only read the text of the
+                # request, so its verdict does not send the executor to look at the same files again
+                router_job.cancel()
+                log.info("session %s: attachments answered by the dialogue agent, router verdict not used", self.id)
+            elif not task and router_job is not None:
                 # no `>>>` from the dialogue agent: the router's verdict on the request itself decides
                 try:
                     verdict = await asyncio.wait_for(router_job, timeout=settings.ROUTER_TIMEOUT)

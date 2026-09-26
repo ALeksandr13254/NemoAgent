@@ -23,7 +23,7 @@ Protocol (JSON text frames):
         -> {"type":"prompts","current":{...},"defaults":{...},"overrides":{...},"overridden":[...]}
     {"type":"ping"}
   server -> client
-    {"type":"ready", "session_id", "model", "models", "media_model", "default_model"}
+    {"type":"ready", "session_id", "model", "models", "vision", "default_model"}
     {"type":"stage", "name": "answer"|"executor"|"report", "agent": "dialogue"|"executor"}
     {"type":"delta", "content"} · {"type":"reasoning", "content"} · {"type":"speech_delta", "content"}
     {"type":"speech_done", "display": str|null, "final": bool}
@@ -82,8 +82,8 @@ async def lifespan(app: FastAPI):
     attachments = AttachmentStore()
     services = Services(nim=nim, attachments=attachments)
     ffmpeg = shutil.which(settings.FFMPEG)
-    log.info("NemoAgent server ready on %s:%s | text model %s | media model %s | router %s | ffmpeg %s | no disk state",
-             settings.HOST, settings.PORT, settings.LLM_MODEL, settings.LLM_MEDIA_MODEL, settings.ROUTER_MODEL,
+    log.info("NemoAgent server ready on %s:%s | model %s | router %s | ffmpeg %s | no disk state",
+             settings.HOST, settings.PORT, settings.LLM_MODEL, settings.ROUTER_MODEL,
              ffmpeg or "not found (only wav/mp3/mp4 attachments pass as they are)")
     sweeper = asyncio.create_task(_sweeper(attachments))
     try:
@@ -105,15 +105,16 @@ def _check_token(authorization: Optional[str]) -> None:
 
 
 def _ready(session: AgentSession) -> dict:
-    return {"type": "ready", "session_id": session.id, "vision": True, "modalities": ["text", "image", "audio", "video"],
-            "model": session.text_model, "models": session.models, "media_model": session.model_for_role("media"),
-            "default_model": settings.LLM_MODEL}
+    vision = session.text_model not in settings.TEXT_ONLY_MODELS
+    return {"type": "ready", "session_id": session.id, "vision": vision,
+            "modalities": ["text", "image", "audio", "video"] if vision else ["text"],
+            "model": session.text_model, "models": session.models, "default_model": settings.LLM_MODEL}
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "model": settings.LLM_MODEL, "media_model": settings.LLM_MEDIA_MODEL, "router_model": settings.ROUTER_MODEL,
-            "vision": True, "ffmpeg": bool(shutil.which(settings.FFMPEG)),
+    return {"ok": True, "model": settings.LLM_MODEL, "router_model": settings.ROUTER_MODEL,
+            "vision": settings.LLM_MODEL not in settings.TEXT_ONLY_MODELS, "ffmpeg": bool(shutil.which(settings.FFMPEG)),
             "uploads_in_ram": services.attachments.count() if services else 0, "time": time.time()}
 
 
@@ -255,7 +256,7 @@ async def ws_endpoint(ws: WebSocket):
                 if "text_model" in incoming or "models" in incoming:
                     log.info("session %s: models -> %s", link.session.id, {k: v.split("/")[-1] for k, v in link.session.models.items()})
                     await link.send({"type": "model", "model": link.session.text_model, "models": link.session.models,
-                                     "media_model": link.session.model_for_role("media")})
+                                     "vision": link.session.text_model not in settings.TEXT_ONLY_MODELS})
                 new_gender = incoming.get("persona_gender")
                 if new_gender and old_gender and new_gender != old_gender and link.session.messages:
                     # the voice changed mid-conversation: the history is full of the old gender, so say it out loud

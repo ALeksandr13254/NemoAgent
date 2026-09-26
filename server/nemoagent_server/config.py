@@ -57,13 +57,13 @@ class Settings:
     # --- NVIDIA NIM ---
     NVIDIA_API_KEY = _env("NVIDIA_API_KEY", "")
     NIM_BASE_URL = _env("NIM_BASE_URL", "https://integrate.api.nvidia.com/v1/")
-    # Two models: the fast text model answers every request that carries no media (first token ~1 s,
-    # no queue), the omni model takes over automatically when a request contains images / audio / video
-    # (attachments, screenshots) — its free pool is small and often overloaded (503 "16/16").
+    # Every role runs on a multimodal model by default and sees images, hears audio and watches video itself.
     # Server-side defaults per role; the client can override every role from its settings panel
-    # (client_info["models"] = {dialogue, executor, router, media}).
+    # (client_info["models"] = {dialogue, executor, router}).
     LLM_MODEL = _env("LLM_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning")          # dialogue + executor
-    LLM_MEDIA_MODEL = _env("LLM_MEDIA_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning")
+    # Models that take text only: in their calls media is replaced with a short text note (AgentSession._for_model).
+    TEXT_ONLY_MODELS = {m.strip() for m in (_env("TEXT_ONLY_MODELS", "nvidia/nemotron-3.5-lightning-30b-a3b") or "").split(",")
+                        if m.strip()}
     LLM_THINKING = _bool("LLM_THINKING", False)     # the model reasons by default; off saves seconds per answer
     LLM_TEMPERATURE = _float("LLM_TEMPERATURE", 0.3)  # model card: 0.2 without reasoning, 0.6 with it
     # Router: a fast parallel call that classifies the user's request (needs the executor or not) and drafts

@@ -52,7 +52,6 @@ class ClientCore:
             "model_dialogue": settings.MODEL_DIALOGUE,   # models per role, asked from the server
             "model_executor": settings.MODEL_EXECUTOR,
             "model_router": settings.MODEL_ROUTER,
-            "model_media": settings.MODEL_MEDIA,
             "voice_ru": settings.TTS_VOICE_RU,
             "voice_en": settings.TTS_VOICE_EN,
             "tts_speed": settings.TTS_SPEED,
@@ -91,9 +90,9 @@ class ClientCore:
 
     # ============================================================== settings persistence
     PERSIST_KEYS = ("tts_mode", "auto_listen", "barge_in", "tools_enabled", "confirm", "voice_ru", "voice_en", "tts_speed",
-                    "stt_language", "tts_language", "model_dialogue", "model_executor", "model_router", "model_media",
+                    "stt_language", "tts_language", "model_dialogue", "model_executor", "model_router",
                     "speaker_device", "mic_device", "screenshot_monitors")
-    MODEL_KEYS = ("model_dialogue", "model_executor", "model_router", "model_media")
+    MODEL_KEYS = ("model_dialogue", "model_executor", "model_router")
 
     def _models(self) -> dict:
         """{role: model id} for the server, only the roles that are set."""
@@ -115,7 +114,7 @@ class ClientCore:
             log.warning("cannot read %s: %s", self._settings_path, e)
 
     def _model_options(self, key: str) -> tuple:
-        return settings.MEDIA_MODELS if key == "model_media" else settings.TEXT_MODELS
+        return settings.TEXT_MODELS
 
     def _sanitize_models(self) -> list[str]:
         """Replace models that are no longer offered (the retired Super 120B in old settings) with the default."""
@@ -712,7 +711,7 @@ class ClientCore:
         t = msg.get("type")
         if t == "ready":
             self.session_id = msg.get("session_id")
-            self.server_info = {k: msg.get(k) for k in ("vision", "vision_error", "memory", "model", "models", "media_model", "default_model")}
+            self.server_info = {k: msg.get(k) for k in ("vision", "vision_error", "memory", "model", "models", "default_model")}
             await self.broadcast_status()
             return
         if t in ("memory_stats", "memory_saved"):   # memory changed: new record count for the pill
@@ -724,6 +723,8 @@ class ClientCore:
         if t == "model":   # the server confirmed the models chosen in the settings
             self.server_info["model"] = msg.get("model")
             self.server_info["models"] = msg.get("models") or self.server_info.get("models")
+            if "vision" in msg:     # the dialogue model sees attachments (Omni) or takes text only (Lightning)
+                self.server_info["vision"] = msg["vision"]
             await self.broadcast_status()
             return
         if t == "prompts":   # the session's prompt overrides, as the server now holds them: persist them here

@@ -327,7 +327,16 @@ async def tool_view_attachments(ctx: ToolContext, args: dict) -> dict:
         ids = [ids]
     ids = [i for i in ids if i] or list(ctx.session.last_attachment_ids)
     store = ctx.session.services.attachments
-    atts = [store.get(i) for i in ids]
+    known = [a for a in (store.get(j) for j in reversed(ctx.session.session_attachment_ids)) if a]
+
+    def find(key: str):
+        """By id, or by the file name the model took from the [attachments: ...] note instead of the id."""
+        a = store.get(key)
+        if a is None:
+            a = next((x for x in known if key in (x.name, x.name.rsplit(".", 1)[0])), None)
+        return a
+
+    atts = [find(i) for i in ids]
     missing = [i for i, a in zip(ids, atts) if a is None]
     atts = [a for a in atts if a is not None][:12]
     if not atts:
@@ -437,15 +446,16 @@ SERVER_TOOLS: dict[str, tuple[dict, ServerTool]] = {
         "function": {
             "name": "view_attachments",
             "description": (
-                "Show yourself the files the user attached (listed in the conversation as attachment ids): images, "
-                "screenshots, audio, video and document text come back as content you can see, hear and read. "
-                "Empty ids = the attachments of the latest user message."
+                "Bring back files the user attached in EARLIER messages whose media is no longer in the conversation "
+                "(their note reads [attachments: ... id=...]): images, screenshots, audio, video and document text come "
+                "back as content you can see, hear and read. The attachments of the current message are already in "
+                "front of you: never call this for them."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "attachment_ids": {"type": "array", "items": {"type": "string"},
-                                       "description": "Attachment ids to show. Empty = all attachments of the latest user message."},
+                                       "description": "Attachment ids (id=... in the note) of the files to bring back."},
                 },
                 "required": [],
             },

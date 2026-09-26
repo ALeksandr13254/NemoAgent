@@ -465,7 +465,7 @@
     const s = state.settings || {};
     for (const k of ['tts_mode', 'confirm', 'stt_language', 'tts_language']) $('s-' + k).value = s[k] || (k === 'tts_language' ? 'ru' : s[k]);
     const models = si.models || {};
-    for (const role of ['dialogue', 'executor', 'router', 'media']) $('s-model_' + role).value = s['model_' + role] || models[role] || '';
+    for (const role of ['dialogue', 'executor', 'router']) $('s-model_' + role).value = s['model_' + role] || models[role] || '';
     $('model').title = Object.entries(models).map(([r, m]) => `${r}: ${m}`).join('\n');
     for (const k of ['auto_listen', 'barge_in', 'tools_enabled']) $('s-' + k).checked = !!s[k];
     fillVoices('s-voice_ru', state.voices.ru, s.voice_ru); fillVoices('s-voice_en', state.voices.en, s.voice_en);
@@ -522,7 +522,7 @@
     updateSettingsPane();
   };
   updateSettingsPane();
-  for (const k of ['tts_mode', 'confirm', 'stt_language', 'tts_language', 'model_dialogue', 'model_executor', 'model_router', 'model_media', 'voice_ru', 'voice_en', 'speaker_device', 'mic_device']) $('s-' + k).onchange = (e) => pushSettings({ [k]: e.target.value });
+  for (const k of ['tts_mode', 'confirm', 'stt_language', 'tts_language', 'model_dialogue', 'model_executor', 'model_router', 'voice_ru', 'voice_en', 'speaker_device', 'mic_device']) $('s-' + k).onchange = (e) => pushSettings({ [k]: e.target.value });
   for (const k of ['auto_listen', 'barge_in', 'tools_enabled']) $('s-' + k).onchange = (e) => pushSettings({ [k]: e.target.checked });
   $('s-tts_speed').oninput = (e) => { $('s-tts_speed-v').textContent = Number(e.target.value).toFixed(2); };
   $('s-tts_speed').onchange = (e) => pushSettings({ tts_speed: Number(e.target.value) });
