@@ -27,7 +27,7 @@ from typing import Any, Awaitable, Callable, Optional
 from . import media
 from .attachments import AttachmentStore
 from .config import settings
-from .nim import Completion, NIMClient
+from .nim import Completion, NIMClient, UpstreamError
 from .prompts import PromptStore
 from .speechfmt import ProseSpeechRouter, looks_like_promise, strip_filler
 from .tools import CLIENT_TOOL_NAMES, ToolContext, all_schemas, compact_result, run_server_tool
@@ -596,6 +596,9 @@ class AgentSession:
             if isinstance(e, httpx.TransportError):
                 # a VPN switch or a dropped network kills the pooled connection to NVIDIA mid-request
                 message = "Связь с NVIDIA оборвалась (сеть или VPN переключились) — повторите сообщение."
+            elif isinstance(e, UpstreamError) and e.status == 451:
+                message = ("NVIDIA отклоняет запросы из текущей сети (HTTP 451): похоже, выключен VPN. "
+                           "Включите VPN и повторите сообщение.")
             elif not str(e).strip():
                 message = f"Ошибка на сервере: {type(e).__name__} (подробности в окне сервера)."
             else:

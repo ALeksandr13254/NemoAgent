@@ -88,8 +88,8 @@ class Settings:
     # against NIM_RETRY_BUDGET_S; one call gives up after NIM_RATE_LIMIT_MAX_WAIT_S of it.
     NIM_RATE_LIMIT_DELAYS = _floats("NIM_RATE_LIMIT_DELAYS", "5,10,20,30")
     NIM_RATE_LIMIT_MAX_WAIT_S = _float("NIM_RATE_LIMIT_MAX_WAIT_S", 120.0)
-    # The NIM host cannot be reached at all (network down, VPN switching): retry every this many seconds instead of
-    # spinning thousands of attempts a second. 0 = at once as well.
+    # The NIM host cannot be reached at all (network down, VPN switching) or refuses this network with HTTP 451 (the
+    # VPN is off): retry every this many seconds instead of spinning thousands of attempts a second. 0 = at once too.
     NIM_CONNECT_RETRY_DELAY_S = _float("NIM_CONNECT_RETRY_DELAY_S", 0.5)
     MAX_TOOL_ROUNDS = _int("MAX_TOOL_ROUNDS", 12)
 

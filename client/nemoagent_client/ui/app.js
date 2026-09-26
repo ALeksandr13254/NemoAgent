@@ -138,13 +138,15 @@
     if (text) send({ type: 'say', text });
   });
   /* waiting indicator: seconds since the message went out, until the model's first token */
-  let waitTimer = null, rateLimitUntil = 0;
+  let waitTimer = null, rateLimitUntil = 0, blockedAt = 0;
+  const BLOCKED_TEXT = 'NVIDIA недоступна из этой сети (HTTP 451): похоже, выключен VPN, повторяю…';
   function rateLimitText() { return `лимит запросов NVIDIA исчерпан, жду ${Math.max(1, Math.ceil((rateLimitUntil - Date.now()) / 1000))} с…`; }
   function waitingSince(t0) {
     clearInterval(waitTimer);
-    if (!t0) { waitTimer = null; rateLimitUntil = 0; return; }
+    if (!t0) { waitTimer = null; rateLimitUntil = 0; blockedAt = 0; return; }
     const tick = () => {
       if (Date.now() < rateLimitUntil) { $('stt-state').textContent = rateLimitText(); return; }
+      if (Date.now() - blockedAt < 1500) { $('stt-state').textContent = BLOCKED_TEXT; return; }
       const s = Math.round((Date.now() - t0) / 1000); if (s >= 2) $('stt-state').textContent = `модель думает… ${s} с`;
     };
     waitTimer = setInterval(tick, 1000);
@@ -353,6 +355,7 @@
       case 'memory': card('memory', `🗂 память: ${m.items.length} совпад.`, m.items.map((i) => `[${i.kind} ${i.score}] ${i.text}`).join('\n\n'), false); break;
       case 'wait':
         if (m.reason === 'rate_limit') { rateLimitUntil = Date.now() + (m.delay || 0) * 1000; $('stt-state').textContent = rateLimitText(); }
+        else if (m.reason === 'blocked') { blockedAt = Date.now(); $('stt-state').textContent = BLOCKED_TEXT; }
         else $('stt-state').textContent = m.stage === 'retry' ? `сервер NVIDIA перегружен, повтор ${m.attempt}…` : 'жду модель…';
         break;
       case 'notice': add(div('notice', esc(m.message))); break;

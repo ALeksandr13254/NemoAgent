@@ -36,6 +36,14 @@ class UpstreamError(Exception):
         self.retry_after = retry_after
 
 
+def _status_text(resp: httpx.Response) -> str:
+    """The message of an error whose body is empty: its status line, and what 451 means here."""
+    text = f"HTTP {resp.status_code} {resp.reason_phrase or ''}".strip()
+    if resp.status_code == 451:
+        text += " (NVIDIA refuses requests from this network: the VPN looks off)"
+    return text
+
+
 def _retry_after(resp: httpx.Response) -> Optional[float]:
     try:
         return float(resp.headers.get("retry-after") or "")
@@ -72,6 +80,8 @@ def _classify(err: Exception) -> Optional[str]:
             return "overloaded"
         if err.status in (429, 500, 502, 503, 504, 529):
             return "overloaded"
+        if err.status == 451:
+            return "blocked"      # NVIDIA refuses this network (VPN off): it passes as soon as the VPN is back
         return "fatal"
     if isinstance(err, (httpx.TransportError, httpx.RemoteProtocolError)):
         return "dropped"
@@ -154,10 +164,10 @@ class NIMClient:
     @staticmethod
     def _retry_delay(err: Exception, failures: int) -> float:
         """Pause before retrying any error except a 429 (see _rate_limited): none by default; a host that cannot be
-        reached at all gets NIM_CONNECT_RETRY_DELAY_S."""
+        reached at all, or refuses this network (451, VPN off), gets NIM_CONNECT_RETRY_DELAY_S."""
         delays = settings.NIM_RETRY_DELAYS
         delay = delays[min(failures, len(delays) - 1)]
-        if isinstance(err, (httpx.ConnectError, httpx.ConnectTimeout)):
+        if isinstance(err, (httpx.ConnectError, httpx.ConnectTimeout)) or (isinstance(err, UpstreamError) and err.status == 451):
             delay = max(delay, settings.NIM_CONNECT_RETRY_DELAY_S)
         return delay
 
@@ -195,7 +205,7 @@ class NIMClient:
                     payload[name] = value
                     log.warning("%s requires %s=%s; retrying", model, name, value)
                     continue
-                if kind not in ("overloaded", "dropped"):
+                if kind not in ("overloaded", "dropped", "blocked"):
                     raise
                 failures += 1
                 if isinstance(err, UpstreamError) and err.status == 429:
@@ -231,11 +241,11 @@ class NIMClient:
                     log.warning("backend rejected %s — retrying without it (%s)", key, _error_detail(text)[:100])
                     del body[key]
                     continue
-                raise UpstreamError(400, _error_detail(text))
+                raise UpstreamError(400, _error_detail(text) or _status_text(resp))
             if resp.status_code != 200:
                 text = (await resp.aread()).decode("utf-8", "ignore")
                 await resp.aclose()
-                raise UpstreamError(resp.status_code, _error_detail(text), _retry_after(resp))
+                raise UpstreamError(resp.status_code, _error_detail(text) or _status_text(resp), _retry_after(resp))
             try:
                 return await self._consume(resp, on_event)
             finally:
@@ -355,15 +365,13 @@ class NIMClient:
                     r = await self._client.post("embeddings", json={
                         "model": model, "input": batch, "input_type": input_type, "encoding_format": "float",
                     }, timeout=120)
-                    if r.status_code in (429, 502, 503, 504, 529):
-                        raise UpstreamError(r.status_code, _error_detail(r.text))
                     if r.status_code != 200:
-                        raise UpstreamError(r.status_code, _error_detail(r.text))
+                        raise UpstreamError(r.status_code, _error_detail(r.text) or _status_text(r), _retry_after(r))
                     data = sorted(r.json().get("data", []), key=lambda d: d.get("index", 0))
                     out.extend(d["embedding"] for d in data)
                     break
                 except Exception as err:  # noqa: BLE001
-                    if _classify(err) in ("overloaded", "dropped") and attempt < 3:
+                    if _classify(err) in ("overloaded", "dropped", "blocked") and attempt < 3:
                         rate_limited = isinstance(err, UpstreamError) and err.status == 429
                         await asyncio.sleep(self._rate_limited(err) if rate_limited else self._retry_delay(err, attempt))
                         continue

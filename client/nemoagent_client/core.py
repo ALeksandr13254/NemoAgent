@@ -655,6 +655,10 @@ class ClientCore:
                     self.server_ws = ws
                     await ws.send(json.dumps({"type": "hello", "token": settings.AGENT_TOKEN,
                                               "client": self._client_info()}, ensure_ascii=False))
+                    if self.chat and self.chat.get("messages"):
+                        # the server keeps nothing: after its restart it gets the open chat back, or the model forgets it
+                        await ws.send(json.dumps({"type": "load_session", "messages": self._history_for_model(self.chat)},
+                                                 ensure_ascii=False))
                     self.connected = True
                     backoff = 1.0
                     await self.broadcast_status()
