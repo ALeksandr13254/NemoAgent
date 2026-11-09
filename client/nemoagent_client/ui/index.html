@@ -53,6 +53,7 @@
     <button class="tab active" data-tab="chat">Чат</button>
     <button class="tab" data-tab="prompt">Системные промпты</button>
     <button class="tab" data-tab="memory">Память</button>
+    <button class="tab" data-tab="embed">Эмбеддинги</button>
     <button class="tab" data-tab="log">Полные логи <span id="log-count" class="muted"></span></button>
     <button class="tab" data-tab="reader">Озвучка</button>
   </nav>
@@ -84,6 +85,44 @@
       </div>
     </div>
     <div id="mem-empty" class="muted small">Выберите воспоминание слева или нажмите «+ новое воспоминание».</div>
+  </section>
+
+  <section id="embed" class="tabpane hidden">
+    <div class="editor">
+      <div class="panehead">
+        <b>Сравнение эмбеддингов</b>
+        <span class="muted small">Модель nvidia/nemotron-3.5-embed-8b: тексты и картинки в одном пространстве. Добавьте тексты (каждая строка — отдельный элемент) и картинки, нажмите «Сравнить» — увидите матрицу косинусной близости. Вектор считается сразу при добавлении — у каждого текста своя роль (переключатель «новые тексты считать как»), картинки всегда документы. «Сравнить» считает матрицу мгновенно из сохранённых векторов. Пара «запрос → документы» — это режим «реранкер» ниже.</span>
+      </div>
+      <label class="ed">Тексты (по одному на строку)
+        <textarea id="emb-texts" rows="5" spellcheck="false" placeholder="one text per line"></textarea></label>
+      <div class="row left">
+        <button id="emb-add-texts">+ добавить тексты</button>
+        <button id="emb-add-images" title="Загрузить картинки для сравнения">+ добавить картинки…</button>
+        <input type="file" id="emb-file-input" accept="image/*" multiple hidden>
+        <span class="spacer"></span>
+        <label class="muted small">новые тексты считать как <select id="emb-role-new" title="Роль вектора: документ лежит в индексе, запрос кодируется в момент поиска"><option value="passage">документы</option><option value="query">запросы</option></select></label>
+        <label class="muted small">размерность <select id="emb-dimensions" title="Усечение вектора с конца; по умолчанию родные 4096">
+          <option value="">4096 (родная)</option>
+          <option value="2048">2048</option>
+          <option value="1024">1024</option>
+          <option value="512">512</option>
+        </select></label>
+      </div>
+      <div class="row left">
+        <label class="muted small">режим <select id="emb-mode" title="Косинус: все пары друг с другом. Реранкер: каждый кандидат оценивается против запроса">
+          <option value="cosine">косинус (все пары)</option>
+          <option value="rerank">реранкер (запрос → кандидаты)</option>
+        </select></label>
+        <input id="emb-query" class="hidden" placeholder="Запрос для реранкера: что ищем?">
+      </div>
+      <div id="emb-items" class="side-list"></div>
+      <div class="row left">
+        <button id="emb-compare" class="primary">Сравнить</button>
+        <button id="emb-clear" class="link">очистить всё</button>
+        <span id="emb-status" class="muted small"></span>
+      </div>
+    </div>
+    <div id="emb-result"></div>
   </section>
 
   <section id="reader" class="tabpane hidden">
@@ -193,21 +232,44 @@
   <h3>Настройки</h3>
   <div class="muted small">Модели по ролям</div>
   <label>Голосовой агент
-    <select id="s-model_dialogue" title="Отвечает вам, сам видит вложения и ставит задачи исполнителю. Nano Omni понимает картинки, аудио и видео; Lightning работает только с текстом">
+    <select id="s-model_dialogue" title="Отвечает вам, сам видит вложения и ставит задачи исполнителю. Nano Omni понимает картинки, аудио и видео; Super VL, GLM Flash, Step 5 и DeepSeek Flash — картинки (без аудио/видео); Lightning и GLM 5.3 работают только с текстом">
       <option value="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning">Nemotron 3 Nano Omni 30B</option>
+      <option value="nvidia/nemotron-3.5-super-vl-120b-a12b">Nemotron 3.5 Super VL 120B</option>
       <option value="nvidia/nemotron-3.5-lightning-30b-a3b">Nemotron 3.5 Lightning 30B</option>
+      <option value="z-ai/glm-5.3-flash">GLM 5.3 Flash</option>
+      <option value="z-ai/glm-5.3">GLM 5.3</option>
+      <option value="stepfun-ai/step-5-preview">Step 5 Preview</option>
+      <option value="deepseek-ai/deepseek-v4.1-flash">DeepSeek V4.1 Flash</option>
     </select>
   </label>
   <label>Исполнитель
-    <select id="s-model_executor" title="Выполняет задачи инструментами и сам смотрит на скриншоты и вложения. Lightning скриншотов не видит">
+    <select id="s-model_executor" title="Выполняет задачи инструментами и сам смотрит на скриншоты и вложения. Lightning и GLM 5.3 скриншотов не видят">
       <option value="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning">Nemotron 3 Nano Omni 30B</option>
+      <option value="nvidia/nemotron-3.5-super-vl-120b-a12b">Nemotron 3.5 Super VL 120B</option>
       <option value="nvidia/nemotron-3.5-lightning-30b-a3b">Nemotron 3.5 Lightning 30B</option>
+      <option value="z-ai/glm-5.3-flash">GLM 5.3 Flash</option>
+      <option value="z-ai/glm-5.3">GLM 5.3</option>
+      <option value="stepfun-ai/step-5-preview">Step 5 Preview</option>
+      <option value="deepseek-ai/deepseek-v4.1-flash">DeepSeek V4.1 Flash</option>
     </select>
   </label>
   <label>Маршрутизатор
     <select id="s-model_router" title="Параллельно с ответом решает, нужен ли исполнитель, и формулирует задачу">
       <option value="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning">Nemotron 3 Nano Omni 30B</option>
+      <option value="nvidia/nemotron-3.5-super-vl-120b-a12b">Nemotron 3.5 Super VL 120B</option>
       <option value="nvidia/nemotron-3.5-lightning-30b-a3b">Nemotron 3.5 Lightning 30B</option>
+      <option value="z-ai/glm-5.3-flash">GLM 5.3 Flash</option>
+      <option value="z-ai/glm-5.3">GLM 5.3</option>
+      <option value="stepfun-ai/step-5-preview">Step 5 Preview</option>
+      <option value="deepseek-ai/deepseek-v4.1-flash">DeepSeek V4.1 Flash</option>
+    </select>
+  </label>
+  <label>Режим рассуждений
+    <select id="s-reasoning" title="Уровень рассуждений диалогового агента и исполнителя. Nemotron: выключены или включены (уровень не различается). GLM: low / high / max, выключены = минимум. Маршрутизатор всегда работает без рассуждений. Длина ответа не ограничена.">
+      <option value="off">выключены</option>
+      <option value="low">низкий</option>
+      <option value="high">высокий</option>
+      <option value="max">максимум</option>
     </select>
   </label>
   <hr>

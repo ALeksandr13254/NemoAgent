@@ -19,7 +19,7 @@ import websockets
 from . import executor
 from pathlib import Path
 
-from .config import settings
+from .config import settings, REASONING_MODES
 from .memory import MemoryStore
 
 log = logging.getLogger("core")
@@ -52,6 +52,7 @@ class ClientCore:
             "model_dialogue": settings.MODEL_DIALOGUE,   # models per role, asked from the server
             "model_executor": settings.MODEL_EXECUTOR,
             "model_router": settings.MODEL_ROUTER,
+            "reasoning": settings.REASONING,             # reasoning effort, asked from the server
             "voice_ru": settings.TTS_VOICE_RU,
             "voice_en": settings.TTS_VOICE_EN,
             "tts_speed": settings.TTS_SPEED,
@@ -87,10 +88,11 @@ class ClientCore:
         self._pending_confirms: dict[str, asyncio.Future] = {}
         self._last_level_sent = 0.0
         self._http = httpx.AsyncClient(timeout=120)
+        self._bg_tasks: set[asyncio.Future] = set()    # UI requests running in the background (see _background)
 
     # ============================================================== settings persistence
     PERSIST_KEYS = ("tts_mode", "auto_listen", "barge_in", "tools_enabled", "confirm", "voice_ru", "voice_en", "tts_speed",
-                    "stt_language", "tts_language", "model_dialogue", "model_executor", "model_router",
+                    "stt_language", "tts_language", "model_dialogue", "model_executor", "model_router", "reasoning",
                     "speaker_device", "mic_device", "screenshot_monitors")
     MODEL_KEYS = ("model_dialogue", "model_executor", "model_router")
 
@@ -107,6 +109,8 @@ class ClientCore:
                         self.state[k] = saved[k]
                 if saved.get("text_model") and "model_dialogue" not in saved:   # settings written by an older client
                     self.state["model_dialogue"] = self.state["model_executor"] = saved["text_model"]
+                if self.state.get("reasoning") not in REASONING_MODES:
+                    self.state["reasoning"] = settings.REASONING
                 log.info("settings restored from %s", self._settings_path)
                 if self._sanitize_models():
                     self._save_state()
@@ -151,13 +155,183 @@ class ClientCore:
         settings.SCREENSHOT_MONITORS = [int(i) for i in (self.state.get("screenshot_monitors") or []) if str(i).isdigit()]
 
     # ============================================================== long-term memory, prompts, attachments (all local)
-    async def _embed(self, kind: str, inputs: list[str], input_type: str) -> list[list[float]]:
+    async def _embed(self, kind: str, inputs: list[str], input_type: str,
+                     modality: Optional[list[str] | str] = None, dimensions: Optional[int] = None) -> list[list[float]]:
         """Vectors through the server's /embed proxy (the only thing the server does for the memory)."""
-        r = await self._http.post(settings.http_url() + "/embed", json={"kind": kind, "input": inputs, "input_type": input_type},
-                                  headers={"Authorization": f"Bearer {settings.AGENT_TOKEN}"}, timeout=120)
+        payload: dict[str, Any] = {"kind": kind, "input": inputs, "input_type": input_type}
+        if modality is not None:
+            payload["modality"] = modality
+        if dimensions is not None:
+            payload["dimensions"] = dimensions
+        r = await self._http.post(settings.http_url() + "/embed", json=payload,
+                                  headers={"Authorization": f"Bearer {settings.AGENT_TOKEN}"}, timeout=600)
         if r.status_code != 200:
             raise RuntimeError(f"embed {r.status_code}: {r.text[:200]}")
         return r.json().get("embeddings") or []
+
+    async def _embed_store(self, msg: dict) -> None:
+        """Embed UI compare items at creation and keep their vectors: answers
+        {"type":"embed_store_result",...} with vecs aligned to the valid request items
+        (order = their request indices; errors carry theirs)."""
+        rid = msg.get("id")
+        try:
+            labels: list[str] = []
+            kinds: list[str] = []
+            roles: list[str] = []
+            inputs: list[str] = []
+            modalities: list[str] = []
+            order: list[int] = []
+            errors: list[dict] = []
+            req_items = msg.get("items") or []
+            for n, it in enumerate(req_items[:64]):
+                if not isinstance(it, dict):
+                    continue
+                kind = str(it.get("kind") or "text")
+                if kind == "image":
+                    aid = str(it.get("attachment_id") or "")
+                    uri = self._image_data_uri(aid, max_side=1120) if aid else None
+                    if not uri:
+                        errors.append({"index": n, "error": f"картинка «{it.get('name') or aid or '?'}»: файл не найден на клиенте"})
+                        continue
+                    labels.append(str(it.get("label") or it.get("name") or f"картинка {len(inputs) + 1}")[:120])
+                    kinds.append("image")
+                    roles.append("passage")
+                    inputs.append(uri)
+                    modalities.append("image")
+                    order.append(n)
+                elif kind == "text_image":
+                    text = str(it.get("text") or "").strip()
+                    aid = str(it.get("attachment_id") or "")
+                    uri = self._image_data_uri(aid, max_side=1120) if aid else None
+                    if not text or not uri:
+                        errors.append({"index": n, "error": f"пара «{text[:40] or it.get('name') or '?'}»: нужны и текст, и картинка"})
+                        continue
+                    labels.append(str(it.get("label") or text)[:120])
+                    kinds.append("text_image")
+                    roles.append("passage")
+                    inputs.append(f"{text[:10000]}\n<img src=\"{uri}\" />")
+                    modalities.append("text_image")
+                    order.append(n)
+                else:
+                    text = str(it.get("text") or "").strip()
+                    if not text:
+                        continue
+                    role = str(it.get("role") or "passage")
+                    if role not in ("passage", "query"):
+                        role = "passage"
+                    labels.append(str(it.get("label") or text)[:120])
+                    kinds.append("text")
+                    roles.append(role)
+                    inputs.append(text[:10000])
+                    modalities.append("text")
+                    order.append(n)
+            if not inputs:
+                await self.broadcast({"type": "embed_store_result", "id": rid, "ok": False,
+                                      "error": "нет годных элементов"})
+                return
+            distinct = sorted(set(roles))
+            # partial: an input the pool still refuses comes back as null with its own error, the rest keep theirs
+            payload: dict[str, Any] = {"kind": "mm8b", "input": inputs, "modality": modalities, "partial": True}
+            if len(distinct) == 1:
+                payload["input_type"] = distinct[0]
+            else:
+                payload["input_types"] = roles
+            r = await self._http.post(settings.http_url() + "/embed", json=payload,
+                                      headers={"Authorization": f"Bearer {settings.AGENT_TOKEN}"}, timeout=600)
+            if r.status_code != 200:
+                raise RuntimeError(f"embed {r.status_code}: {r.text[:200]}")
+            data = r.json()
+            vecs = data.get("embeddings") or []
+            if len(vecs) != len(inputs):
+                raise RuntimeError(f"сервер вернул {len(vecs)} векторов на {len(inputs)} входов")
+            failed = {int(e.get("index")): str(e.get("error") or "ошибка") for e in (data.get("errors") or [])
+                      if isinstance(e, dict) and isinstance(e.get("index"), int)}
+            for k, v in enumerate(vecs):
+                if not v:
+                    errors.append({"index": order[k], "error": f"вектор не посчитан: {failed.get(k) or 'пустой ответ'}"[:300]})
+            dim = next((len(v) for v in vecs if v), 0)
+            await self.broadcast({"type": "embed_store_result", "id": rid, "ok": True,
+                                  "model": data.get("model") or "nvidia/nemotron-3.5-embed-8b",
+                                  "dim": dim, "labels": labels, "kinds": kinds, "roles": roles,
+                                  "vecs": vecs, "order": order, "errors": errors})
+        except Exception as e:  # noqa: BLE001
+            log.warning("embed store failed: %s: %s", type(e).__name__, e)
+            await self.broadcast({"type": "embed_store_result", "id": rid, "ok": False,
+                                  "error": f"сравнение не удалось [{type(e).__name__}]: {str(e)[:300] or 'без подробностей'}"})
+
+    async def _rerank_compare(self, msg: dict) -> None:
+        """Rank UI compare items against a text query with a cross-encoder: answers
+        {"type":"rerank_compare_result",...} with per-passage logits and the winner-first order."""
+        rid = msg.get("id")
+        t0 = time.time()
+        try:
+            query = str(msg.get("query") or "").strip()
+            if not query:
+                await self.broadcast({"type": "rerank_compare_result", "id": rid, "ok": False,
+                                      "error": "запрос пустой: введите текст запроса"})
+                return
+            labels: list[str] = []
+            kinds: list[str] = []
+            passages: list[dict] = []
+            errors: list[str] = []
+            for it in (msg.get("items") or [])[:16]:
+                if not isinstance(it, dict):
+                    continue
+                kind = str(it.get("kind") or "text")
+                if kind == "image":
+                    aid = str(it.get("attachment_id") or "")
+                    uri = self._image_data_uri(aid, max_side=1120) if aid else None
+                    if not uri:
+                        errors.append(f"картинка «{it.get('name') or aid or '?'}»: файл не найден на клиенте")
+                        continue
+                    labels.append(str(it.get("label") or it.get("name") or f"картинка {len(passages) + 1}")[:120])
+                    kinds.append("image")
+                    passages.append({"image": uri})
+                elif kind == "text_image":
+                    text = str(it.get("text") or "").strip()
+                    aid = str(it.get("attachment_id") or "")
+                    uri = self._image_data_uri(aid, max_side=1120) if aid else None
+                    if not text or not uri:
+                        errors.append(f"пара «{text[:40] or it.get('name') or '?'}»: нужны и текст, и картинка")
+                        continue
+                    labels.append(str(it.get("label") or text)[:120])
+                    kinds.append("text_image")
+                    passages.append({"text": text[:10000], "image": uri})
+                else:
+                    text = str(it.get("text") or "").strip()
+                    if not text:
+                        continue
+                    labels.append(str(it.get("label") or text)[:120])
+                    kinds.append("text")
+                    passages.append({"text": text[:10000]})
+            if not passages:
+                await self.broadcast({"type": "rerank_compare_result", "id": rid, "ok": False,
+                                      "error": "нет кандидатов: добавьте тексты и/или картинки"})
+                return
+            r = await self._http.post(settings.http_url() + "/rerank",
+                                      json={"query": query[:4000], "passages": passages},
+                                      headers={"Authorization": f"Bearer {settings.AGENT_TOKEN}"}, timeout=600)
+            if r.status_code != 200:
+                raise RuntimeError(f"rerank {r.status_code}: {r.text[:200]}")
+            data = r.json()
+            rankings = data.get("rankings") or []
+            logits: list = [None] * len(passages)
+            for x in rankings:
+                if isinstance(x, dict) and isinstance(x.get("index"), int) and 0 <= x["index"] < len(passages):
+                    try:
+                        logits[x["index"]] = float(x.get("logit"))
+                    except (TypeError, ValueError):
+                        pass
+            order = sorted(range(len(passages)), key=lambda i: (logits[i] is None, -(logits[i] or 0.0)))
+            await self.broadcast({"type": "rerank_compare_result", "id": rid, "ok": True,
+                                  "model": data.get("model") or "nvidia/nemotron-3.5-rerank-8b",
+                                  "query": query[:4000], "labels": labels, "kinds": kinds,
+                                  "logits": logits, "order": order,
+                                  "ms": int((time.time() - t0) * 1000), "errors": errors})
+        except Exception as e:  # noqa: BLE001
+            log.warning("rerank compare failed: %s: %s", type(e).__name__, e)
+            await self.broadcast({"type": "rerank_compare_result", "id": rid, "ok": False,
+                                  "error": f"сравнение не удалось [{type(e).__name__}]: {str(e)[:300] or 'без подробностей'}"})
 
     async def _memory_write(self, user: str, answer: str, reports: list, atts: list, source: Optional[str]) -> Optional[int]:
         """One exchange -> one memory record (dialog, or media when pictures were attached); returns its id."""
@@ -188,7 +362,9 @@ class ClientCore:
     async def _search_memory_tool(self, args: dict) -> dict:
         query = str(args.get("query") or "").strip()
         limit = max(1, min(int(args.get("limit") or 5), 12))
-        items = await self.memory.search(query, top_k=limit, exclude_session=None, min_score=0.3)
+        # an explicit search may reach a little below the recall threshold: scores go with the results
+        items = await self.memory.search(query, top_k=limit, exclude_session=None,
+                                         min_score=max(0.0, settings.MEMORY_MIN_SCORE - 0.05))
         return {"count": len(items), "results": [{"when": time.strftime("%Y-%m-%d %H:%M", time.localtime(i["ts"])),
                                                   "kind": i["kind"], "score": round(i["score"], 3), "text": i["text"][:2500]} for i in items]}
 
@@ -692,6 +868,7 @@ class ClientCore:
         info["tools_enabled"] = self.state["tools_enabled"]
         info["persona_gender"] = self._persona_gender()
         info["models"] = self._models()
+        info["reasoning"] = str(self.state.get("reasoning") or "off")
         info["prompts"] = dict(self.prompt_overrides)   # the server holds them for this session only
         return info
 
@@ -723,7 +900,7 @@ class ClientCore:
         if t == "model":   # the server confirmed the models chosen in the settings
             self.server_info["model"] = msg.get("model")
             self.server_info["models"] = msg.get("models") or self.server_info.get("models")
-            if "vision" in msg:     # the dialogue model sees attachments (Omni) or takes text only (Lightning)
+            if "vision" in msg:     # the dialogue model sees attachments (Omni, Super VL, GLM/Step/DeepSeek Flash) or takes text only (Lightning, GLM 5.3)
                 self.server_info["vision"] = msg["vision"]
             await self.broadcast_status()
             return
@@ -1058,6 +1235,7 @@ class ClientCore:
         except Exception:  # noqa: BLE001
             pass
         return {"type": "status", "server": self.connected, "session_id": self.session_id,
+                "caps": ["embed_store", "rerank_compare"],
                 "server_info": {**self.server_info, "memory": self.memory.count()},
                 "stt": self.status["stt"], "tts": self.status["tts"], "mic": self.status["mic"],
                 "speaker": getattr(self.player, "device_name", None), "output_devices": devices,
@@ -1070,6 +1248,12 @@ class ClientCore:
 
     async def broadcast_status(self) -> None:
         await self.broadcast(self.status_payload())
+
+    def _background(self, coro) -> None:
+        """Run a UI request without holding up the page's socket; the task is kept until it ends."""
+        task = asyncio.ensure_future(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
     async def on_ui_message(self, ws, msg: dict) -> None:
         t = msg.get("type")
@@ -1100,6 +1284,12 @@ class ClientCore:
             await self._forget_all_chats()
         elif t in ("memory_clear", "memory_prune", "memory_list", "memory_search", "memory_add", "memory_update", "memory_delete"):
             await self._memory_ui(msg)       # the memory tab works on the local store
+        elif t == "embed_store":
+            # the embeddings tab: vectors at creation, kept client-side. In the background: a call to the pool takes
+            # seconds, and this socket must keep reading the page's other messages meanwhile (results are broadcast)
+            self._background(self._embed_store(msg))
+        elif t == "rerank_compare":
+            self._background(self._rerank_compare(msg))  # the embeddings tab in rerank mode: query -> passages logits
         elif t == "screenshot":
             res = await self.take_screenshot_attachment(msg.get("monitor"))
             await ws.send_text(json.dumps({"type": "attachment", "request_id": msg.get("request_id"), **res}, ensure_ascii=False))
@@ -1143,11 +1333,15 @@ class ClientCore:
         if "screenshot_monitors" in s:   # a list of 1-based monitor numbers; empty = all monitors
             s["screenshot_monitors"] = [int(i) for i in (s["screenshot_monitors"] or []) if str(i).isdigit()]
         for key in ("tts_mode", "auto_listen", "barge_in", "tools_enabled", "confirm", "voice_ru", "voice_en", "tts_speed",
-                    "stt_language", "tts_language", "memory_recall", "screenshot_monitors", *self.MODEL_KEYS):
+                    "stt_language", "tts_language", "memory_recall", "screenshot_monitors", "reasoning", *self.MODEL_KEYS):
             if key in s and not (key in self.MODEL_KEYS and s[key] not in self._model_options(key)):
+                if key == "reasoning" and s[key] not in REASONING_MODES:
+                    continue
                 self.state[key] = s[key]
         if any(k in s for k in self.MODEL_KEYS) and self.server_ws:
             await self.send_server({"type": "client_info", "client": {"models": self._models()}})
+        if "reasoning" in s and self.server_ws:
+            await self.send_server({"type": "client_info", "client": {"reasoning": str(self.state.get("reasoning") or "off")}})
         if any(k in s for k in ("voice_ru", "voice_en", "tts_language")) and self.server_ws:
             self._sync_runtime_settings()
             await self.send_server({"type": "client_info", "client": {"persona_gender": self._persona_gender()}})

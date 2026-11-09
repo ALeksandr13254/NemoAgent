@@ -27,7 +27,7 @@ from .config import settings
 
 log = logging.getLogger("memory")
 
-Embedder = Callable[[str, list[str], str], Awaitable[list[list[float]]]]   # (kind, inputs, input_type) -> vectors
+Embedder = Callable[..., Awaitable[list[list[float]]]]   # (kind, inputs, input_type, modality?, dimensions?) -> vectors
 COLLECTIONS = ("text", "vl")
 
 # closing formulas the model loves to append; they only reinforce themselves once stored
@@ -88,9 +88,13 @@ class MemoryStore:
         for coll in COLLECTIONS:
             rows = self._db.execute("SELECT memory_id, dim, vec FROM vectors WHERE collection=?", (coll,)).fetchall()
             ids, vecs = [], []
+            dims = [int(dim) for _, dim, _ in rows]
+            main_dim = max(set(dims), key=dims.count) if dims else 0   # vectors of another model would break the matrix
+            if len(set(dims)) > 1:
+                log.warning("memory %s: vectors of %d sizes, only the %d-dim ones are searched", coll, len(set(dims)), main_dim)
             for mid, dim, blob in rows:
                 v = np.frombuffer(blob, dtype=np.float32)
-                if v.size != dim:
+                if v.size != dim or dim != main_dim:
                     continue
                 ids.append(mid)
                 vecs.append(v)
@@ -115,10 +119,14 @@ class MemoryStore:
             )
             mid = int(cur.lastrowid)
             for v in vecs:
+                v = v.astype(np.float32)
                 self._db.execute("INSERT INTO vectors(memory_id, collection, dim, vec) VALUES(?,?,?,?)",
-                                 (mid, coll, int(v.size), v.astype(np.float32).tobytes()))
+                                 (mid, coll, int(v.size), v.tobytes()))
+                mat = self._mat[coll]
+                if mat.shape[0] and mat.shape[1] != v.size:
+                    continue        # another model's size: stored, but kept out of the search matrix (see _load)
                 self._ids[coll].append(mid)
-                self._mat[coll] = np.vstack([self._mat[coll], v[None, :]]) if self._mat[coll].size else v[None, :].copy()
+                self._mat[coll] = np.vstack([mat, v[None, :]]) if mat.shape[0] else v[None, :].copy()
             self._db.commit()
         return mid
 
@@ -196,6 +204,10 @@ class MemoryStore:
             mat = self._mat.get(coll)
             ids = list(self._ids.get(coll, []))
         if mat is None or mat.shape[0] == 0:
+            return []
+        if mat.shape[1] != q.size:
+            log.warning("memory %s: stored vectors are %d-dim, the query is %d-dim (the embedding model changed?): "
+                        "skipped", coll, mat.shape[1], q.size)
             return []
         scores = mat @ q
         order = np.argsort(-scores)

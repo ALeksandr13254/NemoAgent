@@ -25,9 +25,10 @@
     d.innerHTML = `<summary>${title}</summary><pre>${esc(body)}</pre>`; return add(d);
   }
   function send(msg) {
-    if (ws && ws.readyState === 1) { ws.send(JSON.stringify(msg)); return; }
+    if (ws && ws.readyState === 1) { ws.send(JSON.stringify(msg)); return true; }
     // no link to the local client process: say so instead of dropping the message silently
     if (msg.type === 'send' || msg.type === 'say') add(div('errline', '⚠ нет связи с клиентом NemoAgent (окно run_client.bat) — страница переподключается, обновите её (Ctrl+F5), если это не проходит'));
+    return false;
   }
   function setPill(id, cls, text) { const p = $(id); p.className = 'pill ' + cls; if (text) p.textContent = text; }
   /* ---------------------------------------------------------------- icons (inline SVG: crisp and readable, unlike the OS emoji font) */
@@ -225,7 +226,7 @@
   function activeTab() { return document.querySelector('nav.tabs .tab.active')?.dataset.tab || 'chat'; }
   document.querySelectorAll('nav.tabs .tab').forEach((b) => b.onclick = () => {
     document.querySelectorAll('nav.tabs .tab').forEach((x) => x.classList.toggle('active', x === b));
-    for (const id of ['chat', 'prompt', 'log', 'reader', 'memory']) $(id).classList.toggle('hidden', id !== b.dataset.tab);
+    for (const id of ['chat', 'prompt', 'log', 'reader', 'memory', 'embed']) $(id).classList.toggle('hidden', id !== b.dataset.tab);
     if (b.dataset.tab === 'memory') memRefresh();
     document.querySelector('footer').classList.toggle('hidden', b.dataset.tab !== 'chat');
     $('attachments').classList.toggle('hidden', b.dataset.tab !== 'chat');
@@ -304,12 +305,18 @@
     switch (m.type) {
       case 'status': {
         const wasConnected = state && state.server;
-        const sig = (x) => x ? [x.server, x.settings && x.settings.tts_mode, x.settings && x.settings.memory_recall, JSON.stringify((x.server_info || {}).models || {})].join('|') : '';
+        const sig = (x) => x ? [x.server, x.settings && x.settings.tts_mode, x.settings && x.settings.memory_recall, x.settings && x.settings.reasoning, JSON.stringify((x.server_info || {}).models || {})].join('|') : '';
         const before = sig(state);
         state = m; renderStatus();
         if (m.server && (!wasConnected || !promptState)) send({ type: 'get_prompts' });
         if (!wasConnected) send({ type: 'chats' });
         if (sig(m) !== before) scheduleCount(50);      // connection, speech mode or models changed: another request
+        if ($('emb-status')) {
+          const staleHint = 'бэкенд клиента устарел: перезапустите run_client.bat';
+          const hasRerank = m.caps && m.caps.indexOf('rerank_compare') >= 0;
+          if (m.server && !hasRerank && !$('emb-status').textContent) $('emb-status').textContent = staleHint;
+          else if (hasRerank && $('emb-status').textContent === staleHint) $('emb-status').textContent = '';
+        }
         break;
       }
       case 'token_count': renderCount(m); break;
@@ -344,6 +351,8 @@
         break;
       }
       case 'memory_items': memRender(m); break;
+      case 'embed_store_result': embStoreRender(m); break;
+      case 'rerank_compare_result': embRerankRender(m); break;
       case 'memory_saved': {
         const label = m.action === 'add' ? (m.ok ? 'добавлено' : 'не добавлено') : m.action === 'update' ? (m.ok ? 'сохранено' : 'не сохранено') : (m.ok ? 'удалено' : 'не удалено');
         $('mem-ed-status').textContent = label + ' ' + new Date().toLocaleTimeString();
@@ -530,7 +539,7 @@
     $('btn-memory').classList.toggle('active', !!(state.settings && state.settings.memory_recall));
     $('pill-stt').title = state.mic ? 'микрофон: ' + state.mic : '';
     const s = state.settings || {};
-    for (const k of ['tts_mode', 'confirm', 'stt_language', 'tts_language']) $('s-' + k).value = s[k] || (k === 'tts_language' ? 'ru' : s[k]);
+    for (const k of ['tts_mode', 'confirm', 'stt_language', 'tts_language', 'reasoning']) $('s-' + k).value = s[k] || (k === 'tts_language' ? 'ru' : (k === 'reasoning' ? 'off' : s[k]));
     const models = si.models || {};
     for (const role of ['dialogue', 'executor', 'router']) $('s-model_' + role).value = s['model_' + role] || models[role] || '';
     $('model').title = Object.entries(models).map(([r, m]) => `${r}: ${m}`).join('\n');
@@ -589,7 +598,7 @@
     updateSettingsPane();
   };
   updateSettingsPane();
-  for (const k of ['tts_mode', 'confirm', 'stt_language', 'tts_language', 'model_dialogue', 'model_executor', 'model_router', 'voice_ru', 'voice_en', 'speaker_device', 'mic_device']) $('s-' + k).onchange = (e) => pushSettings({ [k]: e.target.value });
+  for (const k of ['tts_mode', 'confirm', 'stt_language', 'tts_language', 'reasoning', 'model_dialogue', 'model_executor', 'model_router', 'voice_ru', 'voice_en', 'speaker_device', 'mic_device']) $('s-' + k).onchange = (e) => pushSettings({ [k]: e.target.value });
   for (const k of ['auto_listen', 'barge_in', 'tools_enabled']) $('s-' + k).onchange = (e) => pushSettings({ [k]: e.target.checked });
   $('s-tts_speed').oninput = (e) => { $('s-tts_speed-v').textContent = Number(e.target.value).toFixed(2); };
   $('s-tts_speed').onchange = (e) => pushSettings({ tts_speed: Number(e.target.value) });
@@ -799,5 +808,290 @@
   function hideConfirm() { confirmId = null; $('confirm').classList.add('hidden'); }
   $('confirm-yes').onclick = () => { send({ type: 'confirm_reply', id: confirmId, approved: true }); hideConfirm(); };
   $('confirm-no').onclick = () => { send({ type: 'confirm_reply', id: confirmId, approved: false }); hideConfirm(); };
+  /* ---------------------------------------------------------------- embeddings tab: cosine similarity of texts + images (nemotron-3.5-embed-8b) */
+  let embItems = [], embSeq = 0, embPending = null;
+  let storeQueue = [], storeBusy = false, storeJobs = {}, wantCompare = false, storeTimer = null;
+  let embModel = 'nvidia/nemotron-3.5-embed-8b';
+  let embTimer = null;
+  const EMB_WAIT_MS = 180000;
+  let embTick = null;
+  function embWaitStart(base) {
+    clearInterval(embTick);
+    const t0 = Date.now();
+    $('emb-status').textContent = base + '…';
+    embTick = setInterval(() => {
+      $('emb-status').textContent = base + ' … ' + Math.round((Date.now() - t0) / 1000) + ' с';
+    }, 1000);
+  }
+  function embWaitStop() { clearInterval(embTick); embTick = null; }
+  function embSetStatus(t) { $('emb-status').textContent = t; }
+  function embClearResult() { $('emb-result').innerHTML = ''; }
+  function embRenderItems() {
+    const box = $('emb-items');
+    box.innerHTML = embItems.length ? '' : '<div class="muted small">Пока пусто: добавьте тексты и картинки выше — вектор считается сразу при добавлении.</div>';
+    for (const it of embItems) {
+      const el = div('hist-item'); el.dataset.uid = it.uid;
+      const badge = it.kind === 'image' ? '🖼 картинка' : '📝 текст';
+      const roleCtl = it.kind === 'text'
+        ? ` <select class="emb-role" data-uid="${it.uid}" title="Роль вектора: документ лежит в индексе, запрос кодируется в момент поиска (смена пересчитает вектор)"><option value="passage"${it.role !== 'query' ? ' selected' : ''}>документ</option><option value="query"${it.role === 'query' ? ' selected' : ''}>запрос</option></select>`
+        : ' · документ';
+      const state = it.err ? ` <button class="link emb-retry" data-uid="${it.uid}" title="${esc(it.err)} — нажать чтобы повторить">⚠</button>`
+        : it.pending ? ' <span class="muted small">⏳</span>'
+        : it.vec ? ' <span class="muted small" title="вектор готов">✓</span>' : '';
+      el.innerHTML = `<div class="t">${esc(it.label)}</div><div class="d">${badge}${roleCtl}${state}${it.kind !== 'text' && it.name ? ' · ' + esc(it.name) : ''}</div><button class="x" title="убрать">✕</button>`;
+      box.appendChild(el);
+    }
+    const rerank = $('emb-mode').value === 'rerank';
+    $('emb-compare').disabled = embItems.length < (rerank ? 1 : 2);
+  }
+  function embRequestStore(uids) {
+    const items = uids.map((u) => embItems.find((x) => x.uid === u)).filter((it) => it && !it.vec && !it.pending);
+    if (!items.length) { embPumpStore(); return; }
+    const id = ++embSeq;
+    storeQueue.push({ id, uids: items.map((it) => it.uid),
+      payload: items.map((it) => it.kind === 'text'
+        ? { kind: 'text', text: it.text, label: it.label, role: it.role }
+        : { kind: 'image', attachment_id: it.attachment_id, label: it.label, name: it.name }) });
+    items.forEach((it) => { it.pending = true; it.err = null; });
+    embClearResult(); embRenderItems();
+    embPumpStore();
+  }
+  function embPumpStore() {
+    if (storeBusy) return;
+    const job = storeQueue.shift();
+    if (!job) {
+      clearTimeout(storeTimer);
+      if (wantCompare) { wantCompare = false; embCompareLocal(); }
+      else embSetStatus('векторы готовы');
+      return;
+    }
+    if (!send({ type: 'embed_store', id: job.id, items: job.payload })) {
+      // no link to the client: the job would wait out the whole timeout for an answer that cannot come
+      storeQueue = []; wantCompare = false;
+      for (const it of embItems) if (it.pending) { it.pending = false; it.err = 'нет связи с клиентом NemoAgent'; }
+      embRenderItems();
+      embSetStatus('⚠ нет связи с клиентом NemoAgent (окно run_client.bat): повторите, когда страница переподключится');
+      return;
+    }
+    storeBusy = true;
+    storeJobs[job.id] = job.uids;
+    embSetStatus('считаю эмбеддинги…');
+    clearTimeout(storeTimer);
+    storeTimer = setTimeout(() => {
+      storeBusy = false; storeQueue = []; storeJobs = {}; wantCompare = false;
+      for (const it of embItems) if (it.pending) { it.pending = false; it.err = it.err || 'превышено ожидание'; }
+      embRenderItems();
+      embSetStatus('ответ не пришёл за 180 с: проверьте окна сервера/клиента и повторите');
+    }, EMB_WAIT_MS);
+  }
+  function embStoreRender(m) {
+    const uids = storeJobs[m.id];
+    if (!uids) return;
+    delete storeJobs[m.id];
+    storeBusy = false;
+    if (m.ok) {
+      embModel = m.model || embModel;
+      (m.order || []).forEach((reqIdx, k) => {
+        const it = embItems.find((x) => x.uid === uids[reqIdx]);
+        if (!it) return;
+        it.vec = ((m.vecs || [])[k]) || null;
+        it.vecDim = m.dim;
+        it.pending = false;
+        it.err = null;
+      });
+      for (const e of (m.errors || [])) {
+        const it = embItems.find((x) => x.uid === uids[e.index]);
+        if (!it) continue;
+        it.pending = false;
+        it.err = e.error || 'ошибка';
+      }
+    } else {
+      for (const u of uids) {
+        const it = embItems.find((x) => x.uid === u);
+        if (!it) continue;
+        it.pending = false;
+        it.err = m.error || 'ошибка';
+      }
+    }
+    embRenderItems();
+    embPumpStore();
+  }
+  $('emb-add-texts').onclick = () => {
+    const lines = $('emb-texts').value.split('\n').map((s) => s.trim()).filter(Boolean);
+    if (!lines.length) return;
+    const role = $('emb-role-new').value === 'query' ? 'query' : 'passage';
+    const added = [];
+    for (const line of lines) {
+      const it = { uid: ++embSeq, kind: 'text', role, text: line, label: line.length > 80 ? line.slice(0, 80) + '…' : line, vec: null, pending: false, err: null };
+      embItems.push(it); added.push(it.uid);
+    }
+    $('emb-texts').value = '';
+    embClearResult(); embRenderItems();
+    embRequestStore(added);
+  };
+  $('emb-add-images').onclick = () => $('emb-file-input').click();
+  $('emb-file-input').onchange = async (e) => {
+    const files = [...e.target.files]; e.target.value = '';
+    const added = [];
+    for (const f of files) {
+      const fd = new FormData(); fd.append('file', f, f.name);
+      try {
+        const r = await fetch('/ui/upload', { method: 'POST', body: fd }); const j = await r.json();
+        if (j.error) { embSetStatus('⚠ ' + j.error); continue; }
+        const it = { uid: ++embSeq, kind: 'image', role: 'passage', attachment_id: j.id, name: j.name || f.name,
+          label: (j.name || f.name || 'картинка').slice(0, 80), vec: null, pending: false, err: null };
+        embItems.push(it); added.push(it.uid);
+      } catch (err) { embSetStatus('⚠ загрузка не удалась: ' + err.message); }
+    }
+    embClearResult(); embRenderItems();
+    embRequestStore(added);
+  };
+  $('emb-clear').onclick = () => {
+    embItems = []; storeQueue = []; storeJobs = {}; storeBusy = false; wantCompare = false;
+    clearTimeout(storeTimer);
+    embClearResult(); embSetStatus(''); embRenderItems();
+  };
+  $('emb-items').addEventListener('change', (e) => {
+    const sel = e.target.closest('.emb-role'); if (!sel) return;
+    const it = embItems.find((x) => String(x.uid) === sel.dataset.uid);
+    if (!it || it.kind !== 'text') return;
+    const role = sel.value === 'query' ? 'query' : 'passage';
+    if (it.role === role && it.vec) return;
+    it.role = role; it.vec = null; it.err = null;
+    embClearResult(); embRenderItems();
+    embRequestStore([it.uid]);
+  });
+  $('emb-items').addEventListener('click', (e) => {
+    const retry = e.target.closest('.emb-retry');
+    if (retry) {
+      const it = embItems.find((x) => String(x.uid) === retry.dataset.uid);
+      if (!it || it.pending) return;
+      it.err = null; it.vec = null;
+      embClearResult(); embRenderItems();
+      embRequestStore([it.uid]);
+      return;
+    }
+    const x = e.target.closest('.x'); if (!x) return;
+    const item = x.closest('.hist-item'); if (!item) return;
+    embItems = embItems.filter((it) => String(it.uid) !== item.dataset.uid);
+    embClearResult(); embRenderItems();
+  });
+  $('emb-mode').onchange = () => {
+    $('emb-query').classList.toggle('hidden', $('emb-mode').value !== 'rerank');
+    embClearResult(); embRenderItems();
+  };
+  $('emb-compare').onclick = () => {
+    const rerank = $('emb-mode').value === 'rerank';
+    if (embItems.length < (rerank ? 1 : 2)) return;
+    if (rerank) {
+      const query = $('emb-query').value.trim();
+      if (!query) { $('emb-status').textContent = 'введите запрос для реранкера'; return; }
+      const items = embItems.map((it) => it.kind === 'text' ? { kind: 'text', text: it.text, label: it.label }
+        : { kind: 'image', attachment_id: it.attachment_id, label: it.label, name: it.name });
+      if (!send({ type: 'rerank_compare', id: ++embSeq, query, items })) {
+        embSetStatus('⚠ нет связи с клиентом NemoAgent (окно run_client.bat): повторите, когда страница переподключится');
+        return;
+      }
+      embPending = embSeq;
+      embWaitStart('ранжирую');
+      $('emb-compare').disabled = true;
+      clearTimeout(embTimer);
+      embTimer = setTimeout(() => {
+        if (embPending) {
+          embPending = null; $('emb-compare').disabled = false; embWaitStop();
+          $('emb-status').textContent = 'ответ не пришёл за 180 с: очередь NVIDIA висит или связь с сервером потеряна — проверьте окно сервера и повторите';
+        }
+      }, EMB_WAIT_MS);
+      return;
+    }
+    const missing = embItems.filter((it) => !it.vec && !it.pending);
+    if (missing.length || embItems.some((it) => it.pending)) {
+      wantCompare = true;
+      if (missing.length) embRequestStore(missing.map((it) => it.uid));
+      else embSetStatus('дожидаюсь векторы…');
+      return;
+    }
+    embCompareLocal();
+  };
+  function truncNorm(vec, dim) {
+    const d = Math.min(dim, vec.length);
+    let s = 0;
+    for (let i = 0; i < d; i++) s += vec[i] * vec[i];
+    const n = Math.sqrt(s) || 1;
+    const out = new Array(d);
+    for (let i = 0; i < d; i++) out[i] = vec[i] / n;
+    return out;
+  }
+  function embCompareLocal() {
+    const ready = embItems.filter((it) => it.vec);
+    const skipped = embItems.filter((it) => !it.vec);
+    if (ready.length < 2) { embSetStatus('нужно минимум 2 элемента с векторами (остальные ещё считаются или с ошибкой)'); return; }
+    const dimSel = Number($('emb-dimensions').value) || 4096;
+    const dim = Math.min(dimSel, ready[0].vec.length);
+    const t0 = performance.now();
+    const mats = ready.map((it) => truncNorm(it.vec, dim));
+    const matrix = mats.map((a) => mats.map((b) => {
+      let s = 0;
+      for (let k = 0; k < a.length; k++) s += a[k] * b[k];
+      return Math.max(-1, Math.min(1, s));
+    }));
+    const roles = ready.map((it) => (it.kind === 'text' && it.role === 'query') ? 'query' : 'passage');
+    const distinct = [...new Set(roles)];
+    const ms = Math.max(1, Math.round(performance.now() - t0));
+    embPending = ++embSeq;
+    embRender({ id: embPending, ok: true, model: embModel, dim, input_type: distinct.length > 1 ? 'mixed' : distinct[0],
+      labels: ready.map((it) => it.label), kinds: ready.map((it) => it.kind), roles, matrix, ms,
+      errors: skipped.map((it) => `${it.label} — без вектора, пропущен`) });
+    embSetStatus(`посчитано локально за ${ms} мс`);
+  }
+  $('emb-dimensions').onchange = () => {
+    if ($('emb-mode').value === 'rerank' || !$('emb-result').innerHTML.trim()) return;
+    embCompareLocal();
+  };
+  function embRender(m) {
+    if (m.id !== embPending) return;
+    embPending = null; clearTimeout(embTimer); embWaitStop(); $('emb-compare').disabled = embItems.length < ($('emb-mode').value === 'rerank' ? 1 : 2);
+    if (!m.ok) { $('emb-status').textContent = '⚠ ' + (m.error || 'ошибка'); return; }
+    const n = m.labels.length;
+    let html = `<div class="panehead"><b>Косинусная близость</b><span class="muted small">${esc(m.model || '')} · dim ${m.dim} · ${m.input_type} · ${m.ms} мс</span></div>`;
+    if ((m.errors || []).length) html += `<div class="errline">${m.errors.map(esc).join('<br>')}</div>`;
+    html += '<div class="emb-table-wrap"><table class="emb-table"><tr><th></th>';
+    for (let j = 0; j < n; j++) html += `<th title="${esc(m.labels[j])}">${j + 1}</th>`;
+    html += '</tr>';
+    for (let i = 0; i < n; i++) {
+      html += `<tr><th title="${esc(m.labels[i])}">${i + 1}. ${esc((m.labels[i] || '').slice(0, 40))}</th>`;
+      for (let j = 0; j < n; j++) {
+        const v = m.matrix[i][j];
+        const a = Math.max(0, Math.min(1, (v + 1) / 2));
+        const bg = i === j ? 'var(--accent2)' : `rgba(79,140,255,${(a * 0.85).toFixed(2)})`;
+        html += `<td style="background:${bg}" title="${esc(m.labels[i])} ↔ ${esc(m.labels[j])}">${v.toFixed(2)}</td>`;
+      }
+      html += '</tr>';
+    }
+    html += '</table></div><div class="muted small">Строки и столбцы: ' + m.labels.map((l, i) => `${i + 1}. ${esc((l || '').slice(0, 60))}${m.kinds && m.kinds[i] !== 'text' ? ' 🖼' : ''}${m.roles && m.roles[i] === 'query' ? ' (запрос)' : ''}`).join(' · ') + '</div>';
+    $('emb-result').innerHTML = html;
+    $('emb-status').textContent = `готово за ${m.ms} мс`;
+  }
+  function embRerankRender(m) {
+    if (m.id !== embPending) return;
+    embPending = null; clearTimeout(embTimer); embWaitStop(); $('emb-compare').disabled = embItems.length < ($('emb-mode').value === 'rerank' ? 1 : 2);
+    if (!m.ok) { $('emb-status').textContent = '⚠ ' + (m.error || 'ошибка'); return; }
+    const nums = (m.logits || []).filter((v) => v != null);
+    const lo = nums.length ? Math.min(...nums) : 0, hi = nums.length ? Math.max(...nums) : 0;
+    let html = `<div class="panehead"><b>Релевантность запросу</b><span class="muted small">${esc(m.model || '')} · ${m.ms} мс</span></div>`;
+    html += `<div class="muted small">Запрос: ${esc(m.query || '')}</div>`;
+    if ((m.errors || []).length) html += `<div class="errline">${m.errors.map(esc).join('<br>')}</div>`;
+    html += '<div class="emb-table-wrap"><table class="emb-table"><tr><th>место</th><th>кандидат</th><th>логит</th></tr>';
+    (m.order || []).forEach((idx, place) => {
+      const v = (m.logits || [])[idx];
+      const a = v == null || hi === lo ? 0 : (v - lo) / (hi - lo);
+      const bg = `rgba(124,92,255,${(0.15 + a * 0.7).toFixed(2)})`;
+      html += `<tr><td>${place + 1}</td><th title="${esc(m.labels[idx])}">${idx + 1}. ${esc((m.labels[idx] || '').slice(0, 60))}${m.kinds && m.kinds[idx] !== 'text' ? ' 🖼' : ''}</th><td style="background:${bg}">${v == null ? '—' : v.toFixed(2)}</td></tr>`;
+    });
+    html += '</table></div>';
+    $('emb-result').innerHTML = html;
+    $('emb-status').textContent = `готово за ${m.ms} мс`;
+  }
+  embRenderItems();
   window.addEventListener('error', (e) => { $('stt-state').textContent = '⚠ ошибка страницы: ' + (e.message || e.type); });
 })();

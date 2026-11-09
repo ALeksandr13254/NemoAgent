@@ -32,6 +32,19 @@ def _bool(name: str, default: bool) -> bool:
     return v.lower() in ("1", "true", "yes", "on")
 
 
+REASONING_MODES = ("off", "low", "high", "max")
+
+
+def _reasoning(name: str, default: str) -> str:
+    v = _env(name)
+    if v is None:
+        if _bool("LLM_THINKING", False):      # legacy boolean switch
+            return "max"
+        return default
+    v = v.strip().lower()
+    return v if v in REASONING_MODES else default
+
+
 def _int(name: str, default: int) -> int:
     v = _env(name)
     try:
@@ -59,12 +72,20 @@ class Settings:
     NIM_BASE_URL = _env("NIM_BASE_URL", "https://integrate.api.nvidia.com/v1/")
     # Every role runs on a multimodal model by default and sees images, hears audio and watches video itself.
     # Server-side defaults per role; the client can override every role from its settings panel
-    # (client_info["models"] = {dialogue, executor, router}).
+    # (client_info["models"] = {dialogue, executor, router}). Nano Omni is the default; Nemotron 3.5 Super VL 120B,
+    # GLM 5.3 Flash, Step 5 Preview and DeepSeek V4.1 Flash are also multimodal (text and images, no audio/video)
+    # and can be picked per role; Nemotron 3.5 Lightning 30B and GLM 5.3 take text only.
     LLM_MODEL = _env("LLM_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning")          # dialogue + executor
     # Models that take text only: in their calls media is replaced with a short text note (AgentSession._for_model).
-    TEXT_ONLY_MODELS = {m.strip() for m in (_env("TEXT_ONLY_MODELS", "nvidia/nemotron-3.5-lightning-30b-a3b") or "").split(",")
+    TEXT_ONLY_MODELS = {m.strip() for m in (_env("TEXT_ONLY_MODELS", "nvidia/nemotron-3.5-lightning-30b-a3b,z-ai/glm-5.3") or "").split(",")
                         if m.strip()}
-    LLM_THINKING = _bool("LLM_THINKING", False)     # the model reasons by default; off saves seconds per answer
+    # Reasoning effort for the dialogue agent and the executor: off | low | high | max. Chosen per session
+    # in the client's settings panel (client_info["reasoning"]); this is the default when the client sends nothing.
+    # Nemotron models only switch thinking on/off (any level but off enables it); GLM budgets it with
+    # reasoning_effort (off means the minimum, low), DeepSeek with a numeric reasoning_effort 1-100
+    # (off/low/high/max = 1/33/66/100); StepFun has no documented NIM switch and follows the on/off path.
+    # Legacy LLM_THINKING=true still means "max".
+    LLM_REASONING = _reasoning("LLM_REASONING", "off")
     LLM_TEMPERATURE = _float("LLM_TEMPERATURE", 0.3)  # model card: 0.2 without reasoning, 0.6 with it
     # Router: a fast parallel call that classifies the user's request (needs the executor or not) and drafts
     # the task, so an action is carried out even when the dialogue agent forgets its `>>>` line.
@@ -73,8 +94,6 @@ class Settings:
     # Models no longer served: a client with old settings that still asks for one gets the role's default.
     RETIRED_MODELS = {m.strip() for m in (_env("RETIRED_MODELS", "nvidia/nemotron-3-super-120b-a12b") or "").split(",") if m.strip()}
     ROUTER_TIMEOUT = _float("ROUTER_TIMEOUT", 4.0)             # seconds to wait for its verdict after the answer
-    LLM_MAX_TOKENS = _int("LLM_MAX_TOKENS", 4096)            # executor rounds (write_file content can be long)
-    DIALOGUE_MAX_TOKENS = _int("DIALOGUE_MAX_TOKENS", 1200)   # spoken answer + screen part; bounds a runaway to ~30 s
     LLM_TOP_P = _env("LLM_TOP_P")                   # unset = model default
     UPSTREAM_TIMEOUT = _int("UPSTREAM_TIMEOUT", 600)  # seconds of NIM silence we tolerate
     # A request to the free pool that fails (503, a stream closed with nothing in it, an error returned as text, a
@@ -91,10 +110,30 @@ class Settings:
     # The NIM host cannot be reached at all (network down, VPN switching) or refuses this network with HTTP 451 (the
     # VPN is off): retry every this many seconds instead of spinning thousands of attempts a second. 0 = at once too.
     NIM_CONNECT_RETRY_DELAY_S = _float("NIM_CONNECT_RETRY_DELAY_S", 0.5)
+    # One embeddings/rerank attempt waits this long for the pool, then the attempt is cancelled and sent
+    # again at once (NIM_RETRY_DELAYS, 0 by default): a queued-but-silent request is retried like a failed one.
+    # 429 rate-limit waits are unaffected (an instant retry would only earn another 429).
+    EMBED_ATTEMPT_TIMEOUT_S = _float("EMBED_ATTEMPT_TIMEOUT_S", 60.0)
+    # Embedding models whose batches the pool fails: they get one input per request (a model whose batch fails
+    # with a 5xx joins them by itself until the server restarts). nemotron-3.5-embed-8b answers 500 to most
+    # batches of 3+ texts and to every request with 2+ images; single inputs pass.
+    EMBED_SINGLE_INPUT_MODELS = {m.strip() for m in (_env("EMBED_SINGLE_INPUT_MODELS", "nvidia/nemotron-3.5-embed-8b")
+                                                     or "").split(",") if m.strip()}
+    EMBED_CONCURRENCY = _int("EMBED_CONCURRENCY", 4)   # single-input embedding requests in flight per call
+    # Tries of one embeddings/rerank request the pool fails (5xx, a stall, a dropped connection), within
+    # NIM_RETRY_BUDGET_S; a single image on the 8b model fails every other time, so 8 tries leave ~1/256.
+    EMBED_MAX_ATTEMPTS = max(1, _int("EMBED_MAX_ATTEMPTS", 8))
     MAX_TOOL_ROUNDS = _int("MAX_TOOL_ROUNDS", 12)
 
     EMBED_TEXT_MODEL = _env("EMBED_TEXT_MODEL", "nvidia/nemotron-3-embed-1b")
     EMBED_VL_MODEL = _env("EMBED_VL_MODEL", "nvidia/llama-nemotron-embed-vl-1b-v2")
+    # One space for text and images: the UI's "Эмбеддинги" tab compares texts and pictures through it.
+    EMBED_MM8B_MODEL = _env("EMBED_MM8B_MODEL", "nvidia/nemotron-3.5-embed-8b")
+    # Cross-encoder reranking for the UI's "Эмбеддинги" tab (query -> passages relevance logits).
+    # integrate.api.nvidia.com does not serve it (GET /models lists no rerank model); the sanctioned
+    # host from the model's build.nvidia.com page is ai.api.nvidia.com (same NVIDIA_API_KEY works).
+    RERANK_MODEL = _env("RERANK_MODEL", "nvidia/nemotron-3.5-rerank-8b")
+    RERANK_BASE_URL = _env("RERANK_BASE_URL", "https://ai.api.nvidia.com/v1/")
 
     # --- media: attachments are sent to the model as image_url / audio_url / video_url parts ---
     MEDIA_IMAGE_MAX_SIDE = _int("MEDIA_IMAGE_MAX_SIDE", 1600)   # ~1600 prompt tokens per image at this size

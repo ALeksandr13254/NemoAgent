@@ -149,7 +149,7 @@ class AgentSession:
         if not tokencount.supports(model):
             return None
         try:
-            return COUNTER.count(messages, tools, settings.LLM_THINKING if thinking is None else thinking)
+            return COUNTER.count(messages, tools, self.reasoning_mode() != "off" if thinking is None else thinking)
         except Exception as e:  # noqa: BLE001
             log.warning("session %s: token count failed: %s", self.id, e)
             return None
@@ -459,10 +459,9 @@ class AgentSession:
             except Exception:  # noqa: BLE001
                 pass
 
-    def _trace_params(self, tts: bool, use_memory: bool, source: str, tools: list, max_tokens: Optional[int] = None) -> dict:
-        return {"temperature": settings.LLM_TEMPERATURE, "max_tokens": max_tokens or settings.LLM_MAX_TOKENS,
-                "thinking": settings.LLM_THINKING, "tool_choice": "auto" if tools else None,
-                "tts": tts, "memory": use_memory, "source": source}
+    def _trace_params(self, tts: bool, use_memory: bool, source: str, tools: list) -> dict:
+        return {"temperature": settings.LLM_TEMPERATURE, "reasoning": self.reasoning_mode(),
+                "tool_choice": "auto" if tools else None, "tts": tts, "memory": use_memory, "source": source}
 
     ROLES = ("dialogue", "executor", "router")
 
@@ -485,6 +484,14 @@ class AgentSession:
     @property
     def text_model(self) -> str:
         return self.model_for_role("dialogue")
+
+    def reasoning_mode(self) -> str:
+        """Reasoning effort for this session: the client's settings-panel choice (off | low | high | max),
+        else the server default. The router and the video probe always run with "off"."""
+        mode = str(self.client_info.get("reasoning") or "").strip().lower()
+        if mode in ("off", "low", "high", "max"):
+            return mode
+        return settings.LLM_REASONING
 
     def _for_model(self, messages: list[dict], role: str = "dialogue") -> tuple[str, list[dict]]:
         """The role's model and the messages in a form it takes. Every role is multimodal by default and gets images,
@@ -530,9 +537,9 @@ class AgentSession:
             router = ProseSpeechRouter()
             await self.send({"type": "trace", "kind": "request", "agent": "dialogue", "stage": stage, "turn": self.turns,
                              "round": call_no, "model": model, "messages": media.redact(messages), "tools": [],
-                             "params": self._trace_params(tts, use_memory, source, [], settings.DIALOGUE_MAX_TOKENS)})
+                             "params": self._trace_params(tts, use_memory, source, [])})
             acc: Completion = await self.services.nim.chat_stream(messages, None, model=model,
-                                                                  max_tokens=settings.DIALOGUE_MAX_TOKENS, on_event=on_event)
+                                                                  reasoning=self.reasoning_mode(), on_event=on_event)
             await emit(router.finish())
             await self._counted(counting)
             await self.send({"type": "trace", "kind": "response", "agent": "dialogue", "stage": stage, "turn": self.turns,
@@ -547,7 +554,7 @@ class AgentSession:
                 await self.send({"type": "notice", "message": "Модель зациклилась, ответ обрезан."})
             break
         if acc.finish_reason == "length":
-            await self.send({"type": "notice", "message": "Ответ обрезан по лимиту max_tokens."})
+            await self.send({"type": "notice", "message": "Ответ обрезан по лимиту длины модели."})
         speech, display, task = router.result
         log.info("session %s dialogue/%s: %d chars spoken, task=%s, %.1fs", self.id, stage, len(speech),
                  "yes" if task else "no", time.time() - t0)
@@ -568,10 +575,10 @@ class AgentSession:
         counting = self._count_job(model, messages, thinking=False)
         await self.send({"type": "trace", "kind": "request", "agent": "router", "stage": "router", "turn": self.turns,
                          "round": 0, "model": model, "messages": messages, "tools": [],
-                         "params": dict(self._trace_params(tts, use_memory, source, [], 200), temperature=0.1)})
+                         "params": dict(self._trace_params(tts, use_memory, source, []), temperature=0.1)})
         try:
             acc: Completion = await self.services.nim.chat_stream(messages, None, model=model,
-                                                                  temperature=0.1, max_tokens=200, thinking=False)
+                                                                  temperature=0.1, max_tokens=200, reasoning="off")
         except Exception as e:  # noqa: BLE001
             log.warning("session %s: router call failed: %s", self.id, e)
             return None
@@ -637,7 +644,8 @@ class AgentSession:
                 elif kind == "wait":
                     await self.send({"type": "wait", **data})
 
-            acc: Completion = await self.services.nim.chat_stream(messages, schemas, model=model, tool_choice=choice, on_event=on_event)
+            acc: Completion = await self.services.nim.chat_stream(messages, schemas, model=model, tool_choice=choice,
+                                                                  reasoning=self.reasoning_mode(), on_event=on_event)
             await self._counted(counting)
             await self.send({"type": "trace", "kind": "response", "agent": "executor", "stage": "executor", "turn": self.turns,
                              "round": call_no + round_no - 1, "content": acc.content, "reasoning": acc.reasoning,

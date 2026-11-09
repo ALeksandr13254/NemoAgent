@@ -42,6 +42,14 @@ def _allowed(value: str | None, options: tuple) -> str:
     return value if value in options else options[0]
 
 
+# Reasoning effort for the dialogue agent and the executor, asked from the server (shown in the UI settings).
+# Nemotron models only switch thinking on/off (any level but off enables it); GLM budgets it with
+# reasoning_effort (off means the minimum, low), DeepSeek with a numeric reasoning_effort 1-100
+# (off/low/high/max = 1/33/66/100); StepFun has no documented NIM switch and follows the on/off path.
+# The router always classifies without reasoning.
+REASONING_MODES = ("off", "low", "high", "max")
+
+
 class Settings:
     # --- connection to the agent server ---
     SERVER_URL = _env("SERVER_URL", "http://127.0.0.1:8700")
@@ -78,13 +86,18 @@ class Settings:
     TTS_THREADS = _int("TTS_THREADS", 0)               # 0 = automatic
     TTS_LANGUAGE = _env("TTS_LANGUAGE", "ru")        # auto (by script) | ru | en — which voice reads Latin words and numbers
     # Model per role, asked from the server (shown in the UI settings). Every role runs on the multimodal Nano Omni
-    # by default and sees attachments and screenshots itself; Nemotron 3.5 Lightning takes text only (its calls get a
-    # text note instead of media). A value outside this list (for example the retired Nemotron 3 Super 120B left in
-    # an old .env) falls back to the first entry.
-    TEXT_MODELS = ("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", "nvidia/nemotron-3.5-lightning-30b-a3b")
+    # by default and sees attachments and screenshots itself; Nemotron 3.5 Super VL 120B, GLM 5.3 Flash,
+    # Step 5 Preview and DeepSeek V4.1 Flash are also multimodal (text and images, no audio/video),
+    # Nemotron 3.5 Lightning and GLM 5.3 take text only
+    # (their calls get a text note instead of media). A value outside this list (for example the retired Nemotron 3
+    # Super 120B left in an old .env) falls back to the first entry.
+    TEXT_MODELS = ("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", "nvidia/nemotron-3.5-super-vl-120b-a12b",
+                   "nvidia/nemotron-3.5-lightning-30b-a3b", "z-ai/glm-5.3-flash", "z-ai/glm-5.3",
+                   "stepfun-ai/step-5-preview", "deepseek-ai/deepseek-v4.1-flash")
     MODEL_DIALOGUE = _allowed(_env("MODEL_DIALOGUE"), TEXT_MODELS)
     MODEL_EXECUTOR = _allowed(_env("MODEL_EXECUTOR"), TEXT_MODELS)
     MODEL_ROUTER = _allowed(_env("MODEL_ROUTER"), TEXT_MODELS)
+    REASONING = _allowed(_env("REASONING"), REASONING_MODES)
     TTS_VOICE_RU = _env("TTS_VOICE_RU", "ru_f1")
     TTS_VOICE_EN = _env("TTS_VOICE_EN", "eng_f5")
     TTS_SPEED = _float("TTS_SPEED", 1.0)               # duration_scale: <1 faster, >1 slower
@@ -98,7 +111,10 @@ class Settings:
 
     # --- long-term memory (RAG over past dialogs), stored here on the client ---
     MEMORY_TOP_K = _int("MEMORY_TOP_K", 4)             # memories mixed into a message when 🗂 is on
-    MEMORY_MIN_SCORE = _float("MEMORY_MIN_SCORE", 0.5)  # cosine threshold for that
+    # Cosine threshold for that. Query -> passage cosines of these models are low: a relevant memory scores
+    # 0.27-0.7 (nemotron-3-embed-1b) or 0.26-0.55 (llama-nemotron-embed-vl-1b-v2), an unrelated one rarely
+    # above 0.24. The old 0.5 dropped 85-90% of the relevant memories; 0.27 keeps about 90% of them.
+    MEMORY_MIN_SCORE = _float("MEMORY_MIN_SCORE", 0.27)
     ATTACHMENT_KEEP_HOURS = _int("ATTACHMENT_KEEP_HOURS", 1)   # uploads that never made it into a chat are dropped after this
 
     # --- computer control ---

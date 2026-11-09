@@ -9,6 +9,7 @@ Protocol (JSON text frames):
   client -> server
     {"type":"hello", "token": "...", "client": {os, hostname, user, shell, screen, timezone, tools_enabled,
                                                  persona_gender, models: {dialogue, executor, router},
+                                                 reasoning: "off"|"low"|"high"|"max",
                                                  prompts: {system, voice_prose, voice_text, executor, router}}}
     {"type":"user_message", "text": "...", "attachments": ["id", ...], "source": "voice"|"text", "tts": bool,
                             "memory": bool, "memory_context": [{kind, ts, score, text}, ...]}
@@ -18,7 +19,7 @@ Protocol (JSON text frames):
     {"type":"tool_result", "call_id": "...", "result": {...}}     # answer to client_tool
     {"type":"interrupt"} · {"type":"new_session"} · {"type":"load_session", "messages":[{role, content, attachment_ids?}...]}
     {"type":"sync_history", "messages":[...]}   # a message of the open chat was edited/deleted: same session, new context
-    {"type":"client_info", "client": {...}}     # update capabilities / models / prompts / gender
+    {"type":"client_info", "client": {...}}     # update capabilities / models / reasoning / prompts / gender
     {"type":"get_prompts"} / {"type":"set_prompts","values":{...}} / {"type":"reset_prompts","keys":[...]}
         -> {"type":"prompts","current":{...},"defaults":{...},"overrides":{...},"overridden":[...]}
     {"type":"count_tokens", "id", "text", "attachments": [...], "tts": bool}
@@ -39,7 +40,11 @@ Protocol (JSON text frames):
     {"type":"wait", ...} · {"type":"notice", "message"} · {"type":"error", "message", "detail"}
     {"type":"done", "finish_reason", "ms", "first_token_ms", "memo": {user, assistant, reports, attachments, source}}
         memo = what the client may store in its long-term memory for this turn
-HTTP: GET /health · POST /upload (multipart 'file') · POST /embed {"kind":"text"|"vl","input":[...],"input_type"}
+HTTP: GET /health · POST /upload (multipart 'file') · POST /embed {"kind":"text"|"vl"|"mm8b","input":[...],"input_type",
+  "input_types","modality","dimensions","partial"} (mm8b = nemotron-3.5-embed-8b: UI embedding comparison, texts +
+  images in one space; partial=true: a failed input gets null and an entry in "errors" instead of failing the call)
+  · POST /rerank {"query": str, "passages": [{"text"?, "image"?}]} (nemotron-3.5-rerank-8b on ai.api.nvidia.com:
+  UI embedding comparison, relevance logits of each passage to the query)
 All HTTP calls carry `Authorization: Bearer <AGENT_TOKEN>`.
 """
 from __future__ import annotations
@@ -58,7 +63,7 @@ from fastapi import Body, FastAPI, File, Header, HTTPException, UploadFile, WebS
 from .agent import AgentSession, Services
 from .attachments import AttachmentStore
 from .config import settings
-from .nim import NIMClient
+from .nim import NIMClient, UpstreamError
 from .tokencount import COUNTER
 
 logging.basicConfig(level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
@@ -113,6 +118,17 @@ def _check_token(authorization: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="bad token")
 
 
+def _looks_like_image(item: str) -> bool:
+    return item.startswith("data:image/") or "<img" in item
+
+
+def _infer_modality(item: str) -> str:
+    """'image' for a bare data:image/... URI, 'text_image' for text with an <img src=...> tag, else 'text'."""
+    if item.startswith("data:image/"):
+        return "image"
+    return "text_image" if "<img" in item else "text"
+
+
 def _ready(session: AgentSession) -> dict:
     vision = session.text_model not in settings.TEXT_ONLY_MODELS
     return {"type": "ready", "session_id": session.id, "vision": vision,
@@ -142,19 +158,118 @@ async def upload(file: UploadFile = File(...), authorization: Optional[str] = He
 
 @app.post("/embed")
 async def embed(body: dict = Body(...), authorization: Optional[str] = Header(default=None)):
-    """Embeddings for the client's long-term memory: 'text' (nemotron-3-embed-1b) or 'vl' (llama-nemotron-embed-vl-1b-v2,
-    texts and data:image/... URIs in one space). The server only relays; nothing is kept."""
+    """Embeddings: 'text' (nemotron-3-embed-1b) or 'vl' (llama-nemotron-embed-vl-1b-v2) for the client's
+    long-term memory, 'mm8b' (nemotron-3.5-embed-8b: texts and data:image/... URIs in one space) for the
+    UI's embedding comparison. Optional 'modality' (one value or one per input; inferred per input for mm8b
+    when missing) and 'dimensions' are passed through to NIM. 'partial': true answers every input that
+    worked, null and an {"index","error"} entry in "errors" for the others. The server only relays."""
     _check_token(authorization)
     kind = str(body.get("kind") or "text")
-    model = settings.EMBED_VL_MODEL if kind == "vl" else settings.EMBED_TEXT_MODEL
+    model = settings.EMBED_MM8B_MODEL if kind == "mm8b" else (
+        settings.EMBED_VL_MODEL if kind == "vl" else settings.EMBED_TEXT_MODEL)
     inputs = [str(x) for x in (body.get("input") or [])][:64]
     if not inputs:
-        return {"embeddings": [], "model": model}
+        return {"embeddings": [], "model": model, "errors": []}
+    partial = bool(body.get("partial"))
+    input_type = str(body.get("input_type") or "passage")
+    if input_type not in ("passage", "query"):
+        input_type = "passage"
+    # per-item roles (the UI compare tab: each text chooses document or query at creation).
+    # NIM takes one input_type per request, so items are grouped by role: one NIM call per group,
+    # vectors merged back in the original order (a bi-encoder scores every input independently).
+    raw_types = body.get("input_types")
+    types: list[str] | None = None
+    if kind == "mm8b" and isinstance(raw_types, list) and raw_types:
+        if len(raw_types) != len(inputs) or any(t not in ("passage", "query") for t in raw_types):
+            raise HTTPException(status_code=400, detail="input_types must parallel input with passage|query values")
+        types = list(raw_types)
+    # modality: one per input (a single value applies to all; a short list is completed by inference). The 8b
+    # model needs it for images (500 without it), the VL memory model infers it and gets nothing.
+    raw_mod = body.get("modality")
+    if isinstance(raw_mod, str):
+        raw_mod = [raw_mod] * len(inputs)
+    modality: list[str] | None = None
+    if isinstance(raw_mod, list) or kind == "mm8b":
+        given = raw_mod if isinstance(raw_mod, list) else []
+        modality = [str(given[i]) if i < len(given) and given[i] in ("text", "image", "text_image")
+                    else _infer_modality(x) for i, x in enumerate(inputs)]
     try:
-        vecs = await services.nim.embed(model, inputs, str(body.get("input_type") or "passage"))
+        dimensions = int(body.get("dimensions")) if body.get("dimensions") is not None else None
+    except (TypeError, ValueError):
+        dimensions = None
+    if dimensions is not None and not 1 <= dimensions <= 4096:
+        dimensions = None
+    groups: dict[str, list[int]] = {}
+    if types is None:
+        t = input_type
+        if t != "passage" and any(_looks_like_image(x) for x in inputs):
+            # NIM rejects image inputs with input_type "query": documents are passages, queries are text-only
+            t = "passage"
+        groups[t] = list(range(len(inputs)))
+    else:
+        for i, t in enumerate(types):
+            if t != "passage" and _looks_like_image(inputs[i]):
+                t = "passage"
+            groups.setdefault(t, []).append(i)
+    vecs: list = [None] * len(inputs)
+    errors: list[dict] = []
+    # role groups are independent: one NIM call each, concurrently (the free pool queues each call)
+    calls = [(t, idxs) for t, idxs in groups.items()]
+    group_errors: list[dict[int, str]] = [{} for _ in calls]
+    try:
+        parts = await asyncio.gather(*(
+            services.nim.embed(model, [inputs[i] for i in idxs], t,
+                               modality=[modality[i] for i in idxs] if modality else None,
+                               dimensions=dimensions, errors=errs if partial else None)
+            for (t, idxs), errs in zip(calls, group_errors)))
     except Exception as e:  # noqa: BLE001
+        log.warning("embedding failed (%s, %d inputs): %s", model, len(inputs), str(e)[:200])
         raise HTTPException(status_code=502, detail=f"embedding failed: {str(e)[:200]}")
-    return {"embeddings": vecs, "model": model}
+    for (_, idxs), part, errs in zip(calls, parts, group_errors):
+        for k, (i, v) in enumerate(zip(idxs, part)):
+            vecs[i] = v
+            if k in errs:
+                errors.append({"index": i, "error": errs[k]})
+    if errors:
+        log.warning("embedding: %d of %d inputs failed (%s): %s", len(errors), len(inputs), model, errors[0]["error"][:160])
+    return {"embeddings": vecs, "model": model, "errors": sorted(errors, key=lambda e: e["index"])}
+
+
+@app.post("/rerank")
+async def rerank(body: dict = Body(...), authorization: Optional[str] = Header(default=None)):
+    """Rank passages against a text query with a cross-encoder (RERANK_MODEL on RERANK_BASE_URL): each passage
+    is {"text"?,"image"?} (image = data:image/... URI); answers {"rankings":[{"index","logit"}],"model"} with
+    the raw relevance logits, highest first. The server only relays; nothing is kept."""
+    _check_token(authorization)
+    model = str(body.get("model") or settings.RERANK_MODEL)
+    query = str(body.get("query") or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query is empty")
+    passages: list[dict] = []
+    for it in (body.get("passages") or [])[:64]:
+        if not isinstance(it, dict):
+            continue
+        text = str(it.get("text") or "").strip()
+        image = str(it.get("image") or "")
+        if text and image and _looks_like_image(image):
+            passages.append({"text": text[:10000], "image": image})
+        elif image and _looks_like_image(image):
+            passages.append({"image": image})
+        elif text:
+            passages.append({"text": text[:10000]})
+    if not passages:
+        raise HTTPException(status_code=400, detail="no passages: each needs text and/or a data:image/... URI")
+    truncate = str(body.get("truncate") or "END")
+    if truncate not in ("NONE", "END"):
+        truncate = "END"
+    try:
+        rankings = await services.nim.rerank(model, query, passages, truncate)
+    except UpstreamError as e:
+        raise HTTPException(status_code=502 if e.status < 500 else e.status,
+                            detail=f"rerank failed: {str(e)[:200]}")
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"rerank failed: {str(e)[:200]}")
+    return {"rankings": rankings, "model": model}
 
 
 class ClientLink:

@@ -141,6 +141,20 @@ button.danger:hover { background: var(--err); color: #fff; }
 .hist-foot { padding: 8px; border-top: 1px solid var(--border); }
 .hist-foot button { width: 100%; }
 
+/* ---- embeddings tab */
+#emb-texts { display: block; width: 100%; margin-top: 4px; background: #0b0d12; color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; resize: vertical; }
+#emb-texts:focus { outline: none; border-color: var(--accent); }
+#emb-items { max-height: 220px; margin-top: 8px; }
+.emb-table-wrap { overflow-x: auto; margin: 4px 4px 8px; }
+table.emb-table { border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+table.emb-table th, table.emb-table td { border: 1px solid var(--border); padding: 4px 8px; text-align: center; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+table.emb-table th { background: var(--panel2); color: var(--muted); font-weight: 600; }
+table.emb-table td { color: var(--text); }
+
+#emb-query { flex: 1; min-width: 160px; background: #0b0d12; color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; font: inherit; }
+#emb-query:focus { outline: none; border-color: var(--accent); }
+.emb-role { background: #0b0d12; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 1px 4px; font-size: 12px; margin-left: 6px; }
+
 /* ---- memory tab */
 #mem-search { flex: 1; min-width: 160px; background: #0b0d12; color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; font: inherit; }
 #mem-search:focus { outline: none; border-color: var(--accent); }
